@@ -1,4 +1,8 @@
-# Glaux <img src="assets/GlauxAI_Logo.png" alt="Glaux logo" width="128" align="absmiddle">
+<p align="center">
+  <img src="assets/GlauxAI_Logo.png" alt="Glaux logo" width="192">
+</p>
+
+# Glaux
 
 Glaux is a **local AI workspace** for Windows, macOS, and Linux. It runs Hugging Face [Transformers](https://github.com/huggingface/transformers) models and GGUF models (via [llama.cpp](https://github.com/ggml-org/llama.cpp) for chat, and [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) for ASR) on your machine through a desktop UI — no cloud API required for inference.
 
@@ -346,38 +350,32 @@ Target a specific platform from a matching host (cross-compilation of `vendor/py
 ```
 Glaux/
   src/
-    main/                 # Electron main process (IPC domains, paths, windows)
-    preload/              # contextBridge APIs
-    renderer/             # UI (chat, panels, markdown editor, media viewer)
+    i18n/                         # Locale catalogs; English is the fallback
+    main/                         # Electron main process
+    preload/                      # contextBridge APIs
+    renderer/                     # UI (chat, panels, markdown editor, media viewer)
   engines/
-    engineManager.js      # Inference facade (routes by format + pipeline_tag)
-    contextManager.js     # Canonical chat history
-    common/               # Format detection, stripThinking, GPU runtime helpers
-    huggingface/          # JS bridge + engine.py shim + worker/ + requirements
-      worker/             # Modular Python HF worker (chat, ASR, download, …)
-    llamacpp/             # llama-server HTTP bridge (engine/server/chat)
-    transcribecpp/        # transcribe-cli bridge (engine/cli/asr)
-  tests/                  # Node unit tests (npm test)
-  scripts/
-    gpuBackends.js
-    build-python-runtime.js
-    check-python-runtime.js
-    check-cuda-runtime.js
-    build-ffmpeg.js
-    check-ffmpeg-runtime.js
-    build-llamacpp.js
-    check-llamacpp-runtime.js
-    build-transcribe.js
-    check-transcribe-runtime.js
-  assets/                 # App icons (.ico / .icns / .png) and README screenshot
-  deps/llama.cpp/         # Auto-cloned (gitignored) — pinned source for build:llamacpp
-  deps/transcribe.cpp/    # Auto-cloned (gitignored) — pinned source for build:transcribe
-  vendor/python/          # Generated — bundled runtime (gitignored)
-  vendor/cuda/            # Generated — shared CUDA 13 runtime (Win/Linux)
-  vendor/ffmpeg/          # Generated — shared ffmpeg + ffprobe + libav/dav1d
-  vendor/llamacpp/        # Generated — llama-server + GPU backends
-  vendor/transcribe/      # Generated — transcribe-cli + GPU backends
-  dist/                   # Generated — installers / archives (gitignored)
+    engineManager.js              # Inference facade (routes by format + pipeline_tag)
+    contextManager.js             # Canonical chat history
+    common/                       # Format detection, GPU helpers, PDF/video, ffmpeg
+    huggingface/                  # JS bridge + Python Transformers worker
+      worker/                     # Modular Python HF worker (chat, ASR, download, …)
+    llamacpp/                     # llama-server HTTP bridge
+    transcribecpp/                # transcribe-cli bridge
+  tests/                          # Node unit tests (`npm test`)
+  scripts/                        # Build scripts
+  assets/                         # App icons and README screenshot
+  deps/                           # Auto-cloned (gitignored)
+    llama.cpp/                    # Pinned source for llamacpp
+    transcribe.cpp/               # Pinned source for transcribe
+    ffmpeg-glaux/                 # Pinned source for ffmpeg
+  vendor/                         # Generated (gitignored)
+    python/                       # Bundled CPython + PyTorch / Transformers
+    cuda/                         # Shared CUDA 13 runtime (Win/Linux)
+    ffmpeg/                       # Shared ffmpeg + ffprobe + libav/dav1d
+    llamacpp/                     # llama-server + GPU backends
+    transcribe/                   # transcribe-cli + GPU backends
+  dist/                           # Generated — installers / archives (gitignored)
 ```
 
 
