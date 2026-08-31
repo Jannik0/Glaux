@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title data-i18n="editor.windowTitle">Markdown Editor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <style>
+      html:not([data-i18n-ready]) body {
+        visibility: hidden;
+      }
+
+      :root {
+        color-scheme: dark;
+        --bg-body: #0f1011;
+        --text-body: #f2f3f5;
+        --bg-app: #17191c;
+        --border-app: #2a2d31;
+        --text-subtle: #b3b7be;
+        --text-muted: #8f949d;
+        --bg-input: #252930;
+        --text-input: #f2f3f5;
+        --button-bg: #434a55;
+        --focus-border: #737b88;
+        --focus-ring: rgba(115, 123, 136, 0.45);
+        --interactive-hover: rgba(115, 123, 136, 0.2);
+        --accent: #6b9bd1;
+        --danger: #d46a6a;
+        --overlay-backdrop: rgba(10, 10, 10, 0.68);
+        --shadow-app: rgba(0, 0, 0, 0.2);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: var(--bg-body);
+        color: var(--text-body);
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      .editor-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 14px;
+        background: var(--bg-app);
+        border-bottom: 1px solid var(--border-app);
+        flex-shrink: 0;
+      }
+
+      .editor-title {
+        flex: 1;
+        min-width: 0;
+        font-size: 14px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .editor-title.is-dirty::after {
+        content: ' *';
+        color: var(--accent);
+      }
+
+      .editor-status {
+        font-size: 12px;
+        color: var(--text-muted);
+        min-width: 80px;
+        text-align: right;
+      }
+
+      .editor-status.error {
+        color: var(--danger);
+      }
+
+      .editor-status.saved {
+        color: var(--accent);
+      }
+
+      .editor-btn {
+        border: 1px solid var(--border-app);
+        background: var(--button-bg);
+        color: var(--text-body);
+        border-radius: 6px;
+        padding: 6px 12px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      .editor-btn:hover {
+        background: var(--interactive-hover);
+      }
+
+      .editor-btn:focus-visible {
+        outline: 2px solid var(--focus-ring);
+        border-color: var(--focus-border);
+      }
+
+      .editor-btn.primary {
+        background: var(--accent);
+        border-color: transparent;
+        color: #fff;
+      }
+
+      .editor-btn.active {
+        border-color: var(--accent);
+        box-shadow: inset 0 0 0 1px var(--accent);
+      }
+
+      .editor-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        padding: 8px 14px;
+        background: var(--bg-app);
+        border-bottom: 1px solid var(--border-app);
+        flex-shrink: 0;
+      }
+
+      .toolbar-btn {
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--text-body);
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 13px;
+        cursor: pointer;
+        min-width: 30px;
+      }
+
+      .toolbar-btn:hover {
+        background: var(--interactive-hover);
+        border-color: var(--border-app);
+      }
+
+      .toolbar-btn:focus-visible {
+        outline: 2px solid var(--focus-ring);
+      }
+
+      .toolbar-separator {
+        width: 1px;
+        background: var(--border-app);
+        margin: 0 4px;
+        align-self: stretch;
+      }
+
+      .editor-main {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+
+      .editor-main.split {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .editor-pane {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        min-width: 0;
+      }
+
+      .editor-pane + .editor-pane {
+        border-left: 1px solid var(--border-app);
+      }
+
+      .pane-label {
+        padding: 6px 14px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        background: var(--bg-app);
+        border-bottom: 1px solid var(--border-app);
+        flex-shrink: 0;
+      }
+
+      #editor-textarea {
+        flex: 1;
+        width: 100%;
+        min-height: 0;
+        resize: none;
+        border: none;
+        outline: none;
+        padding: 16px;
+        font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+        font-size: 14px;
+        line-height: 1.55;
+        background: var(--bg-input);
+        color: var(--text-input);
+      }
+
+      #editor-preview {
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+        padding: 16px 20px;
+        background: var(--bg-app);
+        line-height: 1.5;
+        font-size: 14px;
+      }
+
+      #editor-preview h1,
+      #editor-preview h2,
+      #editor-preview h3,
+      #editor-preview h4,
+      #editor-preview h5,
+      #editor-preview h6 {
+        margin: 0 0 8px;
+        line-height: 1.25;
+      }
+
+      #editor-preview h1 { font-size: 1.6em; }
+      #editor-preview h2 { font-size: 1.35em; }
+      #editor-preview h3 { font-size: 1.15em; }
+
+      #editor-preview p {
+        margin: 0 0 10px;
+      }
+
+      #editor-preview ul,
+      #editor-preview ol {
+        margin: 0 0 10px;
+        padding-left: 1.4em;
+      }
+
+      #editor-preview li {
+        margin: 0 0 4px;
+      }
+
+      #editor-preview blockquote {
+        margin: 0 0 10px;
+        padding-left: 12px;
+        border-left: 3px solid var(--border-app);
+        color: var(--text-subtle);
+      }
+
+      #editor-preview pre {
+        margin: 0 0 10px;
+        padding: 10px 12px;
+        border-radius: 6px;
+        background: var(--bg-input);
+        overflow-x: auto;
+      }
+
+      #editor-preview pre code {
+        font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+        font-size: 13px;
+      }
+
+      #editor-preview :not(pre) > code {
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--bg-input);
+        font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+        font-size: 0.92em;
+      }
+
+      #editor-preview hr {
+        border: none;
+        border-top: 1px solid var(--border-app);
+        margin: 14px 0;
+      }
+
+      #editor-preview a {
+        color: var(--accent);
+      }
+
+      .editor-loading {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--text-muted);
+        font-size: 14px;
+      }
+
+      .dialog-overlay {
+        position: fixed;
+        inset: 0;
+        background: var(--overlay-backdrop);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1100;
+        padding: 16px;
+      }
+
+      .dialog-overlay.hidden {
+        display: none;
+      }
+
+      .dialog-box {
+        width: min(420px, 100%);
+        background: var(--bg-app);
+        border: 1px solid var(--border-app);
+        border-radius: 12px;
+        box-shadow: 0 20px 40px var(--shadow-app);
+        padding: 14px;
+      }
+
+      .dialog-title {
+        font-size: 16px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+
+      .dialog-message {
+        font-size: 13px;
+        color: var(--text-subtle);
+        margin-bottom: 12px;
+      }
+
+      .dialog-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+
+      .dialog-btn {
+        border: 1px solid var(--border-app);
+        border-radius: 6px;
+        background: var(--bg-input);
+        color: var(--text-input);
+        font-size: 13px;
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+
+      .dialog-btn.danger {
+        background: #b91c1c;
+        border-color: #ef4444;
+        color: #fee2e2;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="editor-header">
+      <div class="editor-title" id="editor-title" data-i18n="editor.loading">Loading...</div>
+      <div class="editor-status" id="editor-status"></div>
+      <button type="button" class="editor-btn" id="preview-toggle-btn" data-i18n="editor.showPreview" data-i18n-title="editor.togglePreviewTitle" title="Toggle preview pane">
+        Show preview
+      </button>
+      <button type="button" class="editor-btn primary" id="save-btn" data-i18n="editor.save" data-i18n-title="editor.saveTitle" title="Save">
+        Save
+      </button>
+    </header>
+
+    <div class="editor-toolbar hidden" id="editor-toolbar">
+      <button type="button" class="toolbar-btn" data-action="bold" data-i18n-title="editor.toolbar.bold" title="Bold"><strong>B</strong></button>
+      <button type="button" class="toolbar-btn" data-action="italic" data-i18n-title="editor.toolbar.italic" title="Italic"><em>I</em></button>
+      <button type="button" class="toolbar-btn" data-action="strikethrough" data-i18n-title="editor.toolbar.strikethrough" title="Strikethrough">S̶</button>
+      <span class="toolbar-separator"></span>
+      <button type="button" class="toolbar-btn" data-action="h1" data-i18n-title="editor.toolbar.h1" title="Heading 1">H1</button>
+      <button type="button" class="toolbar-btn" data-action="h2" data-i18n-title="editor.toolbar.h2" title="Heading 2">H2</button>
+      <button type="button" class="toolbar-btn" data-action="h3" data-i18n-title="editor.toolbar.h3" title="Heading 3">H3</button>
+      <span class="toolbar-separator"></span>
+      <button type="button" class="toolbar-btn" data-action="ul" data-i18n-title="editor.toolbar.bulletList" title="Bullet list">• List</button>
+      <button type="button" class="toolbar-btn" data-action="ol" data-i18n-title="editor.toolbar.numberedList" title="Numbered list">1. List</button>
+      <button type="button" class="toolbar-btn" data-action="quote" data-i18n-title="editor.toolbar.blockquote" title="Blockquote">" Quote</button>
+      <span class="toolbar-separator"></span>
+      <button type="button" class="toolbar-btn" data-action="link" data-i18n="editor.toolbar.link" data-i18n-title="editor.toolbar.link" title="Link">Link</button>
+      <button type="button" class="toolbar-btn" data-action="code" data-i18n-title="editor.toolbar.inlineCode" title="Inline code">` Code</button>
+      <button type="button" class="toolbar-btn" data-action="codeblock" data-i18n-title="editor.toolbar.codeBlock" title="Code block">```</button>
+    </div>
+
+    <div class="editor-loading" id="editor-loading" data-i18n="editor.loadingDocument">Loading document...</div>
+
+    <div class="editor-main hidden" id="editor-main">
+      <div class="editor-pane">
+        <div class="pane-label" data-i18n="editor.edit">Edit</div>
+        <textarea id="editor-textarea" spellcheck="true" data-i18n-aria="editor.sourceAria" aria-label="Markdown source"></textarea>
+      </div>
+      <div class="editor-pane hidden" id="preview-pane">
+        <div class="pane-label" data-i18n="editor.preview">Preview</div>
+        <div id="editor-preview" class="message"></div>
+      </div>
+    </div>
+
+    <div class="dialog-overlay hidden" id="confirm-overlay">
+      <div class="dialog-box" role="dialog" aria-modal="true">
+        <div class="dialog-title" id="confirm-title" data-i18n="editor.confirmAction">Confirm action</div>
+        <div class="dialog-message" id="confirm-message"></div>
+        <div class="dialog-actions">
+          <button
+            type="button"
+            class="dialog-btn"
+            id="confirm-cancel"
+            tabindex="-1"
+            data-i18n="editor.cancel"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="dialog-btn hidden"
+            id="confirm-alt"
+            tabindex="-1"
+            data-i18n="editor.secondary"
+          >
+            Secondary
+          </button>
+          <button
+            type="button"
+            class="dialog-btn"
+            id="confirm-confirm"
+            tabindex="-1"
+            data-i18n="editor.confirm"
+          >
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script src="../../node_modules/marked/lib/marked.umd.js"></script>
+    <script src="../../node_modules/dompurify/dist/purify.min.js"></script>
+    <script src="../i18n/translate.js"></script>
+    <script src="i18n/i18n.js"></script>
+    <script src="./markdown-editor.js"></script>
+  </body>
+</html>

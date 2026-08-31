@@ -1,0 +1,9 @@
+# Direct engine dependencies.
+# Install torch/torchvision from the PyTorch index first — see scripts/build-python-runtime.js.
+torch==2.13.0
+torchvision==0.28.0
+transformers==5.15.1
+accelerate==1.14.0
+pillow==12.3.0
+timm==1.0.28
+librosa==1.0.0

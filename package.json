@@ -1,0 +1,137 @@
+{
+  "name": "Glaux",
+  "productName": "Glaux",
+  "version": "1.1.0",
+  "description": "Local AI workspace with on-device inference - chat, multimodal input, document analysis, audio transcription.",
+  "main": "src/main/index.js",
+  "author": "Jannik Lehmkuhl",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "build:python": "node scripts/build-python-runtime.js",
+    "build:ffmpeg": "node scripts/build-ffmpeg.js",
+    "build:llamacpp": "node scripts/build-llamacpp.js",
+    "build:transcribe": "node scripts/build-transcribe.js",
+    "predist": "node scripts/check-python-runtime.js && node scripts/check-cuda-runtime.js && node scripts/check-ffmpeg-runtime.js && node scripts/check-llamacpp-runtime.js && node scripts/check-transcribe-runtime.js",
+    "dist": "electron-builder",
+    "dist:dir": "electron-builder --dir",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux"
+  },
+  "keywords": [
+    "electron",
+    "huggingface",
+    "llama.cpp",
+    "transcribe.cpp",
+    "transformers",
+    "pytorch",
+    "safetensors",
+    "gguf",
+    "local-ai",
+    "inference",
+    "desktop"
+  ],
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "electron": "^41.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.0",
+    "marked": "^18.0.0",
+    "pdf-parse": "^1.1.1"
+  },
+  "build": {
+    "appId": "com.glaux.app",
+    "productName": "Glaux",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/main/**/*",
+      "src/preload/**/*",
+      "src/renderer/**/*",
+      "src/i18n/**/*",
+      "package.json",
+      "assets/**/*",
+      "engines/**/*.js"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/python",
+        "to": "python"
+      },
+      {
+        "from": "vendor/ffmpeg",
+        "to": "ffmpeg"
+      },
+      {
+        "from": "vendor/llamacpp",
+        "to": "llamacpp"
+      },
+      {
+        "from": "vendor/transcribe",
+        "to": "transcribe"
+      },
+      {
+        "from": "engines/huggingface",
+        "to": "engines/huggingface",
+        "filter": [
+          "*.py",
+          "worker/**/*.py"
+        ]
+      },
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "THIRD_PARTY_LICENSES.md",
+        "to": "THIRD_PARTY_LICENSES.md"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "icon": "assets/GlauxAI_Logo.ico",
+      "extraResources": [
+        {
+          "from": "vendor/cuda",
+          "to": "cuda"
+        }
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "assets/GlauxAI_Logo.icns",
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "icon": "assets/GlauxAI_Logo.png",
+      "category": "Utility",
+      "extraResources": [
+        {
+          "from": "vendor/cuda",
+          "to": "cuda"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "afterPack": "./scripts/prune-electron-locales.js"
+  }
+}
