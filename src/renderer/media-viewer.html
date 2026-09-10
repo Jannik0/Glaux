@@ -4,20 +4,11 @@
     <meta charset="UTF-8" />
     <title data-i18n="viewer.windowTitle">Media Viewer</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="theme.css" />
     <style>
       html:not([data-i18n-ready]) body {
         visibility: hidden;
-      }
-
-      :root {
-        color-scheme: dark;
-        --bg-body: #0f1011;
-        --text-body: #f2f3f5;
-        --bg-app: #17191c;
-        --border-app: #2a2d31;
-        --text-muted: #8f949d;
-        --danger: #d46a6a;
       }
 
       * {
@@ -70,7 +61,7 @@
 
       .viewer-content.image-mode {
         padding: 0;
-        background: #0a0a0a;
+        background: var(--viewer-image-bg);
       }
 
       .viewer-content.audio-mode {
@@ -79,12 +70,12 @@
 
       .viewer-content.video-mode {
         padding: 0;
-        background: #000;
+        background: var(--viewer-video-bg);
       }
 
       .viewer-content.pdf-mode {
         padding: 0;
-        background: #525659;
+        background: var(--viewer-pdf-bg);
       }
 
       #media-image {
@@ -104,7 +95,7 @@
         height: 100%;
         max-height: 100%;
         object-fit: contain;
-        background: #000;
+        background: var(--viewer-video-bg);
       }
 
       #media-pdf {
@@ -112,7 +103,7 @@
         height: 100%;
         border: none;
         display: block;
-        background: #525659;
+        background: var(--viewer-pdf-bg);
       }
 
       .viewer-loading,

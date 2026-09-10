@@ -133,6 +133,34 @@ function startSidePanelPolling() {
   });
 }
 
+function initializeThemeSelect() {
+  const select = document.getElementById('theme-select');
+  if (!(select instanceof HTMLSelectElement)) {
+    return;
+  }
+  let selected =
+    window.api && typeof window.api.getThemePreference === 'function'
+      ? window.api.getThemePreference()
+      : 'system';
+  if (selected !== 'light' && selected !== 'dark' && selected !== 'system') {
+    selected = 'system';
+  }
+  select.value = selected;
+  select.addEventListener('change', () => {
+    const next = select.value;
+    if (next !== 'system' && next !== 'light' && next !== 'dark') {
+      return;
+    }
+    if (next === selected) {
+      return;
+    }
+    selected = next;
+    if (window.api && typeof window.api.updatePreferences === 'function') {
+      void window.api.updatePreferences({ theme: next });
+    }
+  });
+}
+
 function initializeLanguageSelect() {
   const select = document.getElementById('language-select');
   const i18n = window.Glaux && window.Glaux.i18n;
@@ -484,6 +512,7 @@ function initializeGlobalDialogInputTrap() {
 
 initializeGlobalPanelChrome();
 initializeGlobalDialogInputTrap();
+initializeThemeSelect();
 initializeLanguageSelect();
 
 void (async () => {

@@ -1,7 +1,7 @@
 {
   "name": "Glaux",
   "productName": "Glaux",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Local AI workspace with on-device inference - chat, multimodal input, document analysis, audio transcription.",
   "main": "src/main/index.js",
   "author": "Jannik Lehmkuhl",

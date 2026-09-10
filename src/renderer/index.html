@@ -4,7 +4,8 @@
     <meta charset="UTF-8" />
     <title>Glaux</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="theme.css" />
     <link rel="stylesheet" href="styles.css" />
     <style>
       html:not([data-i18n-ready]) body {
@@ -62,6 +63,17 @@
           </button>
         </div>
         <div class="app-header-trailing">
+          <label class="visually-hidden" for="theme-select" data-i18n="header.themeLabel">Theme</label>
+          <select
+            id="theme-select"
+            class="dropdown-selector theme-select"
+            data-i18n-aria="header.themeAria"
+            aria-label="UI theme"
+          >
+            <option value="system" data-i18n="header.theme.system">System</option>
+            <option value="light" data-i18n="header.theme.light">Light</option>
+            <option value="dark" data-i18n="header.theme.dark">Dark</option>
+          </select>
           <label class="visually-hidden" for="language-select" data-i18n="header.languageLabel">Language</label>
           <select
             id="language-select"

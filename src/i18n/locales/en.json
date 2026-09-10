@@ -3,6 +3,13 @@
     "subtitle": "Local AI Workspace",
     "languageLabel": "Language",
     "languageAria": "UI language",
+    "themeLabel": "Theme",
+    "themeAria": "UI theme",
+    "theme": {
+      "system": "System",
+      "light": "Light",
+      "dark": "Dark"
+    },
     "workspace": {
       "label": "Workspace:",
       "ariaActive": "Active workspace",

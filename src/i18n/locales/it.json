@@ -3,6 +3,13 @@
     "subtitle": "Area di lavoro IA locale",
     "languageLabel": "Lingua",
     "languageAria": "Lingua dell'interfaccia",
+    "themeLabel": "Tema",
+    "themeAria": "Tema dell'interfaccia",
+    "theme": {
+      "system": "Sistema",
+      "light": "Chiaro",
+      "dark": "Scuro"
+    },
     "workspace": {
       "label": "Area di lavoro:",
       "ariaActive": "Area di lavoro attiva",

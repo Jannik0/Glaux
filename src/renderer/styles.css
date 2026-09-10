@@ -1,22 +1,3 @@
-:root {
-  color-scheme: dark;
-  --bg-body: #0f1011;
-  --text-body: #f2f3f5;
-  --bg-app: #17191c;
-  --border-app: #2a2d31;
-  --shadow-app: rgba(0, 0, 0, 0.2);
-  --text-subtle: #b3b7be;
-  --text-muted: #8f949d;
-  --bg-input: #252930;
-  --text-input: #f2f3f5;
-  --chat-bubble-bg: #2f343c;
-  --button-bg: #434a55;
-  --focus-border: #737b88;
-  --focus-ring: rgba(115, 123, 136, 0.45);
-  --interactive-hover: rgba(115, 123, 136, 0.2);
-  --overlay-backdrop: rgba(10, 10, 10, 0.68);
-}
-
 * {
   box-sizing: border-box;
 }
@@ -338,7 +319,7 @@ body {
 }
 
 .sessions-status.error {
-  color: #e57373;
+  color: var(--color-error);
 }
 
 .sessions-list {
@@ -495,6 +476,12 @@ body {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 8px;
+}
+
+.theme-select {
+  min-width: 110px;
+  max-width: 160px;
 }
 
 .language-select {
@@ -725,7 +712,7 @@ body {
 }
 
 .panel-status.error {
-  color: #f87171;
+  color: var(--color-error);
 }
 
 .panel-tree {
@@ -921,7 +908,7 @@ body {
 
 .prompt-name-error {
   font-size: 12px;
-  color: #e57373;
+  color: var(--color-error);
   margin-bottom: 10px;
 }
 
@@ -959,9 +946,9 @@ body {
 }
 
 .dialog-btn.danger {
-  background: #b91c1c;
-  border-color: #ef4444;
-  color: #fee2e2;
+  background: var(--color-danger-bg);
+  border-color: var(--color-danger-border);
+  color: var(--color-danger-text);
 }
 
 .visually-hidden {
@@ -1020,7 +1007,7 @@ body {
 .app-progress-bar {
   height: 100%;
   width: 0%;
-  background: #2563eb;
+  background: var(--progress-fill);
   transition: width 120ms linear;
 }
 
@@ -1219,7 +1206,7 @@ body {
 }
 
 .message a {
-  color: #60a5fa;
+  color: var(--link);
   text-decoration: underline;
   text-underline-offset: 2px;
   word-break: break-word;
@@ -1238,14 +1225,14 @@ body {
 
 .message.user {
   margin-left: auto;
-  background: var(--chat-bubble-bg);
+  background: var(--chat-bubble-user);
   color: var(--text-input);
   border-bottom-right-radius: 4px;
 }
 
 .message.assistant {
   margin-right: auto;
-  background: var(--chat-bubble-bg);
+  background: var(--chat-bubble-assistant);
   color: var(--text-input);
   border-bottom-left-radius: 4px;
 }
@@ -1427,7 +1414,7 @@ body {
 }
 
 .chat-attachments-drop.drag-over-reject {
-  border-color: #b45353;
+  border-color: var(--reject-border);
   box-shadow: none;
 }
 
@@ -1509,7 +1496,7 @@ body {
 }
 
 .message.user .message-attachments {
-  border-top-color: rgba(255, 255, 255, 0.12);
+  border-top-color: var(--bubble-divider);
 }
 
 .message-attachment-chip {
@@ -1525,7 +1512,7 @@ body {
 }
 
 .message.user .message-attachment-chip {
-  background: rgba(0, 0, 0, 0.12);
+  background: var(--bubble-chip-bg);
 }
 
 .message-attachment-name {

@@ -7,6 +7,7 @@ const { registerIpc } = require('./ipc/register');
 const { ensureWorkspacesReady } = require('./domains/workspaces');
 const { loadPreferences, getPreferences } = require('./domains/preferences');
 const { applyResolvedLanguage, applyChromiumLangSwitch } = require('./domains/i18n');
+const { getWindowBackgroundColor } = require('./domains/theme');
 
 if (process.platform === 'win32') {
   app.setAppUserModelId(APP_NAME);
@@ -23,6 +24,7 @@ function createWindow() {
     height: 700,
     autoHideMenuBar: true,
     icon: APP_ICON_PATH,
+    backgroundColor: getWindowBackgroundColor(),
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,

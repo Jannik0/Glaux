@@ -11,6 +11,7 @@ const {
   resolvePanelFilePath,
   resolvePanelMediaPath,
 } = require('../paths');
+const { getWindowBackgroundColor } = require('./theme');
 
 function getMarkdownEditorKey(panel, relativePath) {
   return `${panel}:${relativePath}`;
@@ -61,6 +62,7 @@ function openMarkdownEditorWindow(panel, relativePath) {
     minHeight: 480,
     autoHideMenuBar: true,
     icon: APP_ICON_PATH,
+    backgroundColor: getWindowBackgroundColor(),
     webPreferences: {
       preload: path.join(__dirname, '../../preload/preload-markdown.js'),
       contextIsolation: true,
@@ -128,7 +130,7 @@ async function openMediaViewerWindow(panel, relativePath) {
     minHeight: size.minHeight,
     autoHideMenuBar: true,
     icon: APP_ICON_PATH,
-    backgroundColor: kind === 'image' || kind === 'pdf' ? '#0f1011' : undefined,
+    backgroundColor: getWindowBackgroundColor(),
     webPreferences: {
       preload: path.join(__dirname, '../../preload/preload-media.js'),
       contextIsolation: true,

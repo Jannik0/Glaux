@@ -70,6 +70,17 @@ contextBridge.exposeInMainWorld('api', {
     cachedI18n = ipcRenderer.sendSync('i18n:get');
     return cachedI18n;
   },
+  getThemePreference: () => {
+    try {
+      const payload = ipcRenderer.sendSync('theme:get');
+      if (payload && typeof payload.theme === 'string') {
+        return payload.theme;
+      }
+    } catch {
+      /* fall through */
+    }
+    return 'system';
+  },
   getPathForFile: (file) => {
     try {
       return webUtils.getPathForFile(file);

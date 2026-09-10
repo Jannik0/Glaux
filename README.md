@@ -65,6 +65,7 @@ export HF_TOKEN=hf_your_token
 - Audio and video transcription
 - Mid-session model switching (including across engines, with chat context preserved)
 - Workspace system
+- Light and dark UI themes (follows the OS by default)
 - Session persistence
 - Context usage tracking
 - Delete and export individual turns
@@ -100,7 +101,7 @@ export HF_TOKEN=hf_your_token
 
 | Path | Purpose |
 | ---- | ------- |
-| `<appData>/Glaux/preferences.json` | App preferences (active workspace, selected model, UI toggles) |
+| `<appData>/Glaux/preferences.json` | App preferences (active workspace, selected model, UI language/theme, UI toggles) |
 | `<appData>/Glaux/Models` | Downloaded Hub model weights (shared across workspaces) |
 | `<appData>/Glaux/Workspaces/<name>/Resources` | User resource library for that workspace |
 | `<appData>/Glaux/Workspaces/<name>/Outputs` | Generated / exported outputs for that workspace |

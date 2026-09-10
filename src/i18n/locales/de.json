@@ -3,6 +3,13 @@
     "subtitle": "Lokaler KI-Arbeitsbereich",
     "languageLabel": "Sprache",
     "languageAria": "UI-Sprache",
+    "themeLabel": "Design",
+    "themeAria": "UI-Design",
+    "theme": {
+      "system": "System",
+      "light": "Hell",
+      "dark": "Dunkel"
+    },
     "workspace": {
       "label": "Arbeitsbereich:",
       "ariaActive": "Aktiver Arbeitsbereich",

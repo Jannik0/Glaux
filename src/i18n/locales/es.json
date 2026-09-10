@@ -3,6 +3,13 @@
     "subtitle": "Espacio de trabajo de IA local",
     "languageLabel": "Idioma",
     "languageAria": "Idioma de la interfaz",
+    "themeLabel": "Tema",
+    "themeAria": "Tema de la interfaz",
+    "theme": {
+      "system": "Sistema",
+      "light": "Claro",
+      "dark": "Oscuro"
+    },
     "workspace": {
       "label": "Espacio de trabajo:",
       "ariaActive": "Espacio de trabajo activo",

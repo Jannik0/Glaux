@@ -1,0 +1,71 @@
+:root {
+  color-scheme: dark;
+  --bg-body: #0f1011;
+  --text-body: #f2f3f5;
+  --bg-app: #17191c;
+  --border-app: #2a2d31;
+  --shadow-app: rgba(0, 0, 0, 0.2);
+  --text-subtle: #b3b7be;
+  --text-muted: #8f949d;
+  --bg-input: #252930;
+  --text-input: #f2f3f5;
+  --chat-bubble-user: #2f343c;
+  --chat-bubble-assistant: #2f343c;
+  --button-bg: #434a55;
+  --focus-border: #737b88;
+  --focus-ring: rgba(115, 123, 136, 0.45);
+  --interactive-hover: rgba(115, 123, 136, 0.2);
+  --overlay-backdrop: rgba(10, 10, 10, 0.68);
+  --color-error: #e57373;
+  --color-danger-bg: #b91c1c;
+  --color-danger-border: #ef4444;
+  --color-danger-text: #fee2e2;
+  --progress-fill: #2563eb;
+  --link: #60a5fa;
+  --reject-border: #b45353;
+  --bubble-divider: rgba(255, 255, 255, 0.12);
+  --bubble-chip-bg: rgba(0, 0, 0, 0.12);
+  --accent: #6b9bd1;
+  --accent-text: #ffffff;
+  --danger: #d46a6a;
+  --viewer-image-bg: #0a0a0a;
+  --viewer-video-bg: #000000;
+  --viewer-pdf-bg: #525659;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg-body: #dddff0;
+    --text-body: #1a1b2e;
+    --bg-app: #f2f2fb;
+    --border-app: #b8bcd8;
+    --shadow-app: rgba(55, 40, 120, 0.14);
+    --text-subtle: #54557a;
+    --text-muted: #65668a;
+    --bg-input: #ffffff;
+    --text-input: #1a1b2e;
+    --chat-bubble-user: #e6def8;
+    --chat-bubble-assistant: #d7e4f8;
+    --button-bg: #c5c8ea;
+    --focus-border: #5b57c9;
+    --focus-ring: rgba(91, 87, 201, 0.36);
+    --interactive-hover: rgba(95, 85, 190, 0.16);
+    --overlay-backdrop: rgba(28, 22, 48, 0.42);
+    --color-error: #c62828;
+    --color-danger-bg: #b91c1c;
+    --color-danger-border: #dc2626;
+    --color-danger-text: #fff5f5;
+    --progress-fill: #5a56db;
+    --link: #4d4ac8;
+    --reject-border: #c2410c;
+    --bubble-divider: rgba(85, 70, 150, 0.16);
+    --bubble-chip-bg: rgba(95, 75, 170, 0.12);
+    --accent: #5c55d0;
+    --accent-text: #ffffff;
+    --danger: #c44747;
+    --viewer-image-bg: #d2d5ea;
+    --viewer-video-bg: #000000;
+    --viewer-pdf-bg: #bfc2d6;
+  }
+}

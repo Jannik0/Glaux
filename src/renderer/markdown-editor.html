@@ -4,30 +4,11 @@
     <meta charset="UTF-8" />
     <title data-i18n="editor.windowTitle">Markdown Editor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="theme.css" />
     <style>
       html:not([data-i18n-ready]) body {
         visibility: hidden;
-      }
-
-      :root {
-        color-scheme: dark;
-        --bg-body: #0f1011;
-        --text-body: #f2f3f5;
-        --bg-app: #17191c;
-        --border-app: #2a2d31;
-        --text-subtle: #b3b7be;
-        --text-muted: #8f949d;
-        --bg-input: #252930;
-        --text-input: #f2f3f5;
-        --button-bg: #434a55;
-        --focus-border: #737b88;
-        --focus-ring: rgba(115, 123, 136, 0.45);
-        --interactive-hover: rgba(115, 123, 136, 0.2);
-        --accent: #6b9bd1;
-        --danger: #d46a6a;
-        --overlay-backdrop: rgba(10, 10, 10, 0.68);
-        --shadow-app: rgba(0, 0, 0, 0.2);
       }
 
       * {
@@ -111,7 +92,7 @@
       .editor-btn.primary {
         background: var(--accent);
         border-color: transparent;
-        color: #fff;
+        color: var(--accent-text);
       }
 
       .editor-btn.active {
@@ -343,9 +324,9 @@
       }
 
       .dialog-btn.danger {
-        background: #b91c1c;
-        border-color: #ef4444;
-        color: #fee2e2;
+        background: var(--color-danger-bg);
+        border-color: var(--color-danger-border);
+        color: var(--color-danger-text);
       }
     </style>
   </head>

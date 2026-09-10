@@ -7,6 +7,8 @@ const { ipcMain } = require('electron');
 const { getUserDataRoot } = require('../paths');
 const { ok, fail } = require('../ipc/result');
 const { t, isSupportedLanguage } = require('../../i18n');
+const { isSupportedTheme, resolveTheme, DEFAULT_THEME } = require('../theme');
+const { applyNativeTheme } = require('./theme');
 
 const PREFERENCES_FILE = 'preferences.json';
 
@@ -25,6 +27,7 @@ function defaultPreferences() {
     reasoningEnabled: false,
     resubmitEnabled: false,
     language: null,
+    theme: DEFAULT_THEME,
   };
 }
 
@@ -86,6 +89,7 @@ function normalizePreferences(raw) {
   prefs.reasoningEnabled = Boolean(record.reasoningEnabled);
   prefs.resubmitEnabled = Boolean(record.resubmitEnabled);
   prefs.language = isSupportedLanguage(record.language) ? record.language : null;
+  prefs.theme = resolveTheme(record.theme);
   return prefs;
 }
 
@@ -111,6 +115,7 @@ function snapshotPreferences() {
     reasoningEnabled: prefs.reasoningEnabled,
     resubmitEnabled: prefs.resubmitEnabled,
     language: prefs.language,
+    theme: prefs.theme,
   };
 }
 
@@ -124,6 +129,7 @@ async function loadPreferences() {
   } catch {
     cached = defaultPreferences();
   }
+  applyNativeTheme(cached.theme);
   return cached;
 }
 
@@ -146,6 +152,7 @@ async function updatePreferences(partial) {
     };
   }
   cached = normalizePreferences(merged);
+  applyNativeTheme(cached.theme);
   await fs.writeFile(preferencesFilePath(), `${JSON.stringify(cached, null, 2)}\n`, 'utf8');
   return cached;
 }
@@ -178,6 +185,9 @@ function pickUiPreferenceUpdates(partial) {
   }
   if (isSupportedLanguage(record.language)) {
     updates.language = record.language;
+  }
+  if (isSupportedTheme(record.theme)) {
+    updates.theme = record.theme;
   }
   return updates;
 }
