@@ -22,20 +22,19 @@ let workspaceSwitchInFlight = false;
  * @returns {string | null} error message, or null if valid
  */
 function validateWorkspaceNameInput(value, existingNames, allowName = null) {
-  try {
-    const safe = window.Glaux.TreePanel.validateEntryName(value);
-    const lower = safe.toLowerCase();
-    const allowLower = typeof allowName === 'string' ? allowName.toLowerCase() : null;
-    if (
-      existingNames.some((n) => n.toLowerCase() === lower) &&
-      lower !== allowLower
-    ) {
-      return t('panels.workspaces.nameAlreadyExists');
-    }
-    return null;
-  } catch (err) {
-    return err && err.message ? err.message : String(err);
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!window.Glaux.OsFolderName.isValidOsFolderName(trimmed)) {
+    return t('panels.workspaces.nameCannotBeUsed');
   }
+  const lower = trimmed.toLowerCase();
+  const allowLower = typeof allowName === 'string' ? allowName.toLowerCase() : null;
+  if (
+    existingNames.some((n) => n.toLowerCase() === lower) &&
+    lower !== allowLower
+  ) {
+    return t('panels.workspaces.nameAlreadyExists');
+  }
+  return null;
 }
 
 function syncWorkspaceControlsDisabled() {

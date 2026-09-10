@@ -108,6 +108,7 @@
       "renameMessage": "Geben Sie einen neuen Namen für diesen Arbeitsbereich ein.",
       "renameConfirm": "Umbenennen",
       "nameAlreadyExists": "Ein Arbeitsbereich mit diesem Namen existiert bereits.",
+      "nameCannotBeUsed": "Dieser Arbeitsbereichsname kann nicht verwendet werden.",
       "deleteConfirmTitle": "Arbeitsbereich löschen?",
       "deleteConfirmMessage": "Arbeitsbereich „{name}“ in den Papierkorb verschieben? Sitzungen, Ressourcen und Ausgaben in diesem Arbeitsbereich werden entfernt."
     },

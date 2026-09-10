@@ -6,6 +6,7 @@
 
 const path = require('path');
 const { t } = require('../i18n');
+const { isValidOsFolderName } = require('../renderer/shared/osFolderName');
 
 /**
  * @param {unknown} name
@@ -29,6 +30,20 @@ function assertValidEntryName(name) {
     throw new Error(t('errors.pathSandbox.nameCannotContainSeparators'));
   }
 
+  return trimmedName;
+}
+
+/**
+ * Like assertValidEntryName, plus Windows/macOS/Linux folder-name rules.
+ * Use for *new* names only so existing on-disk entries can still be referenced.
+ * @param {unknown} name
+ * @returns {string}
+ */
+function assertValidOsFolderName(name) {
+  const trimmedName = assertValidEntryName(name);
+  if (!isValidOsFolderName(trimmedName)) {
+    throw new Error(t('errors.pathSandbox.nameNotValid'));
+  }
   return trimmedName;
 }
 
@@ -90,6 +105,8 @@ function isSubPath(parentPath, candidatePath) {
 
 module.exports = {
   assertValidEntryName,
+  assertValidOsFolderName,
+  isValidOsFolderName,
   toPosixRelative,
   resolveWorkspacePath,
   isSubPath,

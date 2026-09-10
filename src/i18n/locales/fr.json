@@ -108,6 +108,7 @@
       "renameMessage": "Saisissez un nouveau nom pour cet espace de travail.",
       "renameConfirm": "Renommer",
       "nameAlreadyExists": "Un espace de travail portant ce nom existe déjà.",
+      "nameCannotBeUsed": "Ce nom d'espace de travail ne peut pas être utilisé.",
       "deleteConfirmTitle": "Supprimer l'espace de travail ?",
       "deleteConfirmMessage": "Déplacer l'espace de travail « {name} » vers la corbeille ? Les sessions, ressources et sorties de cet espace de travail seront supprimées."
     },

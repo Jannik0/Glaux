@@ -108,6 +108,7 @@
       "renameMessage": "Introduza um novo nome para esta área de trabalho.",
       "renameConfirm": "Renomear",
       "nameAlreadyExists": "Já existe uma área de trabalho com esse nome.",
+      "nameCannotBeUsed": "Este nome de área de trabalho não pode ser usado.",
       "deleteConfirmTitle": "Eliminar área de trabalho?",
       "deleteConfirmMessage": "Mover a área de trabalho \"{name}\" para a lixeira? As sessões, recursos e saídas desta área de trabalho serão removidos."
     },

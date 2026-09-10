@@ -5,6 +5,7 @@ const { getMediaKindFromFileName } = require('./mediaKinds');
 const { t } = require('../i18n');
 const {
   assertValidEntryName,
+  assertValidOsFolderName,
   toPosixRelative,
   resolveWorkspacePath,
   isSubPath,
@@ -310,6 +311,7 @@ module.exports = {
   getModelsRoot,
   getSessionsRoot,
   assertValidEntryName,
+  assertValidOsFolderName,
   assertValidHfRepoId,
   assertValidSessionFilename,
   toPosixRelative,

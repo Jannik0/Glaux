@@ -7,6 +7,7 @@ const state = require('../state');
 const { ok, fail } = require('../ipc/result');
 const {
   assertValidEntryName,
+  assertValidOsFolderName,
   getModelsRoot,
   getResourcesRoot,
   getOutputsRoot,
@@ -185,7 +186,7 @@ async function createWorkspaceHandler() {
 
 async function renameWorkspaceHandler(payload) {
   const oldName = assertValidEntryName(payload && payload.oldName);
-  const newName = assertValidEntryName(payload && payload.newName);
+  const newName = assertValidOsFolderName(payload && payload.newName);
   const names = await listWorkspaceNames();
   if (!workspaceNameTaken(names, oldName)) {
     throw new Error(t('errors.workspaces.doesNotExist'));

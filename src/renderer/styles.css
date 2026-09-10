@@ -953,6 +953,11 @@ body {
   cursor: pointer;
 }
 
+.dialog-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .dialog-btn.danger {
   background: #b91c1c;
   border-color: #ef4444;

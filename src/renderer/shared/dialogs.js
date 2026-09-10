@@ -75,10 +75,32 @@
     if (!text) {
       nameErrorEl.textContent = '';
       nameErrorEl.classList.add('hidden');
+      if (nameInputEl) {
+        nameInputEl.removeAttribute('aria-invalid');
+      }
       return;
     }
     nameErrorEl.textContent = text;
     nameErrorEl.classList.remove('hidden');
+    if (nameInputEl) {
+      nameInputEl.setAttribute('aria-invalid', 'true');
+    }
+  }
+
+  function syncNameDialogValidity() {
+    if (!nameConfirmEl) {
+      return;
+    }
+    const raw = nameInputEl ? nameInputEl.value : '';
+    if (typeof nameValidateFn !== 'function') {
+      const trimmed = typeof raw === 'string' ? raw.trim() : '';
+      nameConfirmEl.disabled = !trimmed;
+      setNameError('');
+      return;
+    }
+    const error = nameValidateFn(raw, nameExistingNames);
+    setNameError(error || '');
+    nameConfirmEl.disabled = Boolean(error);
   }
 
   function closeNameDialog(result) {
@@ -87,6 +109,9 @@
     }
     nameOverlayEl.classList.add('hidden');
     setNameError('');
+    if (nameConfirmEl) {
+      nameConfirmEl.disabled = false;
+    }
     nameValidateFn = null;
     nameExistingNames = [];
     nameInitialValue = '';
@@ -104,11 +129,17 @@
       closeNameDialog(null);
       return;
     }
+    if (nameConfirmEl && nameConfirmEl.disabled) {
+      return;
+    }
     const raw = nameInputEl.value;
     if (typeof nameValidateFn === 'function') {
       const error = nameValidateFn(raw, nameExistingNames);
       if (error) {
         setNameError(error);
+        if (nameConfirmEl) {
+          nameConfirmEl.disabled = true;
+        }
         nameInputEl.focus();
         nameInputEl.select();
         return;
@@ -163,6 +194,7 @@
     nameInputEl.value = nameInitialValue;
     setNameError('');
     nameOverlayEl.classList.remove('hidden');
+    syncNameDialogValidity();
     requestAnimationFrame(() => {
       nameInputEl.focus();
       nameInputEl.select();
@@ -325,12 +357,10 @@
       } else if (event.key === 'Escape') {
         event.preventDefault();
         closeNameDialog(null);
-      } else {
-        setNameError('');
       }
     });
     nameInputEl?.addEventListener('input', () => {
-      setNameError('');
+      syncNameDialogValidity();
     });
   }
   initializeNameDialogButtons();

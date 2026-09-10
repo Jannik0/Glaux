@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const {
   assertValidEntryName,
+  assertValidOsFolderName,
+  isValidOsFolderName,
   toPosixRelative,
   resolveWorkspacePath,
   isSubPath,
@@ -20,6 +22,43 @@ describe('pathSandbox', () => {
     assert.throws(() => assertValidEntryName('..'), /not valid/i);
     assert.throws(() => assertValidEntryName('a/b'), /separators/i);
     assert.throws(() => assertValidEntryName('a\\b'), /separators/i);
+  });
+
+  it('accepts folder names that are valid on Windows, macOS, and Linux', () => {
+    assert.equal(isValidOsFolderName('My Workspace'), true);
+    assert.equal(isValidOsFolderName('notes.md'), true);
+    assert.equal(isValidOsFolderName('.hidden'), true);
+    assert.equal(isValidOsFolderName('foo.bar'), true);
+    assert.equal(isValidOsFolderName('COM10'), true);
+    assert.equal(isValidOsFolderName('Auxiliary'), true);
+    assert.equal(assertValidOsFolderName('  Project  '), 'Project');
+  });
+
+  it('rejects folder names that are illegal on Windows, macOS, or Linux', () => {
+    assert.equal(isValidOsFolderName(''), false);
+    assert.equal(isValidOsFolderName('.'), false);
+    assert.equal(isValidOsFolderName('..'), false);
+    assert.equal(isValidOsFolderName('trailing-dot.'), false);
+    assert.equal(isValidOsFolderName('foo...'), false);
+    assert.equal(isValidOsFolderName('ends-with-space '), false);
+    assert.equal(isValidOsFolderName('a/b'), false);
+    assert.equal(isValidOsFolderName('a\\b'), false);
+    assert.equal(isValidOsFolderName('foo:bar'), false);
+    assert.equal(isValidOsFolderName('foo*bar'), false);
+    assert.equal(isValidOsFolderName('foo?bar'), false);
+    assert.equal(isValidOsFolderName('foo|bar'), false);
+    assert.equal(isValidOsFolderName('foo<bar'), false);
+    assert.equal(isValidOsFolderName('foo>bar'), false);
+    assert.equal(isValidOsFolderName('foo"bar'), false);
+    assert.equal(isValidOsFolderName('CON'), false);
+    assert.equal(isValidOsFolderName('con.txt'), false);
+    assert.equal(isValidOsFolderName('COM1'), false);
+    assert.equal(isValidOsFolderName('lpt9.dat'), false);
+    assert.equal(isValidOsFolderName(`nul${String.fromCharCode(0)}`), false);
+    assert.equal(isValidOsFolderName('a'.repeat(256)), false);
+    assert.throws(() => assertValidOsFolderName('workspace.'), /not valid/i);
+    assert.throws(() => assertValidOsFolderName('  workspace.  '), /not valid/i);
+    assert.throws(() => assertValidOsFolderName('CON'), /not valid/i);
   });
 
   it('normalizes relative paths to posix', () => {

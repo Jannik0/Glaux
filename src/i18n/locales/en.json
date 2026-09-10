@@ -108,6 +108,7 @@
       "renameMessage": "Enter a new name for this workspace.",
       "renameConfirm": "Rename",
       "nameAlreadyExists": "A workspace with that name already exists.",
+      "nameCannotBeUsed": "This workspace name cannot be used.",
       "deleteConfirmTitle": "Delete workspace?",
       "deleteConfirmMessage": "Move workspace \"{name}\" to the recycle bin? Sessions, resources, and outputs in this workspace will be removed."
     },
