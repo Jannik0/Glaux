@@ -8,7 +8,7 @@ Glaux is a **local AI workspace** for Windows, macOS, and Linux. It runs Hugging
 
 It is designed to be as **user-friendly and accessible as possible**: you do not need any prior knowledge or experience running AI models. Pick a model from the [Hub](https://huggingface.co/models), download it through Glaux, and start chatting. Attach images, audio, video, or PDFs (parsed into markdown) when the model supports them. All content and sessions stay on disk under your user profile.
 
-![Glaux workspace with a local chat session](assets/screenshot01.png)
+![Glaux workspace in dark mode with a local chat session](assets/screenshot01_dark.png)
 
 **Windows is the primary tested platform.** macOS and Linux packaging is supported, but those builds may need community validation.
 

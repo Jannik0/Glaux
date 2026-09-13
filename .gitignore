@@ -4,6 +4,7 @@ deps/
 dist/
 node_modules/
 vendor/
+web/
 *.log
 .DS_Store
 Thumbs.db
