@@ -12,6 +12,7 @@ module-load time -- this module is safe to import ``worker.context`` at the top 
 
 import gc
 import os
+import sys
 import threading
 import types
 from collections.abc import Mapping
@@ -70,6 +71,19 @@ def _pipeline_placement_kwargs() -> dict:
     return {"device": "cpu"}
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """True when a pipeline load failed because the GPU ran out of memory."""
+    try:
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    text = str(exc).lower()
+    return "out of memory" in text or "with oom" in text or "cudacachingallocator" in text.replace(" ", "")
+
+
 @contextmanager
 def _chat_lock_guard():
     """Acquire ``_CHAT_LOCK`` with a bounded wait instead of blocking indefinitely."""
@@ -118,19 +132,35 @@ def chatbot_create(model_id: str):
     model_path = str(model_local_dir(model_id))
     CHATBOT_PIPELINE_TAG = read_model_pipeline_tag(model_id) or DEFAULT_PIPELINE_TAG
 
-    def _build_pipeline():
+    def _build_pipeline(placement: dict):
         return pipeline(
             CHATBOT_PIPELINE_TAG,
             model=model_path,
             trust_remote_code=False,
-            **_pipeline_placement_kwargs(),
+            **placement,
         )
+
+    def _load_pipeline():
+        placement = _pipeline_placement_kwargs()
+        try:
+            return _build_pipeline(placement)
+        except Exception as exc:
+            if _force_cpu() or not _is_cuda_oom(exc):
+                raise
+            gc.collect()
+            _release_torch_cache()
+            print(
+                "CUDA out of memory while loading the model; retrying on CPU.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return _build_pipeline({"device": "cpu"})
 
     if _download._load_progress_callback is not None:
         with _load_progress_tqdm_hook():
-            CHATBOT = _build_pipeline()
+            CHATBOT = _load_pipeline()
     else:
-        CHATBOT = _build_pipeline()
+        CHATBOT = _load_pipeline()
     _configure_asr_generation_limits()
 
 def _configure_asr_generation_limits() -> None:

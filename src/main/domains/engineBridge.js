@@ -229,6 +229,15 @@ function registerEngineBridgeIpc() {
     const streamState = { canceled: false, sender, timeoutHandle: null, keepaliveHandle: null };
     state.activeStreamRequests.set(requestId, streamState);
 
+    function onSenderDestroyed() {
+      const activeState = state.activeStreamRequests.get(requestId);
+      if (activeState) {
+        activeState.canceled = true;
+        cleanupStream();
+        engineManager.cancelGeneration();
+      }
+    }
+
     const cleanupStream = () => {
       if (streamState.keepaliveHandle) {
         clearInterval(streamState.keepaliveHandle);
@@ -238,17 +247,15 @@ function registerEngineBridgeIpc() {
         clearTimeout(streamState.timeoutHandle);
         streamState.timeoutHandle = null;
       }
+      try {
+        sender.removeListener('destroyed', onSenderDestroyed);
+      } catch {
+        /* webContents already gone */
+      }
       state.activeStreamRequests.delete(requestId);
     };
 
-    sender.once('destroyed', () => {
-      const activeState = state.activeStreamRequests.get(requestId);
-      if (activeState) {
-        activeState.canceled = true;
-        cleanupStream();
-        engineManager.cancelGeneration();
-      }
-    });
+    sender.once('destroyed', onSenderDestroyed);
 
     Promise.resolve().then(async () => {
       let startsInThinking = false;
