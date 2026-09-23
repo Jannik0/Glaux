@@ -11,9 +11,12 @@ const { which } = require('./gpuBackends');
 
 function runGit(args, options = {}) {
   console.log(`> git ${args.join(' ')}`);
-  const result = spawnSync('git', args, {
+  // Windows joins into one string: Node warns (DEP0190) when shell:true is
+  // paired with an args array, and that array is only concatenated anyway.
+  const shell = process.platform === 'win32';
+  const result = spawnSync(shell ? ['git', ...args].join(' ') : 'git', shell ? [] : args, {
     stdio: 'inherit',
-    shell: process.platform === 'win32',
+    shell,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     ...options,
   });

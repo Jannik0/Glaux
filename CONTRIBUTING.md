@@ -1,6 +1,6 @@
 # Contributing to Glaux
 
-Thanks for helping. Contributions of every size are welcome: bug reports, model/use-case testing (especially on **macOS and Linux**), docs, and code.
+Thanks for helping. Contributions of every size are welcome: bug reports, model/use-case testing (especially on **macOS**), docs, and code.
 
 This file is about how to work on Glaux. Full product setup, GPU notes, and packaging live in [README.md](README.md). Private security reports go to [SECURITY.md](SECURITY.md) — do not open a public issue for vulnerabilities.
 
@@ -31,7 +31,7 @@ npm start
 npm test
 ```
 
-Windows is the primary tested platform. GPU backends are compiled into the vendor trees at build time; end users only need a driver.
+Windows and Linux are tested platforms. macOS still needs validation. GPU backends are compiled into the vendor trees at build time; end users only need a driver.
 
 Do **not** commit generated or huge trees: `vendor/`, `dist/`, `deps/`, `node_modules/`, `.env/`. Do not commit Hugging Face tokens, preferences from your user profile, or model weights.
 

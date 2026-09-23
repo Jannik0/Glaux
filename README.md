@@ -10,7 +10,7 @@ It is designed to be as **user-friendly and accessible as possible**: you do not
 
 ![Glaux workspace in dark mode with a local chat session](assets/screenshot01_dark.png)
 
-**Windows is the primary tested platform.** macOS and Linux packaging is supported, but those builds may need community validation.
+**Windows and Linux are tested platforms.** macOS packaging is supported, but those builds still need validation.
 
 **GPU is used by default when the host supports it.** A single app build per OS ships every backend that OS can run; the engine picks CUDA, Vulkan, Metal/MPS, or CPU at runtime.
 
@@ -401,6 +401,7 @@ Glaux/
 | ---------------------------------------------- | ---------------------------------------------------- |
 | `npm start`                                    | Run Electron in development                          |
 | `npm test`                                     | Run Node unit tests                                  |
+| `npm run build`                                | Run `build:python`, `build:ffmpeg`, `build:llamacpp`, and `build:transcribe` in that order |
 | `npm run build:python`                         | Build `vendor/python` (CUDA 13 Torch on Win/Linux; CUDA redists → `vendor/cuda`) |
 | `npm run build:ffmpeg`                         | Build shared ffmpeg + ffprobe + dav1d into `vendor/ffmpeg` |
 | `npm run build:llamacpp`                       | Build `llama-server` + GPU backends into `vendor/llamacpp` (CUDA redists → `vendor/cuda`) |
@@ -414,7 +415,7 @@ Glaux/
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Testing models and validating macOS and Linux GPU builds is especially appreciated.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Testing models and validating macOS GPU builds is especially appreciated.
 
 ## Security
 

@@ -80,9 +80,12 @@ function parseArgs(argv) {
 
 function run(cmd, args, options = {}) {
   console.log(`> ${cmd} ${args.join(' ')}`);
-  const result = spawnSync(cmd, args, {
+  // Windows joins into one string: Node warns (DEP0190) when shell:true is
+  // paired with an args array, and that array is only concatenated anyway.
+  const shell = process.platform === 'win32';
+  const result = spawnSync(shell ? [cmd, ...args].join(' ') : cmd, shell ? [] : args, {
     stdio: 'inherit',
-    shell: process.platform === 'win32',
+    shell,
     ...options,
   });
   if (result.status !== 0) {

@@ -550,6 +550,43 @@ function findCudaToolkitRoot() {
 }
 
 /**
+ * Prepend a directory to the process path.
+ * Linux and macOS use the case-sensitive `PATH` key. Windows stores the same
+ * variable as `Path`; adding a second `PATH` key makes CreateProcess keep only
+ * the new value and drops every other directory.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string} dir
+ */
+function prependEnvPath(env, dir) {
+  if (process.platform !== 'win32') {
+    const current = env.PATH || '';
+    const parts = current.split(path.delimiter).filter(Boolean);
+    if (!parts.includes(dir)) {
+      env.PATH = current ? `${dir}${path.delimiter}${current}` : dir;
+    }
+    return;
+  }
+
+  const keys = Object.keys(env).filter((key) => key.toLowerCase() === 'path');
+  // Node copies the Windows process environment as `Path`. A later `PATH`
+  // assignment is a second entry and hides the original, so keep `Path`.
+  const key = keys.find((candidate) => candidate === 'Path') || keys[0] || 'Path';
+  const current = env[key] || '';
+  for (const extra of keys) {
+    if (extra !== key) {
+      delete env[extra];
+    }
+  }
+
+  const parts = current.split(path.delimiter).filter(Boolean);
+  const already = parts.some((part) => part.toLowerCase() === dir.toLowerCase());
+  if (!already) {
+    env[key] = current ? `${dir}${path.delimiter}${current}` : dir;
+  }
+}
+
+/**
  * Prepend the toolkit bin dir and set CUDA_HOME / CUDACXX so cmake's
  * enable_language(CUDA) finds nvcc. Debian/Ubuntu CUDA packages install
  * nvcc under /usr/local/cuda/bin without putting that dir on PATH;
@@ -569,12 +606,7 @@ function withCudaToolkitEnv(baseEnv = process.env) {
   }
   if (nvcc) {
     env.CUDACXX = env.CUDACXX || nvcc;
-    const binDir = path.dirname(nvcc);
-    const current = env.PATH || '';
-    const parts = current.split(path.delimiter).filter(Boolean);
-    if (!parts.includes(binDir)) {
-      env.PATH = current ? `${binDir}${path.delimiter}${current}` : binDir;
-    }
+    prependEnvPath(env, path.dirname(nvcc));
   }
   return env;
 }

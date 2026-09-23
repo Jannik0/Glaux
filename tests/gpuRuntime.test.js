@@ -84,7 +84,24 @@ describe('findNvcc', () => {
     assert.equal(fs.existsSync(nvcc), true);
     const env = withCudaToolkitEnv({ PATH: 'rest' });
     assert.ok(env.PATH.startsWith(path.dirname(nvcc)));
+    assert.match(env.PATH, /rest/);
     assert.equal(env.CUDACXX, nvcc);
+  });
+
+  it('extends the Windows Path entry without adding a second PATH key', () => {
+    const nvcc = findNvcc();
+    if (!nvcc || process.platform !== 'win32') {
+      return;
+    }
+    const env = withCudaToolkitEnv({
+      Path: 'C:\\Windows\\System32;C:\\Program Files\\CMake\\bin',
+      PATH: path.dirname(nvcc),
+    });
+    const keys = Object.keys(env).filter((key) => key.toLowerCase() === 'path');
+    assert.deepEqual(keys, ['Path']);
+    assert.match(env.Path, /System32/);
+    assert.match(env.Path, /CMake/);
+    assert.ok(env.Path.toLowerCase().startsWith(path.dirname(nvcc).toLowerCase()));
   });
 });
 
