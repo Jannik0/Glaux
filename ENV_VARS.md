@@ -2,7 +2,7 @@
 
 Glaux reads the following variables from the **process environment** of the app (or a `npm run build:*` / `npm run dist*` script). They must be visible to that process: `export VAR=value` then launch, or `VAR=value npm *`. Changing a variable while Glaux is already running has no effect until you restart.
 
-**Packaged app:** export the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, `.deb`, or `.rpm`, then launch.
+**Packaged app:** export the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / `glaux`, then launch.
 
 ## Runtime (app)
 

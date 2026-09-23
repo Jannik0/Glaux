@@ -131,9 +131,9 @@
     },
     "linux": {
       "target": [
-        "AppImage",
         "deb",
-        "rpm"
+        "rpm",
+        "tar.gz"
       ],
       "icon": "assets/GlauxAI_Logo.png",
       "category": "Utility",

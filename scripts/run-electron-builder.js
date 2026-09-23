@@ -4,7 +4,7 @@
 /**
  * Run electron-builder. On Linux, stage temp files under dist/.tmp instead of
  * /tmp: that path is often a small tmpfs, and Glaux's unpacked CUDA Torch tree
- * is multi-GB (ENOSPC while writing the AppImage / deb / rpm). dist/.tmp is
+ * is multi-GB (ENOSPC while writing the deb / rpm / tar.gz). dist/.tmp is
  * removed after electron-builder exits.
  *
  * Override with GLAUX_PACKAGING_TMP=/path if needed (that path is not deleted).

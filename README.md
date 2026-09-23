@@ -51,7 +51,7 @@ $env:HF_TOKEN="hf_your_token"
 export HF_TOKEN=hf_your_token
 ```
 
-**Packaged app:** set the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, `.deb`, or `.rpm`, then launch. Hub **model weights stay under their own licenses**; downloading a gated model does not change the Glaux MIT license.
+**Packaged app:** set the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / `glaux`, then launch. Hub **model weights stay under their own licenses**; downloading a gated model does not change the Glaux MIT license.
 
 
 
@@ -232,7 +232,7 @@ export GLAUX_LLAMA_CTX=8192
 GLAUX_FORCE_CPU=1 GLAUX_LLAMA_CTX=8192 npm start
 ```
 
-**Packaged app:** export the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, `.deb`, or `.rpm`, then launch. `GLAUX_FORCE_CPU` accepts `1`, `true`, `yes`. `GLAUX_LLAMA_CTX` accepts any positive number.
+**Packaged app:** export the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / `glaux`, then launch. `GLAUX_FORCE_CPU` accepts `1`, `true`, `yes`. `GLAUX_LLAMA_CTX` accepts any positive number.
 
 
 
@@ -331,14 +331,12 @@ Target a specific platform from a matching host (cross-compilation of `vendor/py
 | -------------------- | ------------------- |
 | `npm run dist:win`   | `Glaux-Setup-*.exe` (NSIS) and `Glaux-*-win.zip` |
 | `npm run dist:mac`   | `.dmg`, `.zip` |
-| `npm run dist:linux` | `.AppImage`, `.deb`, `.rpm` |
+| `npm run dist:linux` | `.deb`, `.rpm`, `.tar.gz` |
 
 
 > **Note (Windows):** The NSIS installer is a single `Setup.exe` with the app embedded. Do not use electron-builder’s self-extracting “portable” `.exe`: the app (with torch) is multi‑gigabyte unpacked, so that format extracts into `%TEMP%` on every launch and appears to hang with no window. The **zip** is a single-file archive alternative (larger than the installer).
 
 > **Note (Linux):** Packaging stages temp files under `dist/.tmp` (not `/tmp`) and deletes that directory when electron-builder exits. `/tmp` is often a small RAM disk (tmpfs); Glaux’s unpacked CUDA Torch tree is multi‑GB and would otherwise fail with `ENOSPC`. Override with `GLAUX_PACKAGING_TMP` (not auto-deleted). See [ENV_VARS.md](ENV_VARS.md).
-
-> **Note (Linux AppImage):** The AppImage **mounts** its payload with FUSE; it does not extract into `/tmp` on each launch (unlike electron-builder’s Windows “portable” `.exe`). Debian 13 / Ubuntu 24.04 ship FUSE 3 only; the runtime still needs **FUSE 2** (`libfuse.so.2`). Install `libfuse2t64` (`sudo apt install libfuse2t64`). Without it, double-clicking does nothing; a terminal run prints `error loading libfuse.so.2`. Do not use `--appimage-extract-and-run`: that would unpack the multi‑GB tree into `/tmp` and fail the same way as the Windows portable build. The `.deb`, `.rpm`, or `dist/linux-unpacked` is the no-FUSE alternative.
 
 > **Note (Linux RPM):** `npm run dist` / `dist:linux` builds the `.rpm` (Fedora, RHEL, openSUSE, and other RPM distributions) with electron-builder’s bundled fpm, which calls **rpmbuild**. Debian/Ubuntu: `sudo apt install rpm`. Fedora/RHEL: `sudo dnf install rpm-build`. The artifact is `dist/Glaux-<version>.<arch>.rpm` (for example `Glaux-1.1.2.x86_64.rpm`). Install it with `sudo dnf install ./Glaux-*.rpm`.
 
