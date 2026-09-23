@@ -11,6 +11,7 @@
  *
  * Windows requires MSYS2 MinGW64 (gcc, nasm, meson, ninja, pkg-config).
  * macOS/Linux require the same tools on PATH (Homebrew / distro packages).
+ * Linux also requires patchelf.
  */
 
 const { spawnSync } = require('child_process');
@@ -21,7 +22,7 @@ const path = require('path');
 const { pipeline } = require('stream/promises');
 const { createWriteStream } = require('fs');
 const os = require('os');
-const { which } = require('./gpuBackends');
+const { which, requirePatchelf, copyFile, finishStagedNativeDir } = require('./gpuBackends');
 
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_OUT = path.join(ROOT, 'vendor', 'ffmpeg');
@@ -278,6 +279,38 @@ function enableFlags(kind, names) {
   return names.map((n) => `--enable-${kind}=${n}`).join(' \\\n  ');
 }
 
+/**
+ * Debian/Ubuntu meson defaults to lib/<triplet> (GNUInstallDirs). MinGW and
+ * macOS use lib/. Include both so pkg-config and the linker find dav1d.
+ */
+function linuxMultiarchTriplet() {
+  if (process.platform !== 'linux') {
+    return null;
+  }
+  if (process.arch === 'x64') {
+    return 'x86_64-linux-gnu';
+  }
+  if (process.arch === 'arm64') {
+    return 'aarch64-linux-gnu';
+  }
+  return null;
+}
+
+function prefixLibSearchDirs(prefixPosix) {
+  const dirs = [`${prefixPosix}/lib`, `${prefixPosix}/lib64`];
+  const triplet = linuxMultiarchTriplet();
+  if (triplet) {
+    dirs.push(`${prefixPosix}/lib/${triplet}`);
+  }
+  return dirs;
+}
+
+function prefixPkgConfigPath(prefixPosix) {
+  return prefixLibSearchDirs(prefixPosix)
+    .map((dir) => `${dir}/pkgconfig`)
+    .join(':');
+}
+
 function ffmpegConfigureFlags(prefixPosix, extraLdflags, { pic = false } = {}) {
   return [
     `--prefix=${prefixPosix}`,
@@ -332,8 +365,11 @@ function writeUnixBuildScript(opts) {
   const ffmpegPosix = toPosixPath(ffmpegSrc);
   const rpath =
     process.platform === 'darwin' ? '-Wl,-rpath,@loader_path' : '-Wl,-rpath,\\$ORIGIN';
-  const extraLdflags = `--extra-cflags=-I${prefixPosix}/include --extra-ldflags="-L${prefixPosix}/lib ${rpath}"`;
-  const pkgConfig = `${prefixPosix}/lib/pkgconfig`;
+  const libFlags = prefixLibSearchDirs(prefixPosix)
+    .map((dir) => `-L${dir}`)
+    .join(' ');
+  const extraLdflags = `--extra-cflags=-I${prefixPosix}/include --extra-ldflags="${libFlags} ${rpath}"`;
+  const pkgConfig = prefixPkgConfigPath(prefixPosix);
 
   const body = `#!/usr/bin/env bash
 set -euo pipefail
@@ -345,6 +381,7 @@ cd "${dav1dPosix}"
 rm -rf build-glaux
 meson setup build-glaux \\
   --prefix="${prefixPosix}" \\
+  --libdir=lib \\
   --default-library=shared \\
   --buildtype=release \\
   -Denable_tools=false \\
@@ -395,6 +432,7 @@ cd "${dav1dPosix}"
 rm -rf build-glaux
 meson setup build-glaux \\
   --prefix="${prefixPosix}" \\
+  --libdir=lib \\
   --default-library=shared \\
   --buildtype=release \\
   -Denable_tools=false \\
@@ -412,11 +450,6 @@ make install
   const scriptPath = path.join(workDir, 'build.sh');
   fs.writeFileSync(scriptPath, body.replace(/\r\n/g, '\n'));
   return scriptPath;
-}
-
-function copyFile(src, dest) {
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.copyFileSync(src, dest);
 }
 
 function copyMatching(dir, predicate, destDir) {
@@ -445,11 +478,64 @@ function isSharedLib(name) {
   return /\.so(\.\d+)*$/.test(name);
 }
 
+/**
+ * Bake $ORIGIN into DT_RUNPATH so ffmpeg loads sibling libav*.so without
+ * LD_LIBRARY_PATH. The configure ldflag uses `\$ORIGIN` so bash does not
+ * expand `$$` to the shell PID. patchelf is required on Linux when the baked
+ * runpath is wrong.
+ *
+ * @param {string} outDir
+ */
+function fixLinuxFfmpegRunpaths(outDir) {
+  if (process.platform !== 'linux') {
+    return;
+  }
+  const patchelf = requirePatchelf();
+  for (const name of fs.readdirSync(outDir)) {
+    if (name !== 'ffmpeg' && name !== 'ffprobe' && !isSharedLib(name)) {
+      continue;
+    }
+    const file = path.join(outDir, name);
+    try {
+      if (fs.lstatSync(file).isSymbolicLink()) {
+        continue;
+      }
+    } catch {
+      continue;
+    }
+    const result = spawnSync(patchelf, ['--set-rpath', '$ORIGIN', file], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      console.warn(`patchelf --set-rpath failed for ${name}: ${(result.stderr || '').trim()}`);
+    }
+  }
+}
+
+function listPrefixLibDirs(prefixDir) {
+  const dirs = [];
+  const seen = new Set();
+  const add = (dir) => {
+    if (seen.has(dir) || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      return;
+    }
+    seen.add(dir);
+    dirs.push(dir);
+  };
+  add(path.join(prefixDir, 'lib'));
+  add(path.join(prefixDir, 'lib64'));
+  const libRoot = path.join(prefixDir, 'lib');
+  if (fs.existsSync(libRoot) && fs.statSync(libRoot).isDirectory()) {
+    for (const name of fs.readdirSync(libRoot)) {
+      if (/-linux-gnu$/.test(name)) {
+        add(path.join(libRoot, name));
+      }
+    }
+  }
+  return dirs;
+}
+
 function stagePrefixToVendor(prefixDir, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
   const binDir = path.join(prefixDir, 'bin');
-  const libDir = path.join(prefixDir, 'lib');
-  const lib64Dir = path.join(prefixDir, 'lib64');
 
   const ffmpegSrc = path.join(binDir, ffmpegBinName());
   const ffprobeSrc = path.join(binDir, ffprobeBinName());
@@ -464,8 +550,11 @@ function stagePrefixToVendor(prefixDir, outDir) {
   }
 
   copyMatching(binDir, isSharedLib, outDir);
-  copyMatching(libDir, isSharedLib, outDir);
-  copyMatching(lib64Dir, isSharedLib, outDir);
+  for (const libDir of listPrefixLibDirs(prefixDir)) {
+    copyMatching(libDir, isSharedLib, outDir);
+  }
+  finishStagedNativeDir(outDir);
+  fixLinuxFfmpegRunpaths(outDir);
 }
 
 function copyLicenses(ffmpegSrc, dav1dSrc, outDir) {
@@ -572,6 +661,7 @@ async function main() {
       throw new Error('Missing pkg-config on PATH. Install pkg-config, then retry.');
     }
   }
+  requirePatchelf();
 
   const workDir = opts.workDir;
   const srcDir = path.join(workDir, 'src');

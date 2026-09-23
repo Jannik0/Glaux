@@ -7,6 +7,8 @@
  * Clones ggml-org/llama.cpp at LLAMA_CPP_REV into deps/ if missing.
  * Video multimodal support uses the shared vendor/ffmpeg tree
  * (`npm run build:ffmpeg`); this script does not stage ffmpeg/ffprobe.
+ * CUDA kernels use a pinned architecture list (Turing–Blackwell) from
+ * gpuBackends.cudaArchitectureCmakeArgs rather than the toolkit default.
  *
  * Usage:
  *   node scripts/build-llamacpp.js
@@ -21,14 +23,19 @@ const os = require('os');
 const {
   resolveBuildBackends,
   cmakeGpuArgs,
+  cudaCompilerCmakeArgs,
+  cudaArchitectureCmakeArgs,
   rpathCmakeArgs,
   cudaQuietCmakeArgs,
   cmakeBuildQuietArgs,
   cudaBuildJobs,
   stageNativeRuntime,
   stageSharedCudaRuntime,
+  shareGgmlCudaBackend,
   removeStagedCudaRedistributables,
+  withCudaToolkitEnv,
   which,
+  requirePatchelf,
 } = require('./gpuBackends');
 const { ensureGitDep } = require('./ensureGitDep');
 
@@ -128,6 +135,7 @@ function main() {
   if (!which('cmake')) {
     throw new Error('cmake not found on PATH. Install CMake to build llama.cpp.');
   }
+  requirePatchelf();
 
   const buildDir = path.join(opts.srcDir, 'build-glaux');
   fs.mkdirSync(opts.outDir, { recursive: true });
@@ -150,6 +158,8 @@ function main() {
     '-DGGML_SYCL=OFF',
     '-DLLAMA_BUILD_SERVER=ON',
     ...cmakeGpuArgs('ggml', backends),
+    ...cudaCompilerCmakeArgs(backends),
+    ...cudaArchitectureCmakeArgs(backends),
     ...rpathCmakeArgs(),
     ...cudaQuietCmakeArgs(backends),
   ];
@@ -162,7 +172,8 @@ function main() {
     cmakeArgs.push('-DCMAKE_BUILD_TYPE=Release');
   }
 
-  run('cmake', cmakeArgs);
+  const cmakeEnv = withCudaToolkitEnv();
+  run('cmake', cmakeArgs, { env: cmakeEnv });
 
   const buildArgs = [
     '--build',
@@ -175,7 +186,7 @@ function main() {
     String(cudaBuildJobs(opts.jobs, backends)),
     ...cmakeBuildQuietArgs(),
   ];
-  run('cmake', buildArgs);
+  run('cmake', buildArgs, { env: cmakeEnv });
 
   const built = findBuiltServer(buildDir);
   if (!built) {
@@ -192,6 +203,7 @@ function main() {
   if (backends.cuda) {
     stageSharedCudaRuntime({ required: true });
   }
+  shareGgmlCudaBackend(opts.outDir, path.join(ROOT, 'vendor', 'transcribe'));
 
   console.log('llama.cpp build complete.');
 }

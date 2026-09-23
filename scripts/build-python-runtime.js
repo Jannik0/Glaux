@@ -15,11 +15,18 @@
  * moved into vendor/cuda so Torch shares one runtime with llama.cpp / transcribe.cpp.
  * macOS always installs the default PyPI wheels (MPS-capable when hardware supports it).
  *
- * After wheels are installed, packaging leftovers are removed (MSVC .lib files,
- * torch/include, pip/setuptools/ensurepip, tcl/tk, hf_xet, package tests/
- * trees, Torch cusolverMg / nvperf_host / nvrtc*.alt). Public testing modules
- * (numpy.testing, torch.testing) stay. CUPTI and the non-alt NVRTC stay. Rebuild
- * the runtime to add Python packages; the shipped tree cannot pip-install.
+ * After wheels are installed, the same leftover cuts run on Windows and Linux:
+ * MSVC .lib / .pdb, static .a, torch/include, pip/setuptools/ensurepip, tcl/tk,
+ * hf_xet, package tests/ trees, triton, NVTX,
+ * cuda-bindings, and unused CPython stdlib. Linux also collapses ELF
+ * SONAME copies, strips binaries, and removes matching DT_NEEDED entries
+ * with patchelf (those steps are no-ops on Windows). cuDNN, cuFFT, cuRAND, NVRTC, cuSOLVER,
+ * cuSPARSE, and CUPTI stay (libtorch calls them). NCCL, cuSPARSELt, NVSHMEM, and
+ * cuFile are replaced with loader stubs on Windows and Linux: libtorch still
+ * links them, but Glaux never calls multi-GPU collectives, 2:4 sparse matmul,
+ * or GPUDirect Storage. Public testing modules (numpy.testing, torch.testing)
+ * stay. Rebuild with npm run build:python after changing prune logic; the
+ * shipped tree cannot pip-install.
  */
 
 const { spawnSync } = require('child_process');
@@ -32,8 +39,14 @@ const { withSharedCudaLibPath } = require('../engines/common/gpuRuntime');
 const {
   stageSharedCudaRuntime,
   shareTorchCuda13WithVendor,
-  findTorchLibDir,
+  findSitePackages,
+  isDroppedCudaDepName,
+  collapseDuplicateLibsRecursive,
+  stripNativeBinariesRecursive,
+  removeDroppedElfNeeded,
+  requirePatchelf,
 } = require('./gpuBackends');
+const { stubTorchUnusedCudaDeps } = require('./cudaStubs');
 
 const DEFAULT_PBS_TAG = '20260718';
 const DEFAULT_PYTHON_VERSION = '3.14.6';
@@ -166,27 +179,6 @@ function run(command, args, options = {}) {
   }
 }
 
-function findSitePackages(runtimeRoot) {
-  if (process.platform === 'win32') {
-    const dir = path.join(runtimeRoot, 'Lib', 'site-packages');
-    return fs.existsSync(dir) ? dir : null;
-  }
-  const libRoot = path.join(runtimeRoot, 'lib');
-  if (!fs.existsSync(libRoot)) {
-    return null;
-  }
-  for (const name of fs.readdirSync(libRoot)) {
-    if (!/^python\d/.test(name)) {
-      continue;
-    }
-    const dir = path.join(libRoot, name, 'site-packages');
-    if (fs.existsSync(dir)) {
-      return dir;
-    }
-  }
-  return null;
-}
-
 function installCudaSitecustomize(runtimeRoot) {
   const sitePackages = findSitePackages(runtimeRoot);
   if (!sitePackages) {
@@ -263,31 +255,8 @@ function pruneSitePackage(sitePackages, name, removed) {
   }
 }
 
-function pruneMsvcLibFiles(runtimeRoot, removed) {
-  const walk = (dir) => {
-    let ents;
-    try {
-      ents = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const ent of ents) {
-      const full = path.join(dir, ent.name);
-      if (ent.isDirectory()) {
-        walk(full);
-      } else if (ent.isFile() && ent.name.toLowerCase().endsWith('.lib')) {
-        pruneTarget(full, removed);
-      }
-    }
-  };
-  walk(runtimeRoot);
-}
-
 function prunePipScripts(runtimeRoot, removed) {
-  const scriptDirs =
-    process.platform === 'win32'
-      ? [path.join(runtimeRoot, 'Scripts')]
-      : [path.join(runtimeRoot, 'bin')];
+  const scriptDirs = [path.join(runtimeRoot, 'Scripts'), path.join(runtimeRoot, 'bin')];
   const pipName = /^(pip|pip\d+(\.\d+)*)(\.exe|\.cmd)?$/i;
   const easyInstall = /^easy_install(-[\d.]+)?(\.exe|\.cmd)?$/i;
   for (const dir of scriptDirs) {
@@ -332,20 +301,80 @@ function prunePackageTestSuites(sitePackages, removed) {
   walk(sitePackages);
 }
 
-function pruneUnusedTorchCudaExtras(runtimeRoot, removed) {
-  const torchLib = findTorchLibDir(runtimeRoot);
-  if (!torchLib) {
-    return;
-  }
-  for (const name of fs.readdirSync(torchLib)) {
-    if (
-      /cusolverMg/i.test(name) ||
-      /^nvperf_host/i.test(name) ||
-      /^libnvperf_host/i.test(name) ||
-      /nvrtc.*\.alt/i.test(name)
-    ) {
-      pruneTarget(path.join(torchLib, name), removed);
+/**
+ * Same CUDA extra names on Windows and Linux (DLL or .so). Also drop
+ * compile-time leftovers (.lib / .pdb / .a) wherever they landed.
+ * @param {string} runtimeRoot
+ * @param {{ rel: string, bytes: number }[]} removed
+ */
+function pruneDroppedRuntimeFiles(runtimeRoot, removed) {
+  const walk = (dir) => {
+    let ents;
+    try {
+      ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
     }
+    for (const ent of ents) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!ent.isFile()) {
+        continue;
+      }
+      if (/\.(lib|pdb|exp|ilk|a)$/i.test(ent.name) || isDroppedCudaDepName(ent.name)) {
+        pruneTarget(full, removed);
+      }
+    }
+  };
+  walk(runtimeRoot);
+}
+
+const NVIDIA_DROP_DIRS = ['nvtx'];
+const NVIDIA_DROP_DISTINFO =
+  /^(nvidia[_-]nvtx|cuda_bindings|cuda_toolkit)/i;
+const PYTHON_DROP_PACKAGES = ['triton', 'cuda_bindings', 'cuda', 'cuda_toolkit'];
+const PIP_UNINSTALL_PACKAGES = [
+  'triton',
+  'nvidia-nvtx',
+  'cuda-bindings',
+  'cuda-pathfinder',
+];
+const STDLIB_DROP_DIRS = [
+  'ensurepip',
+  'idlelib',
+  'turtledemo',
+  'pydoc_data',
+  'lib2to3',
+  'distutils',
+  'tkinter',
+  'test',
+];
+
+function pruneUnusedNvidiaPackages(sitePackages, removed) {
+  const nvidia = path.join(sitePackages, 'nvidia');
+  if (fs.existsSync(nvidia)) {
+    for (const name of NVIDIA_DROP_DIRS) {
+      pruneTarget(path.join(nvidia, name), removed);
+    }
+    pruneTarget(path.join(nvidia, 'cu13', 'include'), removed);
+    pruneTarget(path.join(nvidia, 'cudnn', 'include'), removed);
+    for (const pkg of fs.readdirSync(nvidia)) {
+      pruneTarget(path.join(nvidia, pkg, 'include'), removed);
+    }
+  }
+  for (const entry of fs.readdirSync(sitePackages)) {
+    if (NVIDIA_DROP_DISTINFO.test(entry) && entry.endsWith('.dist-info')) {
+      pruneTarget(path.join(sitePackages, entry), removed);
+    }
+  }
+}
+
+function pruneUnusedInferencePackages(sitePackages, removed) {
+  for (const name of PYTHON_DROP_PACKAGES) {
+    pruneSitePackage(sitePackages, name, removed);
   }
 }
 
@@ -360,7 +389,7 @@ function pruneTclTk(runtimeRoot, removed) {
     }
   }
   const libRoot = path.join(runtimeRoot, 'lib');
-  if (!fs.existsSync(libRoot) || process.platform === 'win32') {
+  if (!fs.existsSync(libRoot)) {
     return;
   }
   for (const name of fs.readdirSync(libRoot)) {
@@ -370,14 +399,56 @@ function pruneTclTk(runtimeRoot, removed) {
   }
 }
 
+function pruneStdlibLeftovers(stdlib, removed) {
+  if (!stdlib) {
+    return;
+  }
+  for (const name of STDLIB_DROP_DIRS) {
+    pruneTarget(path.join(stdlib, name), removed);
+  }
+  pruneTarget(path.join(stdlib, 'turtle.py'), removed);
+}
+
+function prunePycache(root, removed) {
+  const walk = (dir) => {
+    let ents;
+    try {
+      ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of ents) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (ent.name === '__pycache__') {
+          pruneTarget(full, removed);
+          continue;
+        }
+        walk(full);
+        continue;
+      }
+      if (ent.isFile() && /\.py[co]$/i.test(ent.name)) {
+        pruneTarget(full, removed);
+      }
+    }
+  };
+  walk(root);
+}
+
 /**
  * Drop compile-time and installer leftovers that the packaged app never uses.
- * Must run after pip install + the import check.
+ * Must run after pip install + the first import check. On Linux, unused CUDA
+ * DT_NEEDED entries are stripped before those libraries are deleted so
+ * libtorch still loads.
  * @param {string} runtimeRoot
  */
 function prunePackagingLeftovers(runtimeRoot) {
   const removed = [];
-  pruneMsvcLibFiles(runtimeRoot, removed);
+  const needed = removeDroppedElfNeeded(runtimeRoot);
+  if (needed) {
+    console.log(`Removed ${needed} pruned CUDA DT_NEEDED entit${needed === 1 ? 'y' : 'ies'}`);
+  }
+  pruneDroppedRuntimeFiles(runtimeRoot, removed);
 
   const sitePackages = findSitePackages(runtimeRoot);
   if (sitePackages) {
@@ -389,21 +460,41 @@ function prunePackagingLeftovers(runtimeRoot) {
     pruneTarget(path.join(sitePackages, '_distutils_hack'), removed);
     pruneTarget(path.join(sitePackages, 'distutils-precedence.pth'), removed);
     prunePackageTestSuites(sitePackages, removed);
+    pruneUnusedNvidiaPackages(sitePackages, removed);
+    pruneUnusedInferencePackages(sitePackages, removed);
   }
 
-  const stdlib = findStdlibDir(runtimeRoot);
-  if (stdlib) {
-    pruneTarget(path.join(stdlib, 'ensurepip'), removed);
-  }
-
+  pruneStdlibLeftovers(findStdlibDir(runtimeRoot), removed);
   prunePipScripts(runtimeRoot, removed);
   pruneTclTk(runtimeRoot, removed);
-  pruneUnusedTorchCudaExtras(runtimeRoot, removed);
+  prunePycache(runtimeRoot, removed);
 
   const bytes = removed.reduce((sum, item) => sum + item.bytes, 0);
   console.log(
     `Pruned packaging leftovers (${removed.length} paths, ${(bytes / (1024 * 1024)).toFixed(1)} MB)`
   );
+}
+
+/**
+ * Apply every Python-tree cut. Called only from this build script; change
+ * prune logic and rebuild with npm run build:python.
+ * @param {string} runtimeRoot
+ * @param {{ shareCuda?: boolean }} [opts]
+ */
+function finishPythonRuntime(runtimeRoot, opts = {}) {
+  prunePackagingLeftovers(runtimeRoot);
+  const collapsed = collapseDuplicateLibsRecursive(runtimeRoot);
+  if (collapsed) {
+    console.log(`Collapsed ${collapsed} duplicate Python SONAME copy(ies)`);
+  }
+  const stripped = stripNativeBinariesRecursive(runtimeRoot);
+  if (stripped) {
+    console.log(`Stripped ${stripped} Python native binary(ies)`);
+  }
+  if (opts.shareCuda) {
+    shareTorchCuda13WithVendor(runtimeRoot);
+  }
+  stubTorchUnusedCudaDeps(runtimeRoot);
 }
 
 function resolvePythonExe(runtimeRoot) {
@@ -430,6 +521,20 @@ function resolvePythonExe(runtimeRoot) {
     }
   }
   throw new Error(`Expected bin/python3 under ${runtimeRoot}`);
+}
+
+function verifyRuntimeImports(pythonExe, env) {
+  run(
+    pythonExe,
+    [
+      '-c',
+      'import torch, transformers, PIL, librosa; x = torch.zeros(1); ' +
+        'x = x.cuda() if torch.cuda.is_available() else x; ' +
+        'a = torch.ones(8, 8, device=x.device); b = a @ a; ' +
+        'print("ok", torch.__version__, "cuda", torch.version.cuda, transformers.__version__, float(b[0, 0]))',
+    ],
+    { env }
+  );
 }
 
 function torchInstallArgs(torchVariant) {
@@ -485,6 +590,7 @@ async function main() {
   console.log(`Torch:    ${args.torchVariant}`);
   console.log(`Output:   ${outDir}`);
   console.log('');
+  requirePatchelf();
 
   if (!fs.existsSync(requirements)) {
     throw new Error(`Missing requirements file: ${requirements}`);
@@ -531,6 +637,8 @@ async function main() {
   console.log('Installing remaining requirements...');
   run(pythonExe, ['-m', 'pip', 'install', '--no-warn-script-location', '-r', requirements]);
 
+  const pipEnv = withSharedCudaLibPath({ ...process.env });
+
   if (process.platform !== 'darwin' && args.torchVariant.startsWith('cu')) {
     stageSharedCudaRuntime({ required: false });
     if (args.torchVariant === 'cu130') {
@@ -540,23 +648,39 @@ async function main() {
   }
 
   console.log('Verifying imports...');
-  run(
-    pythonExe,
-    [
-      '-c',
-      'import torch, transformers, PIL, librosa; print("ok", torch.__version__, "cuda", torch.version.cuda, transformers.__version__)',
-    ],
-    { env: withSharedCudaLibPath({ ...process.env }) }
-  );
+  verifyRuntimeImports(pythonExe, pipEnv);
+
+  if (process.platform !== 'darwin') {
+    // Drop DT_NEEDED for extras we are about to uninstall (NVTX)
+    // so libtorch still loads after those libraries are gone.
+    if (process.platform === 'linux') {
+      const needed = removeDroppedElfNeeded(outDir);
+      if (needed) {
+        console.log(`Removed ${needed} pruned CUDA DT_NEEDED entit${needed === 1 ? 'y' : 'ies'}`);
+      }
+    }
+    console.log(`Uninstalling unused inference extras (${PIP_UNINSTALL_PACKAGES.join(', ')})...`);
+    spawnSync(pythonExe, ['-m', 'pip', 'uninstall', '-y', ...PIP_UNINSTALL_PACKAGES], {
+      stdio: 'inherit',
+      env: pipEnv,
+    });
+  }
 
   console.log('Pruning packaging leftovers...');
-  prunePackagingLeftovers(outDir);
+  finishPythonRuntime(outDir, {
+    shareCuda: process.platform !== 'darwin' && args.torchVariant === 'cu130',
+  });
+
+  console.log('Verifying imports after prune...');
+  verifyRuntimeImports(pythonExe, pipEnv);
 
   console.log('');
   console.log(`Done. Runtime ready at: ${outDir}`);
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

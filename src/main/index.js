@@ -8,6 +8,7 @@ const { ensureWorkspacesReady } = require('./domains/workspaces');
 const { loadPreferences, getPreferences } = require('./domains/preferences');
 const { applyResolvedLanguage, applyChromiumLangSwitch } = require('./domains/i18n');
 const { getWindowBackgroundColor } = require('./domains/theme');
+const { isForceCpu } = require('../../engines/common/gpuRuntime');
 
 if (process.platform === 'win32') {
   app.setAppUserModelId(APP_NAME);
@@ -16,6 +17,12 @@ if (process.platform === 'win32') {
 initAppPaths();
 applyChromiumLangSwitch();
 registerIpc();
+
+if (isForceCpu()) {
+  process.stderr.write(
+    'GLAUX_FORCE_CPU is set; Hugging Face, llama.cpp, and transcribe.cpp will pin CPU.\n'
+  );
+}
 
 function createWindow() {
   const mainWindow = new BrowserWindow({

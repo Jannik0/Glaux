@@ -17,6 +17,11 @@ describe('withFfmpegEnv', () => {
       const env = withFfmpegEnv({ PATH: 'rest' }, dir);
       assert.ok(env.PATH.startsWith(path.resolve(dir)));
       assert.match(env.PATH, /rest/);
+      if (process.platform === 'linux') {
+        assert.ok(env.LD_LIBRARY_PATH.startsWith(path.resolve(dir)));
+      } else if (process.platform === 'darwin') {
+        assert.ok(env.DYLD_LIBRARY_PATH.startsWith(path.resolve(dir)));
+      }
       assert.equal(env.GLAUX_FFMPEG, path.join(path.resolve(dir), ffmpegBinName()));
       assert.equal(env.GLAUX_FFPROBE, path.join(path.resolve(dir), ffprobeBinName()));
     } finally {

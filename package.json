@@ -1,7 +1,8 @@
 {
   "name": "Glaux",
   "productName": "Glaux",
-  "version": "1.1.1",
+  "desktopName": "com.glaux.app",
+  "version": "1.1.2",
   "description": "Local AI workspace with on-device inference - chat, multimodal input, document analysis, audio transcription.",
   "main": "src/main/index.js",
   "author": "Jannik Lehmkuhl",
@@ -13,11 +14,11 @@
     "build:llamacpp": "node scripts/build-llamacpp.js",
     "build:transcribe": "node scripts/build-transcribe.js",
     "predist": "node scripts/check-python-runtime.js && node scripts/check-cuda-runtime.js && node scripts/check-ffmpeg-runtime.js && node scripts/check-llamacpp-runtime.js && node scripts/check-transcribe-runtime.js",
-    "dist": "electron-builder",
-    "dist:dir": "electron-builder --dir",
-    "dist:win": "electron-builder --win",
-    "dist:mac": "electron-builder --mac",
-    "dist:linux": "electron-builder --linux"
+    "dist": "node scripts/run-electron-builder.js",
+    "dist:dir": "node scripts/run-electron-builder.js --dir",
+    "dist:win": "node scripts/run-electron-builder.js --win",
+    "dist:mac": "node scripts/run-electron-builder.js --mac",
+    "dist:linux": "node scripts/run-electron-builder.js --linux"
   },
   "keywords": [
     "electron",
@@ -46,6 +47,7 @@
   "build": {
     "appId": "com.glaux.app",
     "productName": "Glaux",
+    "compression": "maximum",
     "directories": {
       "output": "dist"
     },
@@ -61,7 +63,20 @@
     "extraResources": [
       {
         "from": "vendor/python",
-        "to": "python"
+        "to": "python",
+        "filter": [
+          "**/*",
+          "!**/__pycache__",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/*.pyo",
+          "!**/*.a",
+          "!**/*.pdb",
+          "!**/include",
+          "!**/include/**",
+          "!**/tests",
+          "!**/tests/**"
+        ]
       },
       {
         "from": "vendor/ffmpeg",
@@ -116,10 +131,13 @@
     "linux": {
       "target": [
         "AppImage",
-        "tar.gz"
+        "deb",
+        "rpm"
       ],
       "icon": "assets/GlauxAI_Logo.png",
       "category": "Utility",
+      "syncDesktopName": true,
+      "maintainer": "Jannik Lehmkuhl <jannik@glaux.ai>",
       "extraResources": [
         {
           "from": "vendor/cuda",
@@ -132,6 +150,6 @@
       "allowToChangeInstallationDirectory": true,
       "artifactName": "${productName}-Setup-${version}.${ext}"
     },
-    "afterPack": "./scripts/prune-electron-locales.js"
+    "afterPack": "./scripts/afterPack.js"
   }
 }

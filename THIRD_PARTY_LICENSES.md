@@ -2,9 +2,9 @@
 
 Glaux source code is licensed under the MIT License — see [LICENSE](LICENSE).
 
-A **packaged** Glaux build (installer, zip, dmg, AppImage, or unpacked `dist/` tree) also redistributes independently licensed components. Those licenses apply to the corresponding files, not to Glaux source. This notice is shipped next to the app as `THIRD_PARTY_LICENSES.md` (under Electron `extraResources`).
+A **packaged** Glaux build (installer, zip, dmg, AppImage, deb, rpm, or unpacked `dist/` tree) also redistributes independently licensed components. Those licenses apply to the corresponding files, not to Glaux source. This notice is shipped next to the app as `THIRD_PARTY_LICENSES.md` (under Electron `extraResources`).
 
-Glaux does not modify the third-party binaries it stages. Hub **model weights** are downloaded by the user at runtime and are **not** part of Glaux; each model remains under its own Hub license (for example Google Gemma terms).
+Staged third-party binaries are shipped unmodified. On Windows and Linux GPU builds, the NVIDIA NCCL, cuSPARSELt, NVSHMEM, and cuFile libraries are the exception: those binaries are not included. `npm run build:python` compiles tiny loader stubs that keep the original SONAME or DLL name so libtorch still loads. The stubs are Glaux build output, not NVIDIA code and not modified NVIDIA binaries. Hub **model weights** are downloaded by the user at runtime and are **not** part of Glaux; each model remains under its own Hub license (for example Google Gemma terms).
 
 Electron already writes Chromium and Electron license files into the install directory (`LICENSES.chromium.html`, `LICENSE.electron.txt`). Python wheels keep their license texts under `site-packages/*.dist-info`.
 
@@ -19,8 +19,8 @@ Electron already writes Chromium and Electron license files into the install dir
 
 ### transcribe.cpp
 
-- **What:** `transcribe-cli` and ggml backend modules under `vendor/transcribe` (packaged as `resources/transcribe`)
-- **License:** MIT
+- **What:** `transcribe-cli` and ggml backend modules under `vendor/transcribe` (packaged as `resources/transcribe`). The CUDA backend file is a link to llama.cpp’s `libggml-cuda` / `ggml-cuda.dll` in `vendor/llamacpp`. Vulkan and the other backends are the transcribe.cpp build.
+- **License:** MIT (the shared CUDA module is the llama.cpp binary, also MIT)
 - **Upstream:** https://github.com/handy-computer/transcribe.cpp
 
 
@@ -42,7 +42,9 @@ On Windows and Linux GPU builds, Glaux copies CUDA **runtime** libraries (not th
 
 These files are NVIDIA proprietary software, redistributed under the [NVIDIA CUDA Toolkit EULA](https://docs.nvidia.com/cuda/eula/index.html) (redistributable subset). They are not licensed under MIT. End users still need a current NVIDIA **driver** for CUDA inference; the Toolkit itself is not required on the end-user machine.
 
-PyTorch CUDA wheels in `vendor/python` still include Torch-only NVIDIA components (for example cuDNN, cuFFT, nvrtc) covered by the same family of NVIDIA terms. Overlapping CUDA 13 runtime libraries are stripped from `torch/lib` so they are not shipped twice.
+PyTorch CUDA wheels in `vendor/python` still include the NVIDIA components libtorch calls for single-GPU inference (cuDNN, cuFFT, nvrtc, cuSOLVER, cuSPARSE, CUPTI), covered by the same family of NVIDIA terms. PyTorch’s own `libtorch_nvshmem.so` stays; that file is part of the PyTorch wheel, not the NVIDIA NVSHMEM library. Overlapping CUDA 13 runtime libraries are replaced with links to `vendor/cuda` (from both `torch/lib` and `nvidia/cu13`) so they are not shipped twice.
+
+The NVIDIA NCCL, cuSPARSELt, NVSHMEM, and cuFile binaries are not shipped. On Windows and Linux, Glaux replaces those shared libraries with the loader stubs described above. NVSHMEM device bitcode and bootstrap plugins are deleted. The wheel `*.dist-info` directories for those four packages, including their NVIDIA license texts, remain under `site-packages`. Headers, static libs, NVTX, `nvperf`, `cusolverMg`, and `nvrtc*.alt` are omitted from the packaged tree.
 
 
 ## Python runtime and ML stack

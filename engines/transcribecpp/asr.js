@@ -5,12 +5,11 @@
  * cache-aware streaming args, parse progressive stdout into onToken deltas.
  */
 
-const { spawn } = require('child_process');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const os = require('os');
 const path = require('path');
-const { pickFfmpeg } = require('../common/ffmpeg');
+const { pickFfmpeg, spawnFfmpeg } = require('../common/ffmpeg');
 const { isForceCpu } = require('../common/gpuRuntime');
 const { runTranscribeCli } = require('./cli');
 
@@ -108,7 +107,7 @@ async function ensureSixteenKhzMonoWav(audioPath, opts = {}) {
       'pcm_s16le',
       outPath,
     ];
-    const child = spawn(ffmpeg, args, { windowsHide: true });
+    const child = spawnFfmpeg(args);
     let err = '';
     const onAbort = () => {
       try {

@@ -46,3 +46,22 @@ if (!hasAvcodec) {
 console.log(`Found ffmpeg at ${ffmpegBin}`);
 console.log(`Found ffprobe at ${ffprobeBin}`);
 console.log(`Found shared libavcodec in ${vendor}`);
+
+if (process.platform === 'linux') {
+  const { spawnSync } = require('child_process');
+  const ldd = spawnSync('ldd', [ffmpegBin], {
+    encoding: 'utf8',
+    env: { ...process.env, LD_LIBRARY_PATH: vendor },
+  });
+  const missing = (ldd.stdout || '')
+    .split('\n')
+    .filter((line) => /libav|libsw|libdav1d/.test(line) && /not found/.test(line));
+  if (ldd.status !== 0 || missing.length) {
+    console.error(
+      `Vendored ffmpeg cannot resolve libav* with LD_LIBRARY_PATH=${vendor}.\n` +
+        (missing.join('\n') || ldd.stderr || 'ldd failed') +
+        `\nRebuild with:\n  npm run build:ffmpeg -- --force`
+    );
+    process.exit(1);
+  }
+}

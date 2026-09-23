@@ -51,7 +51,7 @@ $env:HF_TOKEN="hf_your_token"
 export HF_TOKEN=hf_your_token
 ```
 
-**Packaged app:** set the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, then launch. Hub **model weights stay under their own licenses**; downloading a gated model does not change the Glaux MIT license.
+**Packaged app:** set the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, `.deb`, or `.rpm`, then launch. Hub **model weights stay under their own licenses**; downloading a gated model does not change the Glaux MIT license.
 
 
 
@@ -124,11 +124,13 @@ export HF_TOKEN=hf_your_token
 - For GGUF inference in development:
   - Chat / multimodal: `npm run build:llamacpp` (clones a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) into `deps/llama.cpp` if missing)
   - ASR: `npm run build:transcribe` (clones a pinned [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) into `deps/transcribe.cpp` if missing)
-  - Install **CMake** + a C++ toolchain (VS 2022 on Windows, Xcode CLT on macOS, build-essential on Linux)
-  - On Windows/Linux, also install the **CUDA Toolkit** (`nvcc`) and **Vulkan SDK** so GPU backends are compiled into the vendor trees (not required on the end-user machine)
+  - Install **CMake** + a C++ toolchain (VS 2022 on Windows, Xcode CLT on macOS, `build-essential` on Linux)
+  - On Windows/Linux, also install the **CUDA Toolkit** (`nvcc`) and **Vulkan SDK** (or Debian/Ubuntu `sudo apt install libvulkan-dev glslc spirv-headers`) so GPU backends are compiled into the vendor trees (not required on the end-user machine)
   - Non-WAV / video ASR prep and Hugging Face audio/video decode use ffmpeg/ffprobe from `vendor/ffmpeg` (built by `npm run build:ffmpeg`)
   - Chat GGUF video input also needs that same `ffprobe` next to ffmpeg (llama.cpp probes with ffprobe, then decodes with ffmpeg)
-  - Building `vendor/ffmpeg` needs **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Windows install [MSYS2](https://www.msys2.org/) MinGW64 (`mingw-w64-x86_64-gcc`, `nasm`, `meson`, `ninja`, `pkg-config`)
+  - Building `vendor/ffmpeg` needs **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Windows install [MSYS2](https://www.msys2.org/) MinGW64 (`mingw-w64-x86_64-gcc`, `nasm`, `meson`, `ninja`, `pkg-config`). On Debian/Ubuntu: `sudo apt install cmake nasm meson ninja-build pkg-config`
+  - **patchelf** is required on Linux (`sudo apt install patchelf`). Vendor builds use it to set `$ORIGIN` RPATH and to drop leftover `DT_NEEDED` entries after Python extras are pruned.
+  - Packaging the Linux `.rpm` needs **rpmbuild**. On Debian/Ubuntu: `sudo apt install rpm`.
 
 Optional: [uv](https://github.com/astral-sh/uv) for managing a local venv. Pass `--cpu-only` to `build:llamacpp` / `build:transcribe` if you need a CPU-only native build for local iteration (note that cpu-only trees cannot be packaged).
 
@@ -211,23 +213,26 @@ One installer per OS/arch contains every backend that OS can use. At runtime the
 
 PyTorch has no Vulkan device; Vulkan is used by the GGUF engines only. CUDA is not available on macOS.
 
-To force CPU **at runtime** (debug / comparison), set `GLAUX_FORCE_CPU=1` in the environment **before launching** the app — it is read when a model is loaded (Hugging Face pipeline / llama-server start) and when a transcription starts. It is not a build flag; GPU backends are still compiled and shipped. Changing the variable while the app is already running has no effect until you restart Glaux.
+To force CPU **at runtime** (debug / comparison), put `GLAUX_FORCE_CPU=1` in the **process environment** that launches the app — it is read when a model is loaded (Hugging Face pipeline / llama-server start) and when a transcription starts. It is not a build flag; GPU backends are still compiled and shipped. Changing the variable while the app is already running has no effect until you restart Glaux.
 
 Chat GGUFs leave llama-server’s `--ctx-size` unset so `--fit` can keep the model’s trained window when it fits, or shrink it (down to 4096) to stay on GPU. Priority order for llama-server’s `--fit` is: 1. fit entire model in GPU memory (and shrink context if necessary) 2. if context is shrunk to 4096 and model still does not fit in GPU memory, offload everything that does not fit in GPU to CPU and system RAM (context stays 4096) 3. if GPU and CPU together cannot hold model with 4096 context size, fail. Set `GLAUX_LLAMA_CTX` to a positive token count (for example `8192`) **before launching** if you need a fixed window; `--fit` will not shrink that value.
 
 **Example**
 
 ```bash
-# Windows (PowerShell)
+# Windows (PowerShell) — session environment, then launch
 $env:GLAUX_FORCE_CPU="1"
 $env:GLAUX_LLAMA_CTX="8192"
 
-# macOS / Linux
-GLAUX_FORCE_CPU=1
-GLAUX_LLAMA_CTX=8192
+# macOS / Linux — export so npm/Electron inherit the vars
+export GLAUX_FORCE_CPU=1
+export GLAUX_LLAMA_CTX=8192
+
+# equivalent one-liner (no prior export needed)
+GLAUX_FORCE_CPU=1 GLAUX_LLAMA_CTX=8192 npm start
 ```
 
-**Packaged app:** set the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, then launch. `GLAUX_FORCE_CPU` accepts `1`, `true`, `yes`. `GLAUX_LLAMA_CTX` accepts any positive number.
+**Packaged app:** export the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, `.deb`, or `.rpm`, then launch. `GLAUX_FORCE_CPU` accepts `1`, `true`, `yes`. `GLAUX_LLAMA_CTX` accepts any positive number.
 
 
 
@@ -242,10 +247,10 @@ See [ENV_VARS.md](ENV_VARS.md) for every environment variable Glaux can read, ac
 Packaging uses **electron-builder** plus:
 
 - a **relocatable Python** tree under `vendor/python` (from [python-build-standalone](https://github.com/astral-sh/python-build-standalone); CUDA Torch on Windows/Linux, MPS-capable wheels on macOS)
-- a **shared CUDA 13 runtime** under `vendor/cuda` (cudart / cublas / cublasLt / nvJitLink) used by PyTorch, llama.cpp, and transcribe.cpp
+- a **shared CUDA 13 runtime** under `vendor/cuda` (cudart / cublas / cublasLt / nvJitLink) used by PyTorch, llama.cpp, and transcribe.cpp — ELF SONAME links are kept as relative symlinks so those libraries are not stored three times
 - shared **ffmpeg + ffprobe** (LGPL, plus dav1d) under `vendor/ffmpeg`
 - `llama-server` with **dynamic ggml backends** under `vendor/llamacpp` built from `deps/llama.cpp`
-- `transcribe-cli` with the same dynamic backends under `vendor/transcribe` built from `deps/transcribe.cpp`
+- `transcribe-cli` with the same dynamic backends under `vendor/transcribe` built from `deps/transcribe.cpp`. The CUDA module is a link to llama.cpp’s `libggml-cuda` / `ggml-cuda.dll`, so that fatbin is stored once. Vulkan stays next to each engine.
 
 The packaged app is larger than a CPU-only build (CUDA Torch and CUDA redistributables). End users do not install the CUDA Toolkit or Vulkan SDK.
 
@@ -259,7 +264,9 @@ npm run build:python
 
 This downloads a platform-matched CPython, installs pinned requirements from `engines/huggingface/requirements.txt`, and writes `vendor/python/`.
 
-Default on Windows/Linux is a **CUDA 13** PyTorch wheel (still runs on CPU when no NVIDIA GPU is present). Overlapping CUDA 13 runtime libraries are staged once into `vendor/cuda/` (shared with llama.cpp and transcribe.cpp). macOS always installs the default PyPI wheels (MPS-capable).
+Default on Windows/Linux is a **CUDA 13** PyTorch wheel (still runs on CPU when no NVIDIA GPU is present). Overlapping CUDA 13 runtime libraries are staged once into `vendor/cuda/` (shared with llama.cpp and transcribe.cpp; Torch’s `nvidia/cu13` copies become symlinks to that folder). macOS always installs the default PyPI wheels (MPS-capable).
+
+The runtime then drops packaging leftovers that inference does not load: **triton** (`torch.compile`), NVTX / `cuda-bindings`, CUDA headers / static libs / profiling extras (`nvperf`, `nvrtc*.alt`, cusolverMg), and unused CPython stdlib (`idlelib`, `test`, `tkinter`). The same names are removed on Windows (DLLs / `.lib`) and Linux (`.so` / `.a`). Linux also collapses ELF SONAME copies and uses **patchelf** to strip leftover `DT_NEEDED` entries so Torch still loads. cuDNN, cuFFT, cuRAND, NVRTC, cuSOLVER, cuSPARSE, and CUPTI stay (libtorch calls them). PyTorch’s `libtorch_nvshmem.so` stays. **NCCL, cuSPARSELt, NVSHMEM, and cuFile** are replaced with tiny loader stubs on Windows and Linux: libtorch still links those names, but the NVIDIA binaries are not shipped. NVSHMEM device bitcode and bootstrap plugins are deleted. The wheel `*.dist-info` directories for those four packages stay with the tree. That drops multi-GPU collectives, 2:4 structured sparsity, and GPUDirect Storage, which Glaux does not use. **librosa** (and scipy / sklearn / numba) stay — many Hub audio models import them. Change prune logic and rerun `npm run build:python`; `npm run dist` only restores copies electron-builder may have flattened.
 
 To force CPU Torch:
 
@@ -275,7 +282,7 @@ npm run build:ffmpeg
 
 This downloads FFmpeg 7.1.1 and dav1d 1.5.1, configures a shared LGPL-minimal decode-oriented build, and stages `ffmpeg`, `ffprobe`, and `libav*` / `libdav1d` into `vendor/ffmpeg/`. llama.cpp, transcribe.cpp, and the Hugging Face worker all use this tree.
 
-Requires **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Windows, use MSYS2 MinGW64 (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-meson mingw-w64-x86_64-ninja mingw-w64-x86_64-pkg-config`). Rebuild with `node scripts/build-ffmpeg.js --force`.
+Requires **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Windows, use MSYS2 MinGW64 (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-meson mingw-w64-x86_64-ninja mingw-w64-x86_64-pkg-config`). On Debian/Ubuntu: `sudo apt install build-essential nasm meson ninja-build pkg-config patchelf`. Linux also requires **patchelf** to bake `$ORIGIN` into DT_RUNPATH.
 
 ### 3. Build llama.cpp
 
@@ -283,7 +290,7 @@ Requires **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Wi
 npm run build:llamacpp
 ```
 
-This clones [llama.cpp](https://github.com/ggml-org/llama.cpp) at the pinned revision in `scripts/build-llamacpp.js` into `deps/llama.cpp` if that directory is missing, configures CMake with `GGML_BACKEND_DL` and enables CUDA+Vulkan (Windows/Linux) or Metal (macOS), builds `llama-server`, stages backend modules into `vendor/llamacpp/`, and stages CUDA 13 runtime libraries into the shared `vendor/cuda/` folder. Video decode uses `vendor/ffmpeg` (see above).
+This clones [llama.cpp](https://github.com/ggml-org/llama.cpp) at the pinned revision in `scripts/build-llamacpp.js` into `deps/llama.cpp` if that directory is missing, configures CMake with `GGML_BACKEND_DL` and enables CUDA+Vulkan (Windows/Linux) or Metal (macOS), builds `llama-server`, stages backend modules into `vendor/llamacpp/`, and stages CUDA 13 runtime libraries into the shared `vendor/cuda/` folder. CUDA kernels are compiled for Turing through Blackwell consumer GPUs (`75-real` … `120`) rather than the toolkit’s default fat arch list. Video decode uses `vendor/ffmpeg` (see above).
 
 Local CPU-only iteration (not packagable):
 
@@ -297,7 +304,7 @@ node scripts/build-llamacpp.js --cpu-only
 npm run build:transcribe
 ```
 
-This clones [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) at the pinned revision in `scripts/build-transcribe.js` into `deps/transcribe.cpp` if that directory is missing, configures CMake with `TRANSCRIBE_GGML_BACKEND_DL` and the same per-OS GPU backends, builds `transcribe-cli`, and stages it plus backend modules into `vendor/transcribe/` (CUDA runtime libraries go to `vendor/cuda/`).
+This clones [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) at the pinned revision in `scripts/build-transcribe.js` into `deps/transcribe.cpp` if that directory is missing, configures CMake with `TRANSCRIBE_GGML_BACKEND_DL` and the same per-OS GPU backends and CUDA architecture list as llama.cpp, builds `transcribe-cli`, and stages it plus backend modules into `vendor/transcribe/` (CUDA runtime libraries go to `vendor/cuda/`). When `vendor/llamacpp` already contains the CUDA backend, the transcribe copy is replaced with a link to that file.
 
 Local CPU-only iteration (not packagable):
 
@@ -324,10 +331,16 @@ Target a specific platform from a matching host (cross-compilation of `vendor/py
 | -------------------- | ------------------- |
 | `npm run dist:win`   | `Glaux-Setup-*.exe` (NSIS) and `Glaux-*-win.zip` |
 | `npm run dist:mac`   | `.dmg`, `.zip` |
-| `npm run dist:linux` | `.AppImage`, `.tar.gz` |
+| `npm run dist:linux` | `.AppImage`, `.deb`, `.rpm` |
 
 
 > **Note (Windows):** The NSIS installer is a single `Setup.exe` with the app embedded. Do not use electron-builder’s self-extracting “portable” `.exe`: the app (with torch) is multi‑gigabyte unpacked, so that format extracts into `%TEMP%` on every launch and appears to hang with no window. The **zip** is a single-file archive alternative (larger than the installer).
+
+> **Note (Linux):** Packaging stages temp files under `dist/.tmp` (not `/tmp`) and deletes that directory when electron-builder exits. `/tmp` is often a small RAM disk (tmpfs); Glaux’s unpacked CUDA Torch tree is multi‑GB and would otherwise fail with `ENOSPC`. Override with `GLAUX_PACKAGING_TMP` (not auto-deleted). See [ENV_VARS.md](ENV_VARS.md).
+
+> **Note (Linux AppImage):** The AppImage **mounts** its payload with FUSE; it does not extract into `/tmp` on each launch (unlike electron-builder’s Windows “portable” `.exe`). Debian 13 / Ubuntu 24.04 ship FUSE 3 only; the runtime still needs **FUSE 2** (`libfuse.so.2`). Install `libfuse2t64` (`sudo apt install libfuse2t64`). Without it, double-clicking does nothing; a terminal run prints `error loading libfuse.so.2`. Do not use `--appimage-extract-and-run`: that would unpack the multi‑GB tree into `/tmp` and fail the same way as the Windows portable build. The `.deb`, `.rpm`, or `dist/linux-unpacked` is the no-FUSE alternative.
+
+> **Note (Linux RPM):** `npm run dist` / `dist:linux` builds the `.rpm` (Fedora, RHEL, openSUSE, and other RPM distributions) with electron-builder’s bundled fpm, which calls **rpmbuild**. Debian/Ubuntu: `sudo apt install rpm`. Fedora/RHEL: `sudo dnf install rpm-build`. The artifact is `dist/Glaux-<version>.<arch>.rpm` (for example `Glaux-1.1.2.x86_64.rpm`). Install it with `sudo dnf install ./Glaux-*.rpm`.
 
 > **Note (macOS):** Distribution outside your machine usually requires Apple code signing and notarization. Unsigned local builds are fine for development.
 
@@ -337,10 +350,10 @@ Target a specific platform from a matching host (cross-compilation of `vendor/py
 
 - Electron UI and JS engine bridges (inside `app.asar`)
 - `engines/huggingface/*.py` plus `worker/**/*.py` and the full `vendor/python` tree as `extraResources`
-- `vendor/cuda` (shared CUDA 13 runtime libraries) as `extraResources` on Windows and Linux
+- `vendor/cuda` (shared CUDA 13 runtime libraries) as `extraResources` on Windows and Linux; overlapping Torch `nvidia/cu13` copies are links into this folder
 - `vendor/ffmpeg` (`ffmpeg` + `ffprobe` + shared libav/dav1d) as `extraResources`
 - `vendor/llamacpp` (`llama-server` + ggml backend modules) as `extraResources`
-- `vendor/transcribe` (`transcribe-cli` + ggml backend modules) as `extraResources`
+- `vendor/transcribe` (`transcribe-cli` + ggml backend modules) as `extraResources`; its CUDA backend file is a link to the llama.cpp copy
 - Models are **not** bundled; users download them at runtime into `<appData>/Glaux/Models`
 - `LICENSE` and `THIRD_PARTY_LICENSES.md` (ffmpeg, CUDA redistributables, Electron/Chromium, llama.cpp, transcribe.cpp, PyTorch / Transformers)
 

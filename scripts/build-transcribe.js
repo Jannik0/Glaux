@@ -19,14 +19,19 @@ const os = require('os');
 const {
   resolveBuildBackends,
   cmakeGpuArgs,
+  cudaCompilerCmakeArgs,
+  cudaArchitectureCmakeArgs,
   rpathCmakeArgs,
   cudaQuietCmakeArgs,
   cmakeBuildQuietArgs,
   cudaBuildJobs,
   stageNativeRuntime,
   stageSharedCudaRuntime,
+  shareGgmlCudaBackend,
   removeStagedCudaRedistributables,
+  withCudaToolkitEnv,
   which,
+  requirePatchelf,
 } = require('./gpuBackends');
 const { ensureGitDep } = require('./ensureGitDep');
 
@@ -259,6 +264,7 @@ function main() {
   if (!which('cmake')) {
     throw new Error('cmake not found on PATH. Install CMake to build transcribe.cpp.');
   }
+  requirePatchelf();
 
   applyGlauxCliPatches(opts.srcDir);
 
@@ -282,6 +288,8 @@ function main() {
     '-DTRANSCRIBE_BUILD_EXAMPLES=ON',
     '-DTRANSCRIBE_BUILD_TOOLS=OFF',
     ...cmakeGpuArgs('transcribe', backends),
+    ...cudaCompilerCmakeArgs(backends),
+    ...cudaArchitectureCmakeArgs(backends),
     ...rpathCmakeArgs(),
     ...cudaQuietCmakeArgs(backends),
   ];
@@ -294,7 +302,8 @@ function main() {
     cmakeArgs.push('-DCMAKE_BUILD_TYPE=Release');
   }
 
-  run('cmake', cmakeArgs);
+  const cmakeEnv = withCudaToolkitEnv();
+  run('cmake', cmakeArgs, { env: cmakeEnv });
 
   const buildArgs = [
     '--build',
@@ -307,7 +316,7 @@ function main() {
     String(cudaBuildJobs(opts.jobs, backends)),
     ...cmakeBuildQuietArgs(),
   ];
-  run('cmake', buildArgs);
+  run('cmake', buildArgs, { env: cmakeEnv });
 
   const built = findBuiltCli(buildDir);
   if (!built) {
@@ -324,6 +333,7 @@ function main() {
   if (backends.cuda) {
     stageSharedCudaRuntime({ required: true });
   }
+  shareGgmlCudaBackend(path.join(ROOT, 'vendor', 'llamacpp'), opts.outDir);
 
   console.log('transcribe.cpp build complete.');
 }

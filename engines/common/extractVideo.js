@@ -4,11 +4,10 @@
  * Extract a video's audio track into a sibling mono PCM s16 WAV via vendor ffmpeg.
  */
 
-const { spawn } = require('child_process');
 const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
-const { pickFfmpeg } = require('./ffmpeg');
+const { pickFfmpeg, spawnFfmpeg } = require('./ffmpeg');
 const { VIDEO_EXTS, extOf } = require('./mediaKinds');
 
 /**
@@ -47,7 +46,7 @@ async function extractVideoToWav(videoPath) {
   await new Promise((resolve, reject) => {
     // Match former PyAV behavior: mono PCM s16 at the source sample rate (no -ar).
     const args = ['-y', '-i', abs, '-vn', '-ac', '1', '-c:a', 'pcm_s16le', wavPath];
-    const child = spawn(ffmpeg, args, { windowsHide: true });
+    const child = spawnFfmpeg(args);
     let err = '';
     child.stderr.on('data', (d) => {
       err += d.toString('utf8');

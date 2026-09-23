@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const { findVendorBinary, getVendorRoot } = require('./runtimePaths');
 const { withVendorLibPath } = require('./gpuRuntime');
 
@@ -66,6 +67,28 @@ function withFfmpegEnv(baseEnv = process.env, explicitDir) {
   return env;
 }
 
+/**
+ * Spawn vendored ffmpeg with PATH / LD_LIBRARY_PATH so Linux finds sibling
+ * libav*.so files. Windows loads DLLs next to the exe; do not spawn ffmpeg
+ * without this env on Linux/macOS.
+ *
+ * @param {string[]} args
+ * @param {import('child_process').SpawnOptions} [opts]
+ * @returns {import('child_process').ChildProcess}
+ */
+function spawnFfmpeg(args, opts = {}) {
+  const ffmpeg = pickFfmpeg();
+  if (!ffmpeg) {
+    throw new Error('ffmpeg not found. Run npm run build:ffmpeg.');
+  }
+  const { env: callerEnv, ...rest } = opts;
+  return spawn(ffmpeg, args, {
+    windowsHide: true,
+    ...rest,
+    env: withFfmpegEnv(callerEnv || process.env),
+  });
+}
+
 module.exports = {
   ffmpegBinName,
   ffprobeBinName,
@@ -73,4 +96,5 @@ module.exports = {
   pickFfmpeg,
   pickFfprobe,
   withFfmpegEnv,
+  spawnFfmpeg,
 };

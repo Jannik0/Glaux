@@ -1,8 +1,8 @@
 # Environment variables
 
-Glaux reads the following variables from the process environment. Set them **before launching** the app (or a `npm run build:*` script). Changing a variable while Glaux is already running has no effect until you restart.
+Glaux reads the following variables from the **process environment** of the app (or a `npm run build:*` / `npm run dist*` script). They must be visible to that process: `export VAR=value` then launch, or `VAR=value npm *`. Changing a variable while Glaux is already running has no effect until you restart.
 
-**Packaged app:** set the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, then launch.
+**Packaged app:** export the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / the AppImage, `.deb`, or `.rpm`, then launch.
 
 ## Runtime (app)
 
@@ -45,12 +45,13 @@ Glaux also **writes** these on child processes when the matching vendor tree exi
 
 ## Build scripts
 
-Used only by `npm run build:*` / `scripts/*.js` on a developer machine. They have no effect on a packaged end-user install.
+Used only by `npm run build:*`, `npm run dist*` / `scripts/*.js` on a developer machine. They have no effect on a packaged end-user install.
 
 
 | Variable | Values | Effect |
 | -------- | ------ | ------ |
-| `CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT` | CUDA Toolkit install directory (checked in that order). | Locate `nvcc` / CUDA headers when compiling llama.cpp and transcribe.cpp GPU backends. If unset, the scripts look for `nvcc` on `PATH`, then common install locations. |
+| `CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT` | CUDA Toolkit install directory (checked in that order). | Locate `nvcc` / CUDA headers when compiling llama.cpp and transcribe.cpp GPU backends. If unset, the scripts look for `nvcc` on `PATH`, then common install locations (`/usr/local/cuda` on Linux). The toolkit `bin` directory is added to `PATH` for cmake even when Debian/Ubuntu did not put `nvcc` on `PATH`. |
 | `VULKAN_SDK` | Vulkan SDK root directory. | Locate Vulkan headers/libs for those same native builds. If unset, the scripts search `C:\VulkanSDK\<version>` on Windows and system include paths on Linux. |
 | `MSYS2_BASH` | Absolute path to MSYS2 `bash.exe`. | Windows-only: which bash runs the ffmpeg configure/build (`npm run build:ffmpeg`). |
 | `MSYS2_PATH` | MSYS2 install root (e.g. `C:\msys64`). | Windows-only: fallback if `MSYS2_BASH` is unset; the script uses `%MSYS2_PATH%\usr\bin\bash.exe`. Otherwise it tries `C:\msys64`, `D:\msys64`, `C:\msys32`, then `bash` on `PATH`. |
+| `GLAUX_PACKAGING_TMP` | Absolute directory path. Linux only. Unset → `dist/.tmp`. | Temp directory for `npm run dist` / `dist:linux` (electron-builder). Default is `dist/.tmp` on the project disk so packaging does not fill a small `/tmp` tmpfs (`ENOSPC`). That default directory is deleted after packaging (success or failure). A custom path is left in place. No effect on Windows/macOS. |
