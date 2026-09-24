@@ -78,9 +78,9 @@ export HF_TOKEN=hf_your_token
 ## How it works
 
 ```
-┌─────────────────┐     IPC      ┌──────────────────┐
-│  Renderer (UI)  │ ───────────► │  Electron main   │
-│  src/renderer/  │              │  src/main +      │
+┌─────────────────┐              ┌──────────────────┐
+│  Renderer (UI)  │     IPC      │  Electron main   │
+│  src/renderer/  │ ───────────► │  src/main +      │
 │                 │              │  engineManager   │
 └─────────────────┘              └────────┬─────────┘
                                           │
@@ -88,7 +88,7 @@ export HF_TOKEN=hf_your_token
           ▼                               ▼                               ▼
       safetensors                   Hub downloads                 *.gguf (by tag)
   engines/huggingface           (HF model-downloader)             chat → llamacpp
-(Python / Transformers)                                         ASR  → transcribecpp
+(Python / Transformers)                                         ASR → transcribecpp
 ```
 
 1. **Electron** hosts the UI (`src/renderer/`) and filesystem/IPC logic (`src/main/`, `src/preload/`).
@@ -337,8 +337,6 @@ Target a specific platform from a matching host (cross-compilation of `vendor/py
 > **Note (Windows):** The NSIS installer is a single `Setup.exe` with the app embedded. Do not use electron-builder’s self-extracting “portable” `.exe`: the app (with torch) is multi‑gigabyte unpacked, so that format extracts into `%TEMP%` on every launch and appears to hang with no window. The **zip** is a single-file archive alternative (larger than the installer).
 
 > **Note (Linux):** Packaging stages temp files under `dist/.tmp` (not `/tmp`) and deletes that directory when electron-builder exits. `/tmp` is often a small RAM disk (tmpfs); Glaux’s unpacked CUDA Torch tree is multi‑GB and would otherwise fail with `ENOSPC`. Override with `GLAUX_PACKAGING_TMP` (not auto-deleted). See [ENV_VARS.md](ENV_VARS.md).
-
-> **Note (Linux RPM):** `npm run dist` / `dist:linux` builds the `.rpm` (Fedora, RHEL, openSUSE, and other RPM distributions) with electron-builder’s bundled fpm, which calls **rpmbuild**. Debian/Ubuntu: `sudo apt install rpm`. Fedora/RHEL: `sudo dnf install rpm-build`. The artifact is `dist/Glaux-<version>.<arch>.rpm` (for example `Glaux-1.1.2.x86_64.rpm`). Install it with `sudo dnf install ./Glaux-*.rpm`.
 
 > **Note (macOS):** Distribution outside your machine usually requires Apple code signing and notarization. Unsigned local builds are fine for development.
 
