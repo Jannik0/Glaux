@@ -158,6 +158,88 @@ async function trashModelCacheFolder(modelId) {
   }
 }
 
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isDownloadCancelledError(err) {
+  return Boolean(
+    err &&
+      (/** @type {{ code?: string, message?: string }} */ (err).code === 'DOWNLOAD_CANCELLED' ||
+        /cancelled/i.test(String(/** @type {{ message?: string }} */ (err).message || '')))
+  );
+}
+
+/**
+ * @param {unknown} err
+ */
+function failDownload(err) {
+  if (isDownloadCancelledError(err)) {
+    return fail(err, 'E_DOWNLOAD_CANCELLED');
+  }
+  return fail(err, 'E_DOWNLOAD');
+}
+
+/**
+ * Keep the main-process snapshot in step with bytes already transferred so a
+ * reloaded window can paint the in-progress row without waiting for the next chunk.
+ *
+ * @param {{ modelId?: string, loaded: number, total: number }} session
+ * @param {unknown} event
+ */
+function rememberDownloadProgress(session, event) {
+  if (!event || typeof event !== 'object') {
+    return;
+  }
+  const info = /** @type {{ phase?: string, status?: string, file?: string, loaded?: number, total?: number }} */ (
+    event
+  );
+  const file = typeof info.file === 'string' ? info.file : '';
+  if (file && file !== session.modelId && file !== 'download') {
+    return;
+  }
+  if ((info.phase === 'download' && info.status === 'starting') || info.status === 'initiate') {
+    session.loaded = 0;
+    session.total = 0;
+    return;
+  }
+  if (info.status !== 'progress') {
+    return;
+  }
+  const loaded = Number(info.loaded);
+  const total = Number(info.total);
+  if (Number.isFinite(loaded)) {
+    session.loaded = loaded;
+  }
+  if (Number.isFinite(total)) {
+    session.total = total;
+  }
+}
+
+/**
+ * Deliver a download event to the current main window.
+ * Language switches reload that window; send throws once the frame is disposed,
+ * and an exception here must not reject the transfer.
+ *
+ * @param {string} modelId
+ * @param {unknown} event
+ */
+function publishModelDownloadEvent(modelId, event) {
+  const active = state.activePanelModelDownload;
+  if (active && active.modelId === modelId) {
+    rememberDownloadProgress(active, event);
+  }
+  const win = state.getMainWindow();
+  if (!win || win.isDestroyed()) {
+    return;
+  }
+  try {
+    win.webContents.send('models:downloadProgress', { modelId, event });
+  } catch {
+    /* frame is navigating */
+  }
+}
+
 function registerModelsPrefsIpc() {
   ipcMain.handle('prefs:getSelectedModelId', async () => {
     try {
@@ -242,10 +324,39 @@ function registerModelsPrefsIpc() {
     }
   });
 
-  ipcMain.handle('models:downloadModel', async (event, payload) => {
+  ipcMain.handle('models:listActiveDownloads', async () => {
+    try {
+      const active = state.activePanelModelDownload;
+      if (!active || typeof active.modelId !== 'string' || !active.modelId) {
+        return ok({ downloads: [] });
+      }
+      return ok({
+        downloads: [
+          {
+            modelId: active.modelId,
+            loaded: Number(active.loaded) || 0,
+            total: Number(active.total) || 0,
+          },
+        ],
+      });
+    } catch (err) {
+      return fail(err, 'E_DOWNLOAD');
+    }
+  });
+
+  ipcMain.handle('models:downloadModel', async (_event, payload) => {
     try {
       const modelId = assertValidHfRepoId(payload && payload.modelId);
-      const sender = event.sender;
+      const inFlight = state.activePanelModelDownload;
+      if (inFlight && inFlight.modelId === modelId) {
+        try {
+          await inFlight.promise;
+          return ok({ modelId });
+        } catch (err) {
+          return failDownload(err);
+        }
+      }
+
       let allowPatterns = Array.isArray(payload && payload.allowPatterns)
         ? payload.allowPatterns.filter((p) => typeof p === 'string' && p.trim())
         : undefined;
@@ -270,25 +381,36 @@ function registerModelsPrefsIpc() {
         allowPatterns,
         ggufVariant,
         onProgress: (info) => {
-          if (sender && !sender.isDestroyed()) {
-            sender.send('models:downloadProgress', { modelId, event: info });
-          }
+          publishModelDownloadEvent(modelId, info);
         },
       });
-      state.activePanelModelDownload = { modelId, promise: downloadPromise };
+      state.activePanelModelDownload = {
+        modelId,
+        promise: downloadPromise,
+        loaded: 0,
+        total: 0,
+      };
       try {
         await downloadPromise;
         return ok({ modelId });
+      } catch (err) {
+        publishModelDownloadEvent(modelId, {
+          phase: 'download',
+          status: isDownloadCancelledError(err) ? 'cancelled' : 'error',
+          modelId,
+          message: err && err.message ? String(err.message) : '',
+        });
+        return failDownload(err);
       } finally {
-        if (state.activePanelModelDownload && state.activePanelModelDownload.modelId === modelId) {
+        if (
+          state.activePanelModelDownload &&
+          state.activePanelModelDownload.promise === downloadPromise
+        ) {
           state.activePanelModelDownload = null;
         }
       }
     } catch (err) {
-      if (err && (err.code === 'DOWNLOAD_CANCELLED' || /cancelled/i.test(String(err.message || '')))) {
-        return fail(err, 'E_DOWNLOAD_CANCELLED');
-      }
-      return fail(err, 'E_DOWNLOAD');
+      return failDownload(err);
     }
   });
 

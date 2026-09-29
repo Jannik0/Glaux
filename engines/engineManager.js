@@ -389,10 +389,14 @@ async function downloadModel(opts) {
   const modelId = opts.modelId.trim();
   await ensureDownloadEnginePaths(opts);
   const report = (info) => {
-    if (typeof opts.onProgress === 'function') {
-      opts.onProgress(info);
-    } else {
-      emitProgress(info);
+    try {
+      if (typeof opts.onProgress === 'function') {
+        opts.onProgress(info);
+      } else {
+        emitProgress(info);
+      }
+    } catch {
+      // Listeners observe the transfer; they must not fail or cancel it.
     }
   };
   report({ phase: 'download', status: 'starting', modelId });

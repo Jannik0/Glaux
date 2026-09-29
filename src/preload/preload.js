@@ -303,6 +303,23 @@ contextBridge.exposeInMainWorld('api', {
       files: Array.isArray(result.files) ? result.files : [],
     };
   },
+  listActiveModelDownloads: async () => {
+    const result = await ipcRenderer.invoke('models:listActiveDownloads');
+    if (!result.ok) {
+      throw toStructuredRendererError(result, tf('preload.modelDownloadFailed', 'Model download failed'));
+    }
+    return Array.isArray(result.downloads) ? result.downloads : [];
+  },
+  onModelDownloadProgress: (callback) => {
+    const listener = (_event, payload) => {
+      if (!payload || typeof payload.modelId !== 'string' || typeof callback !== 'function') {
+        return;
+      }
+      callback(payload.modelId, payload.event);
+    };
+    ipcRenderer.on('models:downloadProgress', listener);
+    return () => ipcRenderer.removeListener('models:downloadProgress', listener);
+  },
   downloadModel: async (modelId, handlers = {}) => {
     const onProgress =
       handlers && typeof handlers.onProgress === 'function' ? handlers.onProgress : null;

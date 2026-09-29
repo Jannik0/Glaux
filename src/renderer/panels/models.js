@@ -63,6 +63,14 @@ const downloadingModels = new Map();
 /** @type {Set<string>} */
 const downloadStopRequested = new Set();
 
+/**
+ * Downloads that already reached a terminal event on this page. A language
+ * switch reloads the window while the main process keeps the transfer; the
+ * snapshot fetch can still describe that transfer for a moment after it ends.
+ * @type {Set<string>}
+ */
+const settledDownloadIds = new Set();
+
 function isValidHfRepoId(raw) {
   const s = typeof raw === 'string' ? raw.trim() : '';
   return s.length > 0 && s.length <= 512 && /^[\w.-]+\/[\w.-]+$/.test(s);
@@ -320,6 +328,126 @@ async function handleMoveCachedModelToTrash(modelId) {
   }
 }
 
+function downloadingRowExists(modelId) {
+  if (!modelsCacheListEl) {
+    return false;
+  }
+  const esc = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(modelId) : modelId;
+  return Boolean(modelsCacheListEl.querySelector(`.models-cache-row[data-model-id="${esc}"]`));
+}
+
+let downloadRowRefreshQueued = false;
+let downloadRowRefreshAgain = false;
+
+function queueDownloadRowRefresh() {
+  if (downloadRowRefreshQueued) {
+    downloadRowRefreshAgain = true;
+    return;
+  }
+  downloadRowRefreshQueued = true;
+  const run = () => {
+    downloadRowRefreshAgain = false;
+    void refreshModelsCacheList().finally(() => {
+      if (downloadRowRefreshAgain) {
+        run();
+        return;
+      }
+      downloadRowRefreshQueued = false;
+    });
+  };
+  run();
+}
+
+/**
+ * @param {string} modelId
+ * @param {'complete' | 'cancelled' | 'error'} outcome
+ * @param {string} [message]
+ */
+function finishTrackedDownload(modelId, outcome, message) {
+  settledDownloadIds.add(modelId);
+  downloadingModels.delete(modelId);
+  if (outcome === 'error') {
+    const msg = message || t('panels.models.downloadFailedFallback');
+    setLoadingStatusMessage(t('panels.models.downloadFailed', { message: msg }));
+  }
+  queueDownloadRowRefresh();
+}
+
+/**
+ * Progress and terminal events for a download that may have been started
+ * before this page loaded (a language switch reloads the window).
+ *
+ * @param {string} modelId
+ * @param {object} event
+ */
+function handleTrackedDownloadEvent(modelId, event) {
+  if (!modelId || !event || typeof event !== 'object') {
+    return;
+  }
+  if (event.phase === 'download' && event.status === 'complete') {
+    finishTrackedDownload(modelId, 'complete');
+    return;
+  }
+  if (event.phase === 'download' && event.status === 'cancelled') {
+    finishTrackedDownload(modelId, 'cancelled');
+    return;
+  }
+  if (event.phase === 'download' && event.status === 'error') {
+    const message = typeof event.message === 'string' ? event.message : '';
+    finishTrackedDownload(modelId, 'error', message);
+    return;
+  }
+  if (settledDownloadIds.has(modelId)) {
+    return;
+  }
+  handleModelDownloadProgress(modelId, event);
+  if (downloadingModels.has(modelId) && !downloadingRowExists(modelId)) {
+    queueDownloadRowRefresh();
+  }
+}
+
+let modelDownloadProgressBound = false;
+
+function bindModelDownloadProgress() {
+  if (modelDownloadProgressBound) {
+    return;
+  }
+  if (!(window.api && typeof window.api.onModelDownloadProgress === 'function')) {
+    return;
+  }
+  modelDownloadProgressBound = true;
+  window.api.onModelDownloadProgress((modelId, event) => {
+    handleTrackedDownloadEvent(modelId, event);
+  });
+}
+
+async function restoreActiveModelDownloads() {
+  if (!(window.api && typeof window.api.listActiveModelDownloads === 'function')) {
+    return;
+  }
+  let downloads = [];
+  try {
+    downloads = await window.api.listActiveModelDownloads();
+  } catch {
+    return;
+  }
+  if (!Array.isArray(downloads)) {
+    return;
+  }
+  for (const item of downloads) {
+    if (!item || typeof item.modelId !== 'string' || !item.modelId) {
+      continue;
+    }
+    if (settledDownloadIds.has(item.modelId) || downloadingModels.has(item.modelId)) {
+      continue;
+    }
+    downloadingModels.set(item.modelId, {
+      loaded: Number(item.loaded) || 0,
+      total: Number(item.total) || 0,
+    });
+  }
+}
+
 function handleModelDownloadProgress(modelId, event) {
   if (!event || typeof event !== 'object') {
     return;
@@ -440,6 +568,7 @@ async function runDownloadModelFlow(onDecision) {
       }
     }
 
+    settledDownloadIds.delete(raw);
     downloadingModels.set(raw, { loaded: 0, total: 0 });
     setLoadingStatusMessage('');
     await renderModelsCacheList(cached, await getModelsPanelSelectedId());
@@ -704,7 +833,11 @@ function initializeModelsPanel() {
     return;
   }
 
-  void refreshModelsCacheList();
+  bindModelDownloadProgress();
+  void (async () => {
+    await restoreActiveModelDownloads();
+    await refreshModelsCacheList();
+  })();
 
   modelsCacheListEl.addEventListener('change', (e) => {
     const input = e.target;

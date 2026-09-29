@@ -21,7 +21,7 @@ let engineBootstrapped = false;
 /** Resolves when an in-flight startup model load finishes (success or failure). */
 let engineBootstrapLoadPromise = null;
 
-/** @type {{ modelId: string, promise: Promise<unknown> } | null} */
+/** @type {{ modelId: string, promise: Promise<unknown>, loaded: number, total: number } | null} */
 let activePanelModelDownload = null;
 
 const activeStreamRequests = new Map();

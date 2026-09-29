@@ -234,7 +234,15 @@ function attachReaders(proc) {
     }
 
     if (msg.download === true) {
-      if (p.onProgress && msg.event) p.onProgress(msg.event);
+      if (p.onProgress && msg.event) {
+        try {
+          p.onProgress(msg.event);
+        } catch {
+          // This callback runs on the stdout reader. A throw — webContents.send
+          // during a language-switch reload is the usual one — stops the reader,
+          // the pipe fills, and the Python download stalls.
+        }
+      }
       return;
     }
 
