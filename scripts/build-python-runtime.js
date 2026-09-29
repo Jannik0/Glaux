@@ -50,8 +50,8 @@ const { stubTorchUnusedCudaDeps } = require('./cudaStubs');
 
 const DEFAULT_PBS_TAG = '20260718';
 const DEFAULT_PYTHON_VERSION = '3.14.6';
-const TORCH_VERSION = '2.13.0';
-const TORCHVISION_VERSION = '0.28.0';
+const TORCH_VERSION = '2.14.0';
+const TORCHVISION_VERSION = '0.29.0';
 const VALID_TORCH_VARIANTS = new Set(['cpu', 'cu126', 'cu128', 'cu130']);
 
 function printHelp() {

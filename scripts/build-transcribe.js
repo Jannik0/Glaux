@@ -39,7 +39,8 @@ const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SRC = path.join(ROOT, 'deps', 'transcribe.cpp');
 const DEFAULT_OUT = path.join(ROOT, 'vendor', 'transcribe');
 const TRANSCRIBE_CPP_REPO = 'https://github.com/handy-computer/transcribe.cpp';
-const TRANSCRIBE_CPP_REV = '923d4a045ac8798ea4777f7eda557dc81963f4ed';
+// Release v0.2.4. Same upstream ggml (353b63b) as llama.cpp, so the shared CUDA backend matches.
+const TRANSCRIBE_CPP_REV = '4807edaf210d0d7e8a6f7fb2a44b65966a2797f0';
 
 function printHelp() {
   console.log(`Usage: node scripts/build-transcribe.js [options]

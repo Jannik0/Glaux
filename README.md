@@ -10,7 +10,7 @@ It is designed to be as **user-friendly and accessible as possible**: you do not
 
 ![Glaux workspace in dark mode with a local chat session](assets/screenshot01_dark.png)
 
-**Windows and Linux are tested platforms.** macOS packaging is supported, but those builds still need validation.
+**Windows and Debian Linux are tested platforms.** macOS packaging is supported, but those builds still need validation.
 
 **GPU is used by default when the host supports it.** A single app build per OS ships every backend that OS can run; the engine picks CUDA, Vulkan, Metal/MPS, or CPU at runtime.
 
@@ -160,7 +160,7 @@ Install Python deps into a venv (example with uv):
 ```bash
 uv venv .env
 uv pip install -r engines/huggingface/requirements.txt --python .env/Scripts/python.exe
-uv pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130 --python .env/Scripts/python.exe
+uv pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu130 --python .env/Scripts/python.exe
 ```
 
 **macOS / Linux**
@@ -169,9 +169,9 @@ uv pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.py
 uv venv .env
 uv pip install -r engines/huggingface/requirements.txt --python .env/bin/python
 # Linux CUDA wheels (runs on CPU if no NVIDIA GPU is present):
-uv pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130 --python .env/bin/python
+uv pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu130 --python .env/bin/python
 # macOS (default PyPI wheels; MPS-capable on Apple Silicon):
-uv pip install torch==2.13.0 torchvision==0.28.0 --python .env/bin/python
+uv pip install torch==2.14.0 torchvision==0.29.0 --python .env/bin/python
 ```
 
 Alternatively, build the bundled Python runtime:

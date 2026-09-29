@@ -43,7 +43,8 @@ const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SRC = path.join(ROOT, 'deps', 'llama.cpp');
 const DEFAULT_OUT = path.join(ROOT, 'vendor', 'llamacpp');
 const LLAMA_CPP_REPO = 'https://github.com/ggml-org/llama.cpp';
-const LLAMA_CPP_REV = '0882c7bc89074017c6a2a3149eae46929cb32ab3';
+// b11256. Same upstream ggml (353b63b) as transcribe.cpp; v0.5.0 vendors an older ggml.
+const LLAMA_CPP_REV = 'c85b92c69c955961621193cd51da194f3cbcedf3';
 
 function printHelp() {
   console.log(`Usage: node scripts/build-llamacpp.js [options]
