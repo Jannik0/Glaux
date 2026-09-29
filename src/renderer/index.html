@@ -81,6 +81,16 @@
             data-i18n-aria="header.languageAria"
             aria-label="UI language"
           ></select>
+          <button
+            type="button"
+            class="header-tour-btn"
+            id="tour-button"
+            data-i18n="tour.button"
+            data-i18n-aria="tour.buttonAria"
+            aria-label="Take the welcome tour"
+          >
+            Tour
+          </button>
         </div>
       </div>
       <div class="app-body">
@@ -432,6 +442,45 @@
         </div>
       </div>
     </div>
+    <div class="dialog-overlay hidden" id="welcome-overlay">
+      <div class="dialog-box" id="welcome-box" role="dialog" aria-modal="true" aria-labelledby="welcome-title" aria-describedby="welcome-message">
+        <img class="welcome-icon" src="../../assets/GlauxAI_Logo.png" alt="" />
+        <div class="dialog-title welcome-title" id="welcome-title" data-i18n="tour.welcome.title">Welcome to Glaux</div>
+        <div class="dialog-message" id="welcome-message" data-i18n="tour.welcome.message">Would you like to take a tour and learn how to use the interface?</div>
+        <div class="dialog-actions welcome-actions">
+          <button type="button" class="dialog-btn" id="welcome-dismiss" data-i18n="tour.welcome.ownWay">
+            I'll find my own way
+          </button>
+          <button type="button" class="dialog-btn" id="welcome-tour" data-i18n="tour.welcome.showAround">
+            Show me around
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="tour-overlay hidden" id="tour-overlay">
+      <div class="tour-blocker" id="tour-blocker"></div>
+      <div class="tour-highlight" id="tour-highlight"></div>
+      <div
+        class="tour-popover"
+        id="tour-popover"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="tour-title"
+        aria-describedby="tour-body"
+      >
+        <div class="tour-title" id="tour-title"></div>
+        <div class="tour-body" id="tour-body"></div>
+        <div class="tour-actions">
+          <button type="button" class="dialog-btn" id="tour-skip" data-i18n="tour.skip">Skip</button>
+          <div class="tour-actions-end">
+            <button type="button" class="dialog-btn" id="tour-back" data-i18n="tour.back">Back</button>
+            <button type="button" class="dialog-btn" id="tour-later" data-i18n="tour.later">Later</button>
+            <button type="button" class="dialog-btn" id="tour-download" data-i18n="tour.download">Download</button>
+            <button type="button" class="dialog-btn" id="tour-next" data-i18n="tour.next">Next</button>
+          </div>
+        </div>
+      </div>
+    </div>
     <div class="app-progress-overlay hidden" id="app-progress-overlay">
       <div class="app-progress-dialog" role="status" aria-live="polite">
         <div class="app-progress-title" id="app-progress-title" data-i18n="dialogs.working">Working...</div>
@@ -459,6 +508,7 @@
     <script src="panels/resources.js"></script>
     <script src="panels/outputs.js"></script>
     <script src="panels/chat.js"></script>
+    <script src="tour.js"></script>
     <script src="main.js"></script>
   </body>
 </html>

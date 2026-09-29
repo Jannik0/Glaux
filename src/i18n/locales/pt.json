@@ -399,5 +399,47 @@
       "outputPathRequired": "O caminho de saída é obrigatório.",
       "destinationEscapesResources": "O destino sai do diretório de recursos."
     }
+  },
+  "tour": {
+    "button": "Tour",
+    "buttonAria": "Iniciar a visita de boas-vindas",
+    "skip": "Ignorar",
+    "back": "Voltar",
+    "next": "Seguinte",
+    "done": "Concluir",
+    "download": "Baixar",
+    "later": "Mais tarde",
+    "welcome": {
+      "title": "Bem-vindo ao Glaux",
+      "message": "Deseja fazer uma visita e aprender a utilizar a interface?",
+      "ownWay": "Vou orientar-me sozinho",
+      "showAround": "Mostre-me a interface"
+    },
+    "steps": {
+      "models": {
+        "title": "Modelos",
+        "body": "Este painel transfere e gere os modelos neste computador. Introduza um model id do Hugging Face (org/model) e clique em Adicionar. Num repositório GGUF, escolha uma quantização na caixa de diálogo seguinte. Selecione um modelo transferido para o carregar. Ejetar modelo retira o modelo atual da memória. Recarregar modelo carrega-o de novo. Encontrar modelos abre o hub do Hugging Face.\n\nBaixe agora unsloth/gemma-4-E2B-it-GGUF, ou adicione um modelo mais tarde."
+      },
+      "workspaces": {
+        "title": "Áreas de trabalho",
+        "body": "Uma área de trabalho guarda as suas próprias sessões, recursos e saídas. Os modelos transferidos permanecem disponíveis em cada área de trabalho. Escolha a área de trabalho ativa nesta lista. O botão mais cria uma nova área de trabalho e pede um nome. O lápis renomeia a área de trabalho atual. A lixeira move essa área de trabalho para a lixeira, juntamente com as suas sessões, recursos e saídas."
+      },
+      "sessions": {
+        "title": "Sessões",
+        "body": "Aqui ficam as conversas guardadas da área de trabalho atual. Nova sessão inicia uma conversa em branco. A pesquisa filtra a lista. Abra uma sessão para restaurar as mensagens. Eliminar move uma sessão para a lixeira."
+      },
+      "resources": {
+        "title": "Recursos",
+        "body": "Aqui ficam os arquivos desta área de trabalho. Arraste e solte arquivos neste painel para os adicionar. Arraste um recurso para o chat para o anexar, ou abra um arquivo para o visualizar."
+      },
+      "chat": {
+        "title": "Chat",
+        "body": "Aqui fala com o modelo carregado. Escreva uma mensagem e clique em Enviar. Solte arquivos na área de anexos para incluir imagens, áudio, vídeo ou PDFs quando o modelo os suportar. Raciocínio pede ao modelo que pense antes de responder. Reenviar define se imagens, áudio e vídeo de turnos anteriores são enviados de novo com cada nova mensagem. O indicador de contexto mostra quanto da janela de contexto do modelo está em uso."
+      },
+      "outputs": {
+        "title": "Saídas",
+        "body": "Aqui aparecem os arquivos criados pelo modelo e os arquivos que exporta de um turno do chat. Arraste uma saída para Recursos para a copiar para a biblioteca, ou para o chat para a anexar."
+      }
+    }
   }
 }

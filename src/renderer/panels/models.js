@@ -348,23 +348,44 @@ function handleModelDownloadProgress(modelId, event) {
   }
 }
 
-async function runDownloadModelFlow() {
+/**
+ * @param {(() => void) | undefined} [onDecision]
+ * Called when the pre-download choice is finished (quant picker closed, or the
+ * flow stopped before a transfer). Not called again when the transfer ends.
+ */
+async function runDownloadModelFlow(onDecision) {
+  let decided = false;
+  const settleDecision = () => {
+    if (decided) {
+      return;
+    }
+    decided = true;
+    if (typeof onDecision === 'function') {
+      onDecision();
+    }
+  };
+
   if (!(window.api && typeof window.api.downloadModel === 'function')) {
+    settleDecision();
     return;
   }
   if (modelAddFlowInFlight) {
+    settleDecision();
     return;
   }
   const raw = modelsAddInputEl ? modelsAddInputEl.value.trim() : '';
   if (!raw) {
     setLoadingStatusMessage(t('panels.models.enterValidModelId'));
+    settleDecision();
     return;
   }
   if (!isValidHfRepoId(raw)) {
     setLoadingStatusMessage(t('panels.models.invalidModelIdFormat'));
+    settleDecision();
     return;
   }
   if (downloadingModels.has(raw)) {
+    settleDecision();
     return;
   }
   let cached = [];
@@ -375,6 +396,7 @@ async function runDownloadModelFlow() {
   }
   if (cached.some((entry) => cachedModelId(entry) === raw)) {
     setLoadingStatusMessage(t('panels.models.alreadyInCache'));
+    settleDecision();
     return;
   }
 
@@ -422,6 +444,7 @@ async function runDownloadModelFlow() {
     setLoadingStatusMessage('');
     await renderModelsCacheList(cached, await getModelsPanelSelectedId());
     syncModelPanelDisabled();
+    settleDecision();
     try {
       await window.api.downloadModel(raw, {
         onProgress: (event) => handleModelDownloadProgress(raw, event),
@@ -450,10 +473,29 @@ async function runDownloadModelFlow() {
       await refreshModelsCacheList();
     }
   } finally {
+    settleDecision();
     hideRepoCheckModal();
     modelAddFlowInFlight = false;
     syncModelPanelDisabled();
   }
+}
+
+/**
+ * Same path as the Add button. Resolves when the quant picker is closed or the
+ * flow stops before a transfer, and does not wait for the download to finish.
+ * @param {string} modelId
+ * @returns {Promise<void>}
+ */
+function beginDownload(modelId) {
+  const id = typeof modelId === 'string' ? modelId.trim() : '';
+  if (modelsAddInputEl) {
+    modelsAddInputEl.value = id;
+  }
+  return new Promise((resolve) => {
+    void runDownloadModelFlow(resolve).catch(() => {
+      resolve();
+    });
+  });
 }
 
 /**
@@ -776,3 +818,7 @@ function initializeModelsPanel() {
 
   syncModelPanelDisabled();
 }
+
+window.Glaux.Models = {
+  beginDownload,
+};

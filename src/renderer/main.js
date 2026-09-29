@@ -112,6 +112,39 @@ function initializeSidePanelCollapse() {
   });
 }
 
+function snapshotSidePanelCollapsed() {
+  return {
+    models: sidePanelCollapsed.models,
+    sessions: sidePanelCollapsed.sessions,
+    resources: sidePanelCollapsed.resources,
+    outputs: sidePanelCollapsed.outputs,
+  };
+}
+
+/**
+ * @param {{ models?: boolean, sessions?: boolean, resources?: boolean, outputs?: boolean }} snapshot
+ */
+function restoreSidePanelCollapsed(snapshot) {
+  applySidePanelCollapsedPreference(snapshot);
+  applySidePanelLayout();
+  saveSidePanelCollapsedState();
+}
+
+function expandAllSidePanels() {
+  restoreSidePanelCollapsed({
+    models: false,
+    sessions: false,
+    resources: false,
+    outputs: false,
+  });
+}
+
+window.Glaux.SidePanels = {
+  snapshotCollapsed: snapshotSidePanelCollapsed,
+  expandAll: expandAllSidePanels,
+  restoreCollapsed: restoreSidePanelCollapsed,
+};
+
 const SIDE_PANEL_POLL_MS = 5000;
 
 function tickSidePanelPoll() {
@@ -642,6 +675,9 @@ void (async () => {
     initializeReasoningToggle();
     initializeResubmitToggle();
     initializeSidePanelCollapse();
+    if (window.Glaux.Tour && typeof window.Glaux.Tour.startIfFirstLaunch === 'function') {
+      void window.Glaux.Tour.startIfFirstLaunch();
+    }
 
     if (!(window.api && typeof window.api.bootstrapEngine === 'function')) {
       return;

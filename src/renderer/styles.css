@@ -479,6 +479,27 @@ body {
   gap: 8px;
 }
 
+.header-tour-btn {
+  border: 1px solid var(--border-app);
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text-input);
+  font-size: 13px;
+  padding: 7px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.header-tour-btn:hover {
+  background: var(--interactive-hover);
+}
+
+.header-tour-btn:focus {
+  outline: none;
+  border-color: var(--focus-border);
+  box-shadow: 0 0 0 1px var(--focus-ring);
+}
+
 .theme-select {
   min-width: 110px;
   max-width: 160px;
@@ -1635,6 +1656,89 @@ body {
 
 .send-button span.icon {
   font-size: 12px;
+}
+
+.welcome-icon {
+  display: block;
+  width: 72px;
+  height: 72px;
+  margin: 2px auto 12px;
+  object-fit: contain;
+}
+
+.welcome-title,
+#welcome-message {
+  text-align: center;
+}
+
+.welcome-actions {
+  flex-wrap: wrap;
+}
+
+.tour-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1050;
+  pointer-events: none;
+}
+
+.tour-blocker {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+}
+
+.tour-highlight {
+  position: fixed;
+  z-index: 1;
+  pointer-events: none;
+  border-radius: 6px;
+  box-shadow: 0 0 0 9999px var(--overlay-backdrop);
+  outline: 2px solid var(--focus-border);
+}
+
+.tour-popover {
+  position: fixed;
+  z-index: 2;
+  pointer-events: auto;
+  width: min(420px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  background: var(--bg-app);
+  border: 1px solid var(--border-app);
+  border-radius: 12px;
+  box-shadow: 0 20px 40px var(--shadow-app);
+  padding: 14px;
+}
+
+.tour-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.tour-body {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-subtle);
+  white-space: pre-wrap;
+  margin-bottom: 12px;
+}
+
+.tour-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tour-actions-end {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
 }
 
 @media (max-width: 1400px) {

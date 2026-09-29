@@ -399,5 +399,47 @@
       "outputPathRequired": "Se requiere la ruta de salida.",
       "destinationEscapesResources": "El destino sale del directorio de recursos."
     }
+  },
+  "tour": {
+    "button": "Tour",
+    "buttonAria": "Iniciar el recorrido de bienvenida",
+    "skip": "Omitir",
+    "back": "Atrás",
+    "next": "Siguiente",
+    "done": "Listo",
+    "download": "Descargar",
+    "later": "Más tarde",
+    "welcome": {
+      "title": "Bienvenido a Glaux",
+      "message": "¿Desea hacer un recorrido y aprender a usar la interfaz?",
+      "ownWay": "Encontraré mi propio camino",
+      "showAround": "Muéstreme la interfaz"
+    },
+    "steps": {
+      "models": {
+        "title": "Modelos",
+        "body": "Este panel descarga y administra los modelos en este equipo. Introduzca un model id de Hugging Face (org/model) y pulse Añadir. En un repositorio GGUF, elija una cuantización en el diálogo siguiente. Seleccione un modelo descargado para cargarlo. Expulsar modelo retira el modelo actual de la memoria. Recargar modelo lo carga de nuevo. Buscar modelos abre el hub de Hugging Face.\n\nDescargue unsloth/gemma-4-E2B-it-GGUF ahora, o añada un modelo más tarde."
+      },
+      "workspaces": {
+        "title": "Espacios de trabajo",
+        "body": "Un espacio de trabajo guarda sus propias sesiones, recursos y salidas. Los modelos descargados siguen disponibles en cada espacio de trabajo. Elija el espacio de trabajo activo en esta lista. El botón más crea un espacio de trabajo nuevo y le pide un nombre. El lápiz cambia el nombre del espacio de trabajo actual. La papelera mueve ese espacio de trabajo a la papelera de reciclaje, junto con sus sesiones, recursos y salidas."
+      },
+      "sessions": {
+        "title": "Sesiones",
+        "body": "Aquí están los chats guardados del espacio de trabajo actual. Nueva sesión inicia una conversación en blanco. La búsqueda filtra la lista. Abra una sesión para restaurar sus mensajes. Eliminar mueve una sesión a la papelera de reciclaje."
+      },
+      "resources": {
+        "title": "Recursos",
+        "body": "Aquí están los archivos de este espacio de trabajo. Arrastre y suelte archivos en este panel para añadirlos. Arrastre un recurso al chat para adjuntarlo, o abra un archivo para verlo."
+      },
+      "chat": {
+        "title": "Chat",
+        "body": "Aquí habla con el modelo cargado. Escriba un mensaje y pulse Enviar. Suelte archivos en el área de adjuntos para incluir imágenes, audio, vídeo o PDF cuando el modelo los admita. Razonamiento pide al modelo que piense antes de responder. Reenviar determina si las imágenes, el audio y el vídeo de turnos anteriores se envían de nuevo con cada mensaje nuevo. El indicador de contexto muestra cuánto de la ventana de contexto del modelo está en uso."
+      },
+      "outputs": {
+        "title": "Salidas",
+        "body": "Aquí aparecen los archivos que crea el modelo y los que exporta desde un turno del chat. Arrastre una salida a Recursos para copiarla a la biblioteca, o al chat para adjuntarla."
+      }
+    }
   }
 }

@@ -399,5 +399,47 @@
       "outputPathRequired": "Le chemin de sortie est requis.",
       "destinationEscapesResources": "La destination sort du répertoire des ressources."
     }
+  },
+  "tour": {
+    "button": "Tour",
+    "buttonAria": "Lancer la visite guidée",
+    "skip": "Passer",
+    "back": "Retour",
+    "next": "Suivant",
+    "done": "Terminer",
+    "download": "Télécharger",
+    "later": "Plus tard",
+    "welcome": {
+      "title": "Bienvenue dans Glaux",
+      "message": "Souhaitez-vous faire une visite et apprendre à utiliser l'interface ?",
+      "ownWay": "Je me débrouillerai seul",
+      "showAround": "Faites-moi visiter"
+    },
+    "steps": {
+      "models": {
+        "title": "Modèles",
+        "body": "Ce panneau télécharge et gère les modèles sur cet ordinateur. Saisissez une model id Hugging Face (org/model) et cliquez sur Ajouter. Pour un dépôt GGUF, choisissez une quantification dans la boîte de dialogue qui suit. Sélectionnez un modèle téléchargé pour le charger. Éjecter le modèle décharge le modèle actuel. Recharger le modèle le charge à nouveau. Trouver des modèles ouvre le hub Hugging Face.\n\nTéléchargez unsloth/gemma-4-E2B-it-GGUF maintenant, ou ajoutez un modèle plus tard."
+      },
+      "workspaces": {
+        "title": "Espaces de travail",
+        "body": "Un espace de travail conserve ses propres sessions, ressources et sorties. Les modèles téléchargés restent disponibles dans chaque espace de travail. Choisissez l'espace de travail actif dans cette liste. Le bouton plus crée un nouvel espace de travail et vous demande de le nommer. Le crayon renomme l'espace de travail actuel. La corbeille déplace cet espace de travail vers la corbeille, avec ses sessions, ses ressources et ses sorties."
+      },
+      "sessions": {
+        "title": "Sessions",
+        "body": "Les discussions enregistrées de l'espace de travail actuel se trouvent ici. Nouvelle session démarre une conversation vide. La recherche filtre la liste. Ouvrez une session pour restaurer ses messages. Supprimer déplace une session vers la corbeille."
+      },
+      "resources": {
+        "title": "Ressources",
+        "body": "Les fichiers de cet espace de travail se trouvent ici. Glissez-déposez des fichiers sur ce panneau pour les ajouter. Faites glisser une ressource dans le chat pour la joindre, ou ouvrez un fichier pour le consulter."
+      },
+      "chat": {
+        "title": "Chat",
+        "body": "Vous parlez ici avec le modèle chargé. Saisissez un message et cliquez sur Envoyer. Déposez des fichiers dans la zone de pièces jointes pour inclure des images, de l'audio, de la vidéo ou des PDF lorsque le modèle les prend en charge. Raisonnement demande au modèle de réfléchir avant de répondre. Renvoyer détermine si les images, l'audio et la vidéo des tours précédents sont renvoyés avec chaque nouveau message. L'indicateur de contexte montre quelle part de la fenêtre de contexte du modèle est utilisée."
+      },
+      "outputs": {
+        "title": "Sorties",
+        "body": "Les fichiers créés par le modèle et les fichiers que vous exportez depuis un tour de discussion apparaissent ici. Faites glisser une sortie vers Ressources pour la copier dans la bibliothèque, ou vers le chat pour la joindre."
+      }
+    }
   }
 }

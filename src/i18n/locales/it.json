@@ -399,5 +399,47 @@
       "outputPathRequired": "Il percorso di output è obbligatorio.",
       "destinationEscapesResources": "La destinazione esce dalla directory delle risorse."
     }
+  },
+  "tour": {
+    "button": "Tour",
+    "buttonAria": "Avvia il tour di benvenuto",
+    "skip": "Salta",
+    "back": "Indietro",
+    "next": "Avanti",
+    "done": "Fine",
+    "download": "Scarica",
+    "later": "Più tardi",
+    "welcome": {
+      "title": "Benvenuto in Glaux",
+      "message": "Vuoi fare un tour e imparare a usare l'interfaccia?",
+      "ownWay": "Troverò la mia strada",
+      "showAround": "Mostrami l'interfaccia"
+    },
+    "steps": {
+      "models": {
+        "title": "Modelli",
+        "body": "Questo pannello scarica e gestisce i modelli su questo computer. Inserisci un model id di Hugging Face (org/model) e fai clic su Aggiungi. Per un repository GGUF, scegli una quantizzazione nella finestra successiva. Seleziona un modello scaricato per caricarlo. Espelli modello rimuove il modello attuale dalla memoria. Ricarica modello lo carica di nuovo. Trova modelli apre l'hub di Hugging Face.\n\nScarica ora unsloth/gemma-4-E2B-it-GGUF, oppure aggiungi un modello più tardi."
+      },
+      "workspaces": {
+        "title": "Aree di lavoro",
+        "body": "Un'area di lavoro conserva le proprie sessioni, risorse e output. I modelli scaricati restano disponibili in ogni area di lavoro. Scegli l'area di lavoro attiva da questo elenco. Il pulsante più crea una nuova area di lavoro e chiede di darle un nome. La matita rinomina l'area di lavoro attuale. Il cestino sposta quell'area di lavoro nel Cestino, insieme alle sue sessioni, risorse e output."
+      },
+      "sessions": {
+        "title": "Sessioni",
+        "body": "Qui ci sono le chat salvate dell'area di lavoro corrente. Nuova sessione avvia una conversazione vuota. La ricerca filtra l'elenco. Apri una sessione per ripristinarne i messaggi. Elimina sposta una sessione nel Cestino."
+      },
+      "resources": {
+        "title": "Risorse",
+        "body": "Qui ci sono i file di questa area di lavoro. Trascina i file su questo pannello per aggiungerli. Trascina una risorsa nella chat per allegarla, oppure apri un file per visualizzarlo."
+      },
+      "chat": {
+        "title": "Chat",
+        "body": "Qui parli con il modello caricato. Scrivi un messaggio e premi Invia. Rilascia i file nell'area degli allegati per includere immagini, audio, video o PDF quando il modello li supporta. Ragionamento chiede al modello di riflettere prima di rispondere. Invia di nuovo stabilisce se immagini, audio e video dei turni precedenti vengono inviati di nuovo con ogni nuovo messaggio. L'indicatore di contesto mostra quanta finestra di contesto del modello è in uso."
+      },
+      "outputs": {
+        "title": "Output",
+        "body": "Qui compaiono i file creati dal modello e i file che esporti da un turno della chat. Trascina un output in Risorse per copiarlo nella libreria, oppure nella chat per allegarlo."
+      }
+    }
   }
 }

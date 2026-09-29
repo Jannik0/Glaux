@@ -34,6 +34,13 @@ function defaultPreferences() {
 /** @type {ReturnType<typeof defaultPreferences> | null} */
 let cached = null;
 
+/**
+ * True when this process started without a preferences file.
+ * Workspace boot writes the file before the window opens, so the flag is
+ * captured in `loadPreferences` and is not stored on disk.
+ */
+let launchedWithoutPreferences = false;
+
 function preferencesFilePath() {
   return path.join(getUserDataRoot(), PREFERENCES_FILE);
 }
@@ -123,14 +130,35 @@ function snapshotPreferences() {
  * @returns {Promise<ReturnType<typeof defaultPreferences>>}
  */
 async function loadPreferences() {
+  const filePath = preferencesFilePath();
+  let fileExisted = false;
   try {
-    const raw = await fs.readFile(preferencesFilePath(), 'utf8');
-    cached = normalizePreferences(JSON.parse(raw));
-  } catch {
+    await fs.access(filePath);
+    fileExisted = true;
+  } catch (err) {
+    fileExisted = !(err && err.code === 'ENOENT');
+  }
+  launchedWithoutPreferences = !fileExisted;
+  if (fileExisted) {
+    try {
+      const raw = await fs.readFile(filePath, 'utf8');
+      cached = normalizePreferences(JSON.parse(raw));
+    } catch {
+      cached = defaultPreferences();
+    }
+  } else {
     cached = defaultPreferences();
   }
   applyNativeTheme(cached.theme);
   return cached;
+}
+
+function isFirstLaunch() {
+  return launchedWithoutPreferences;
+}
+
+function consumeFirstLaunch() {
+  launchedWithoutPreferences = false;
 }
 
 /**
@@ -195,7 +223,19 @@ function pickUiPreferenceUpdates(partial) {
 function registerPreferencesIpc() {
   ipcMain.handle('prefs:get', async () => {
     try {
-      return ok({ preferences: snapshotPreferences() });
+      return ok({
+        preferences: snapshotPreferences(),
+        firstLaunch: launchedWithoutPreferences,
+      });
+    } catch (err) {
+      return fail(err, 'E_PREFS');
+    }
+  });
+
+  ipcMain.handle('prefs:consumeFirstLaunch', async () => {
+    try {
+      consumeFirstLaunch();
+      return ok({});
     } catch (err) {
       return fail(err, 'E_PREFS');
     }
@@ -224,5 +264,7 @@ module.exports = {
   snapshotPreferences,
   updatePreferences,
   readPersistedLanguageFromDisk,
+  isFirstLaunch,
+  consumeFirstLaunch,
   registerPreferencesIpc,
 };

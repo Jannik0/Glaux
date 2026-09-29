@@ -399,5 +399,47 @@
       "outputPathRequired": "Ein Ausgabepfad ist erforderlich.",
       "destinationEscapesResources": "Das Ziel verlässt das Ressourcenverzeichnis."
     }
+  },
+  "tour": {
+    "button": "Tour",
+    "buttonAria": "Willkommenstour starten",
+    "skip": "Überspringen",
+    "back": "Zurück",
+    "next": "Weiter",
+    "done": "Fertig",
+    "download": "Herunterladen",
+    "later": "Später",
+    "welcome": {
+      "title": "Willkommen bei Glaux",
+      "message": "Möchten Sie eine Tour machen und lernen, wie die Oberfläche verwendet wird?",
+      "ownWay": "Ich finde mich allein zurecht",
+      "showAround": "Führen Sie mich herum"
+    },
+    "steps": {
+      "models": {
+        "title": "Modelle",
+        "body": "In diesem Bereich laden Sie Modelle herunter und verwalten sie auf diesem Computer. Geben Sie eine Hugging-Face-model id (org/model) ein und klicken Sie auf Hinzufügen. Bei einem GGUF-Repository wählen Sie im folgenden Dialog eine Quantisierung. Wählen Sie ein heruntergeladenes Modell aus, um es zu laden. Modell auswerfen entlädt das aktuelle Modell. Modell neu laden lädt es erneut. Modelle finden öffnet den Hugging-Face-Hub.\n\nLaden Sie jetzt unsloth/gemma-4-E2B-it-GGUF herunter, oder fügen Sie später ein Modell hinzu."
+      },
+      "workspaces": {
+        "title": "Arbeitsbereiche",
+        "body": "Ein Arbeitsbereich behält eigene Sitzungen, Ressourcen und Ausgaben. Heruntergeladene Modelle bleiben in jedem Arbeitsbereich verfügbar. Wählen Sie den aktiven Arbeitsbereich in dieser Liste. Die Plus-Schaltfläche erstellt einen neuen Arbeitsbereich und fragt nach einem Namen. Der Stift benennt den aktuellen Arbeitsbereich um. Die Papierkorb-Schaltfläche verschiebt diesen Arbeitsbereich zusammen mit seinen Sitzungen, Ressourcen und Ausgaben in den Papierkorb."
+      },
+      "sessions": {
+        "title": "Sitzungen",
+        "body": "Hier liegen die gespeicherten Chats des aktuellen Arbeitsbereichs. Neue Sitzung startet eine leere Unterhaltung. Die Suche filtert die Liste. Öffnen Sie eine Sitzung, um ihre Nachrichten wiederherzustellen. Löschen verschiebt eine Sitzung in den Papierkorb."
+      },
+      "resources": {
+        "title": "Ressourcen",
+        "body": "Hier liegen die Dateien dieses Arbeitsbereichs. Ziehen Sie Dateien auf diesen Bereich, um sie hinzuzufügen. Ziehen Sie eine Ressource in den Chat, um sie anzuhängen, oder öffnen Sie eine Datei, um sie anzuzeigen."
+      },
+      "chat": {
+        "title": "Chat",
+        "body": "Hier sprechen Sie mit dem geladenen Modell. Geben Sie eine Nachricht ein und klicken Sie auf Senden. Legen Sie Dateien im Anhangsbereich ab, um Bilder, Audio, Video oder PDFs einzubinden, wenn das Modell sie unterstützt. Nachdenken bittet das Modell, vor der Antwort nachzudenken. Erneut senden legt fest, ob frühere Bild-, Audio- und Videoanhänge mit jeder neuen Nachricht erneut gesendet werden. Die Kontextanzeige zeigt, wie viel des Kontextfensters des Modells belegt ist."
+      },
+      "outputs": {
+        "title": "Ausgaben",
+        "body": "Hier erscheinen Dateien, die das Modell erzeugt, und Dateien, die Sie aus einem Chat-Durchgang exportieren. Ziehen Sie eine Ausgabe in Ressourcen, um sie in die Bibliothek zu kopieren, oder in den Chat, um sie anzuhängen."
+      }
+    }
   }
 }

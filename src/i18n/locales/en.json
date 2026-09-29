@@ -399,5 +399,47 @@
       "outputPathRequired": "Output path is required.",
       "destinationEscapesResources": "Destination escapes resources directory."
     }
+  },
+  "tour": {
+    "button": "Tour",
+    "buttonAria": "Take the welcome tour",
+    "skip": "Skip",
+    "back": "Back",
+    "next": "Next",
+    "done": "Done",
+    "download": "Download",
+    "later": "Later",
+    "welcome": {
+      "title": "Welcome to Glaux",
+      "message": "Would you like to take a tour and learn how to use the interface?",
+      "ownWay": "I'll find my own way",
+      "showAround": "Show me around"
+    },
+    "steps": {
+      "models": {
+        "title": "Models",
+        "body": "This panel downloads and manages models on this computer. Enter a Hugging Face model id (org/model) and click Add. For a GGUF repository, choose a quantization in the dialog that follows. Select a downloaded model to load it. Eject model unloads the current model. Reload model loads it again. Find models opens the Hugging Face hub.\n\nDownload unsloth/gemma-4-E2B-it-GGUF now, or add a model later."
+      },
+      "workspaces": {
+        "title": "Workspaces",
+        "body": "A workspace keeps its own sessions, resources, and outputs. Downloaded models stay available in every workspace. Pick the active workspace from this list. The plus button creates a new workspace and asks you to name it. The pencil renames the current workspace. The trash button moves that workspace to the recycle bin, together with its sessions, resources, and outputs."
+      },
+      "sessions": {
+        "title": "Sessions",
+        "body": "Saved chats for the current workspace live here. New Session starts a blank conversation. Search filters the list. Open a session to restore its messages. Delete moves a session to the recycle bin."
+      },
+      "resources": {
+        "title": "Resources",
+        "body": "Files for this workspace live here. Drag and drop files onto this panel to add them. Drag a resource into the chat to attach it, or open a file to view it."
+      },
+      "chat": {
+        "title": "Chat",
+        "body": "Talk to the loaded model here. Type a message and press Send. Drop files into the attachment area to include images, audio, video, or PDFs when the model supports them. Reasoning asks the model to think before answering. Resubmit controls whether earlier image, audio, and video attachments are sent again with each new message. The context indicator shows how much of the model's context window is in use."
+      },
+      "outputs": {
+        "title": "Outputs",
+        "body": "Files the model creates, and files you export from a chat turn, appear here. Drag an output into Resources to copy it into the library, or into the chat to attach it."
+      }
+    }
   }
 }

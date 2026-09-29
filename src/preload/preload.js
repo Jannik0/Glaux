@@ -234,6 +234,19 @@ contextBridge.exposeInMainWorld('api', {
     }
     return result.preferences;
   },
+  isFirstLaunch: async () => {
+    const result = await ipcRenderer.invoke('prefs:get');
+    if (!result.ok) {
+      throw toStructuredRendererError(result, tf('preload.couldNotReadPreferences', 'Could not read preferences'));
+    }
+    return Boolean(result.firstLaunch);
+  },
+  consumeFirstLaunch: async () => {
+    const result = await ipcRenderer.invoke('prefs:consumeFirstLaunch');
+    if (!result.ok) {
+      throw toStructuredRendererError(result, tf('preload.couldNotSavePreferences', 'Could not save preferences'));
+    }
+  },
   updatePreferences: async (partial) => {
     const result = await ipcRenderer.invoke('prefs:update', partial || {});
     if (!result.ok) {
