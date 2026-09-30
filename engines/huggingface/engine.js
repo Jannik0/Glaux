@@ -4,7 +4,11 @@ const { spawn, execFile } = require('child_process');
 const path = require('path');
 const readline = require('readline');
 const { isPackagedApp, pickPython } = require('../common/runtimePaths');
-const { withForceCpuTorchEnv, withSharedCudaLibPath } = require('../common/gpuRuntime');
+const {
+  withForceCpuTorchEnv,
+  withSharedCudaLibPath,
+  withUnsupportedCudaHidden,
+} = require('../common/gpuRuntime');
 const { withFfmpegEnv } = require('../common/ffmpeg');
 
 /** Directory that contains engine.py (+ model-downloader.py). */
@@ -322,13 +326,15 @@ function ensureChild() {
   }
 
   const env = withFfmpegEnv(
-    withSharedCudaLibPath(
-      withForceCpuTorchEnv({
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-        PYTHONUTF8: '1',
-        PYTHONIOENCODING: 'utf-8:utf-8',
-      })
+    withUnsupportedCudaHidden(
+      withSharedCudaLibPath(
+        withForceCpuTorchEnv({
+          ...process.env,
+          PYTHONUNBUFFERED: '1',
+          PYTHONUTF8: '1',
+          PYTHONIOENCODING: 'utf-8:utf-8',
+        })
+      )
     )
   );
   if (modelsCacheDir) {

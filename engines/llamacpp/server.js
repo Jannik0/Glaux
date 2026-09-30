@@ -23,6 +23,14 @@ let terminatePromise = null;
 let serverPort = null;
 /** @type {string | null} */
 let conversationId = null;
+/** Tail of llama-server stderr, including after the process has exited. */
+let recentStderr = '';
+let stderrGeneration = 0;
+const STDERR_LIMIT = 32 * 1024;
+
+function getRecentStderr() {
+  return recentStderr;
+}
 
 function isProcAlive(proc) {
   return (
@@ -250,15 +258,14 @@ async function startServer({ bin, args, cwd, env, port, onProgress }) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  /** @type {string[]} */
-  const stderrChunks = [];
-  const STDERR_KEEP = 8;
+  const generation = ++stderrGeneration;
+  recentStderr = '';
   proc.stderr.on('data', (chunk) => {
-    const text = chunk.toString('utf8');
-    stderrChunks.push(text);
-    if (stderrChunks.length > STDERR_KEEP) {
-      stderrChunks.shift();
+    if (generation !== stderrGeneration) {
+      return;
     }
+    const text = chunk.toString('utf8');
+    recentStderr = (recentStderr + text).slice(-STDERR_LIMIT);
     if (process.env.GLAUX_LLAMA_DEBUG === '1') {
       process.stderr.write(`[llama-server] ${text}`);
     }
@@ -274,10 +281,8 @@ async function startServer({ bin, args, cwd, env, port, onProgress }) {
   serverPort = port;
   conversationId = `glaux-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const recentStderr = () => stderrChunks.join('').trim().slice(-2000);
-
   try {
-    await waitForHealth(onProgress, recentStderr);
+    await waitForHealth(onProgress, getRecentStderr);
   } catch (err) {
     await stopServer();
     throw err;
@@ -487,4 +492,5 @@ module.exports = {
   getPort,
   getConversationId,
   streamChatCompletions,
+  getRecentStderr,
 };

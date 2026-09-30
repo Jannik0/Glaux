@@ -34,6 +34,7 @@ const {
   requirePatchelf,
 } = require('./gpuBackends');
 const { ensureGitDep } = require('./ensureGitDep');
+const { pruneCudaFatbinsInTree } = require('./cudaFatbin');
 
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SRC = path.join(ROOT, 'deps', 'transcribe.cpp');
@@ -336,6 +337,7 @@ function main() {
   removeStagedCudaRedistributables(opts.outDir);
   if (backends.cuda) {
     stageSharedCudaRuntime({ required: true });
+    pruneCudaFatbinsInTree(opts.outDir);
   }
   shareGgmlCudaBackend(path.join(ROOT, 'vendor', 'llamacpp'), opts.outDir);
 

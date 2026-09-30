@@ -5,9 +5,15 @@
  * GLAUX_FORCE_CPU=1|true|yes disables GPU even when backends are shipped.
  */
 
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { getVendorRoot } = require('./runtimePaths');
+const {
+  cudaComputeCapabilitySupported,
+  isNoCudaKernelImage,
+  selectCudaVisibleDevices,
+} = require('./cudaArch');
 
 /**
  * @param {NodeJS.ProcessEnv} [env]
@@ -76,9 +82,107 @@ function withSharedCudaLibPath(baseEnv, cudaDir) {
   return env;
 }
 
+/** @type {{ index: number, major: number, minor: number }[] | null | undefined} */
+let nvidiaProbeCache;
+
+/**
+ * Physical NVIDIA GPUs from nvidia-smi. Cached. Null when the tool is missing
+ * or reports nothing (macOS, CPU-only, driver not installed).
+ * @returns {{ index: number, major: number, minor: number }[] | null}
+ */
+function queryNvidiaComputeCaps() {
+  if (nvidiaProbeCache !== undefined) {
+    return nvidiaProbeCache;
+  }
+  nvidiaProbeCache = null;
+  if (process.platform === 'darwin') {
+    return null;
+  }
+  const result = spawnSync(
+    'nvidia-smi',
+    ['--query-gpu=index,compute_cap', '--format=csv,noheader'],
+    { encoding: 'utf8', timeout: 8000, windowsHide: true }
+  );
+  if (result.error || result.status !== 0 || !result.stdout) {
+    return null;
+  }
+  /** @type {{ index: number, major: number, minor: number }[]} */
+  const gpus = [];
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const match = line.trim().match(/^(\d+)\s*,\s*(\d+)\.(\d+)\s*$/);
+    if (!match) {
+      continue;
+    }
+    gpus.push({
+      index: Number(match[1]),
+      major: Number(match[2]),
+      minor: Number(match[3]),
+    });
+  }
+  nvidiaProbeCache = gpus.length ? gpus : null;
+  return nvidiaProbeCache;
+}
+
+/**
+ * Hide NVIDIA GPUs that have no bundled cubin and are older than the 12.0 PTX
+ * image. Vulkan still sees them. Leaves the env alone when nvidia-smi is
+ * missing, the user already hid CUDA, or every visible GPU is supported.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {() => { index: number, major: number, minor: number }[] | null} [query]
+ * @returns {NodeJS.ProcessEnv}
+ */
+function withUnsupportedCudaHidden(env = process.env, query = queryNvidiaComputeCaps) {
+  const next = { ...env };
+  if (isForceCpu(next)) {
+    return next;
+  }
+  let gpus = null;
+  try {
+    gpus = query();
+  } catch {
+    return next;
+  }
+  if (!gpus || !gpus.length) {
+    return next;
+  }
+  const visible = Object.prototype.hasOwnProperty.call(env, 'CUDA_VISIBLE_DEVICES')
+    ? env.CUDA_VISIBLE_DEVICES
+    : undefined;
+  const selected = selectCudaVisibleDevices(gpus, visible);
+  if (selected == null || selected === next.CUDA_VISIBLE_DEVICES) {
+    return next;
+  }
+  if (selected === '-1') {
+    process.stderr.write(
+      '[glaux] This NVIDIA GPU is outside the bundled CUDA architectures; using Vulkan.\n'
+    );
+  } else {
+    process.stderr.write(
+      `[glaux] Hiding NVIDIA GPUs without a bundled CUDA image (CUDA_VISIBLE_DEVICES=${selected}).\n`
+    );
+  }
+  next.CUDA_VISIBLE_DEVICES = selected;
+  return next;
+}
+
+/**
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {NodeJS.ProcessEnv}
+ */
+function withCudaHidden(env) {
+  return { ...env, CUDA_VISIBLE_DEVICES: '-1' };
+}
+
 module.exports = {
   isForceCpu,
   withForceCpuTorchEnv,
   withVendorLibPath,
   withSharedCudaLibPath,
+  withUnsupportedCudaHidden,
+  withCudaHidden,
+  queryNvidiaComputeCaps,
+  cudaComputeCapabilitySupported,
+  isNoCudaKernelImage,
+  selectCudaVisibleDevices,
 };

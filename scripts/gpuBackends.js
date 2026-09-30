@@ -10,6 +10,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execSync, spawnSync } = require('child_process');
+const { cudaGgmlArchitectureList } = require('../engines/common/cudaArch');
+const { pruneCudaFatbinsInTree } = require('./cudaFatbin');
 
 const GPU_BACKENDS = ['cuda', 'vulkan', 'metal'];
 
@@ -74,9 +76,14 @@ function isNativeLibName(fileName) {
 
 /**
  * Training, profiling, and installer-only CUDA bits that Glaux inference never
- * loads. Used both for file names and ELF DT_NEEDED entries. Must not match
- * cuDNN (`cudnn` is not `nccl`). NCCL, NVSHMEM, cuSPARSELt, and cuFile stay in
- * the dynamic table and are replaced with loader stubs (see scripts/cudaStubs.js)
+ * loads. Used both for file names and ELF DT_NEEDED entries. Core cuDNN stays,
+ * including the Tensor IR engine: cuDNN 9.24 dlopens it while finalizing tensor
+ * descriptors, and convolution fails with CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+ * when the file is missing. The cuDNN ext plugin is not in that set. libtorch
+ * does not link it, and cuDNN loads it only when the file is present. Same stem
+ * on Windows (`cudnn_ext64_9.dll`) and Linux (`libcudnn_ext.so.9`). NCCL,
+ * NVSHMEM, cuSPARSELt, and cuFile stay in the
+ * dynamic table and are replaced with loader stubs (see scripts/cudaStubs.js)
  * because CPython opens torch with RTLD_NOW. Must not match Torch's `nvtx.py`
  * (`torch.cuda.nvtx`).
  *
@@ -96,6 +103,7 @@ function isDroppedCudaDepName(name) {
     /nvrtc.*\.alt/i.test(name) ||
     /^libpcsamplingutil/i.test(name) ||
     /libcheckpoint/i.test(name) ||
+    /^(?:lib)?cudnn_ext(?:\d|\.|_|$)/i.test(name) ||
     /\.a$/i.test(name)
   );
 }
@@ -820,7 +828,7 @@ function cudaCompilerCmakeArgs(backends) {
  * arch; 120 without `-real` keeps one forward-compat PTX blob. Semicolons are
  * quoted on Windows because spawnSync({shell:true}) otherwise splits the list.
  */
-const GGML_CUDA_ARCHITECTURES = '75-real;80-real;86-real;89-real;90-real;100-real;120';
+const GGML_CUDA_ARCHITECTURES = cudaGgmlArchitectureList();
 
 /**
  * @param {string} name
@@ -1237,6 +1245,7 @@ function stageSharedCudaRuntime(opts = {}) {
     return null;
   }
   copyCudaRedistributables(outDir, cudaRoot);
+  pruneCudaFatbinsInTree(outDir);
   return outDir;
 }
 

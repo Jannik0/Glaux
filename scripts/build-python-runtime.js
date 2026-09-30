@@ -20,8 +20,12 @@
  * hf_xet, package tests/ trees, triton, NVTX,
  * cuda-bindings, and unused CPython stdlib. Linux also collapses ELF
  * SONAME copies, strips binaries, and removes matching DT_NEEDED entries
- * with patchelf (those steps are no-ops on Windows). cuDNN, cuFFT, cuRAND, NVRTC, cuSOLVER,
- * cuSPARSE, and CUPTI stay (libtorch calls them). NCCL, cuSPARSELt, NVSHMEM, and
+ * with patchelf (those steps are no-ops on Windows). Prebuilt CUDA fatbins are
+ * cut to the ggml architecture list (7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0 with
+ * PTX). cuDNN stays, including the Tensor IR engine (convolution fails to load
+ * without it). The cuDNN ext plugin is dropped on Windows and Linux. cuFFT,
+ * cuRAND, NVRTC, cuSOLVER, cuSPARSE, and CUPTI stay
+ * (libtorch calls them). NCCL, cuSPARSELt, NVSHMEM, and
  * cuFile are replaced with loader stubs on Windows and Linux: libtorch still
  * links them, but Glaux never calls multi-GPU collectives, 2:4 sparse matmul,
  * or GPUDirect Storage. Public testing modules (numpy.testing, torch.testing)
@@ -45,8 +49,10 @@ const {
   stripNativeBinariesRecursive,
   removeDroppedElfNeeded,
   requirePatchelf,
+  sharedCudaDir,
 } = require('./gpuBackends');
 const { stubTorchUnusedCudaDeps } = require('./cudaStubs');
+const { pruneCudaFatbinsInTree } = require('./cudaFatbin');
 
 const DEFAULT_PBS_TAG = '20260718';
 const DEFAULT_PYTHON_VERSION = '3.14.6';
@@ -321,6 +327,12 @@ function pruneDroppedRuntimeFiles(runtimeRoot, removed) {
         walk(full);
         continue;
       }
+      if (ent.isSymbolicLink()) {
+        if (isDroppedCudaDepName(ent.name)) {
+          pruneTarget(full, removed);
+        }
+        continue;
+      }
       if (!ent.isFile()) {
         continue;
       }
@@ -495,6 +507,13 @@ function finishPythonRuntime(runtimeRoot, opts = {}) {
     shareTorchCuda13WithVendor(runtimeRoot);
   }
   stubTorchUnusedCudaDeps(runtimeRoot);
+  if (process.platform !== 'darwin') {
+    pruneCudaFatbinsInTree(runtimeRoot);
+    const cudaDir = sharedCudaDir();
+    if (fs.existsSync(cudaDir)) {
+      pruneCudaFatbinsInTree(cudaDir);
+    }
+  }
 }
 
 function resolvePythonExe(runtimeRoot) {

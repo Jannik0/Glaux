@@ -34,6 +34,14 @@ function applyLinuxPackagingTmp() {
 
 const packagingTmp = applyLinuxPackagingTmp();
 
+// fpm's deb compressor only accepts a level digit (XZ_OPT=-9). Threads are a
+// separate xz option, inherited here. xz still caps threads to a fraction of
+// RAM, so -T0 does not start one encoder per core at level 9. RPM threading
+// is fpm's xzmt payload flag, not this variable.
+if (!process.env.XZ_DEFAULTS) {
+  process.env.XZ_DEFAULTS = '-T0';
+}
+
 const cli = require.resolve('electron-builder/cli.js');
 const result = spawnSync(process.execPath, [cli, ...process.argv.slice(2)], {
   stdio: 'inherit',

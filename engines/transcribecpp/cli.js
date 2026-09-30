@@ -7,7 +7,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const { findVendorBinary } = require('../common/runtimePaths');
-const { withVendorLibPath, withSharedCudaLibPath } = require('../common/gpuRuntime');
+const { withVendorLibPath, withSharedCudaLibPath, withUnsupportedCudaHidden } = require('../common/gpuRuntime');
 
 /**
  * @returns {string}
@@ -41,7 +41,9 @@ function runTranscribeCli(args, opts = {}) {
     const child = spawn(bin, args, {
       windowsHide: true,
       cwd: opts.cwd || binDir,
-      env: withSharedCudaLibPath(withVendorLibPath(opts.env || process.env, binDir)),
+      env: withUnsupportedCudaHidden(
+        withSharedCudaLibPath(withVendorLibPath(opts.env || process.env, binDir))
+      ),
     });
 
     let stdout = '';

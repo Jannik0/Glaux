@@ -10,7 +10,7 @@ const fsp = require('fs').promises;
 const os = require('os');
 const path = require('path');
 const { pickFfmpeg, spawnFfmpeg } = require('../common/ffmpeg');
-const { isForceCpu } = require('../common/gpuRuntime');
+const { isForceCpu, isNoCudaKernelImage, withCudaHidden } = require('../common/gpuRuntime');
 const { runTranscribeCli } = require('./cli');
 
 const STREAM_CHUNK_MS = 1120;
@@ -236,20 +236,36 @@ async function transcribeAudio(modelPath, modelId, audioPath, opts = {}) {
       }
     };
 
-    const result = await runTranscribeCli(args, {
+    const onStdoutLine = (line) => {
+      const partial = extractPartialFromLine(line);
+      if (partial != null) {
+        publish(partial);
+        return;
+      }
+      const fin = extractFinalTextFromLine(line);
+      if (fin != null) {
+        finalText = fin;
+      }
+    };
+
+    let result = await runTranscribeCli(args, {
       signal: opts.signal,
-      onStdoutLine: (line) => {
-        const partial = extractPartialFromLine(line);
-        if (partial != null) {
-          publish(partial);
-          return;
-        }
-        const fin = extractFinalTextFromLine(line);
-        if (fin != null) {
-          finalText = fin;
-        }
-      },
+      onStdoutLine,
     });
+
+    if (
+      result.code !== 0 &&
+      !emitted &&
+      !(opts.signal && opts.signal.aborted) &&
+      isNoCudaKernelImage(`${result.stderr}\n${result.stdout}`)
+    ) {
+      process.stderr.write('[glaux] CUDA has no kernel image for this GPU; retrying on Vulkan.\n');
+      result = await runTranscribeCli(args, {
+        signal: opts.signal,
+        onStdoutLine,
+        env: withCudaHidden(process.env),
+      });
+    }
 
     if (opts.signal && opts.signal.aborted) {
       return emitted || finalText || '';

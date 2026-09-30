@@ -44,6 +44,11 @@ _CHAT_LOCK = threading.Lock()
 # forever. Failing loudly after a generous wait is preferable to an indefinite, silent hang.
 _CHAT_LOCK_ACQUIRE_TIMEOUT_SECONDS = 300
 CHAT_GENERATION_STOP = False
+# GPU cannot run bundled CUDA (missing kernel image or another non-OOM CUDA error).
+# Later loads in this process stay on CPU.
+_cuda_unavailable = False
+# Models that did not fit in VRAM. A different model tries CUDA again.
+_cuda_oom_model_ids: set[str] = set()
 
 
 def _force_cpu() -> bool:
@@ -58,7 +63,7 @@ def _pipeline_placement_kwargs() -> dict:
     path still initializes CUDA on Windows CUDA wheels and can native-crash
     (Win32 0xC0000005 / exit 3221225477) when ``GLAUX_FORCE_CPU`` is set.
     """
-    if _force_cpu():
+    if _force_cpu() or _cuda_unavailable or _model_cuda_oom(CHATBOT_MODEL_ID):
         return {"device": "cpu"}
     try:
         import torch
@@ -71,17 +76,127 @@ def _pipeline_placement_kwargs() -> dict:
     return {"device": "cpu"}
 
 
+def _model_cuda_oom(model_id: str | None) -> bool:
+    return bool(model_id) and model_id in _cuda_oom_model_ids
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
-    """True when a pipeline load failed because the GPU ran out of memory."""
+    """True when CUDA ran out of memory. Other CUDA errors are not OOM."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_cuda_oom_one(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _is_cuda_oom_one(exc: BaseException) -> bool:
     try:
         import torch
-
-        if isinstance(exc, torch.cuda.OutOfMemoryError):
+    except ImportError:
+        torch = None
+    if torch is not None:
+        oom = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        if oom is not None and isinstance(exc, oom):
             return True
+    text = str(exc).lower()
+    if "cuda" not in text and "cuda" not in type(exc).__name__.lower():
+        return False
+    compact = text.replace(" ", "")
+    return any(
+        needle in compact for needle in ("outofmemory", "withoom", "cudacachingallocator")
+    )
+
+
+def _note_cuda_failure(exc: BaseException, model_id: str | None) -> None:
+    """Remember an OOM for this model only. Any other CUDA failure disables CUDA."""
+    global _cuda_unavailable
+    if _is_cuda_oom(exc):
+        if model_id:
+            _cuda_oom_model_ids.add(model_id)
+        return
+    _cuda_unavailable = True
+
+
+def _is_cuda_failure(exc: BaseException) -> bool:
+    """True when CUDA itself failed (out of memory, missing kernel image, or another CUDA error)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_cuda_failure_one(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _is_cuda_failure_one(exc: BaseException) -> bool:
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None:
+        oom = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        if oom is not None and isinstance(exc, oom):
+            return True
+    text = str(exc).lower()
+    if "cuda" not in text and "cuda" not in type(exc).__name__.lower():
+        return False
+    compact = text.replace(" ", "")
+    needles = (
+        "out of memory",
+        "with oom",
+        "cudacachingallocator",
+        "cuda error",
+        "cudaerror",
+        "no kernel image",
+        "invalid kernel image",
+        "acceleratorerror",
+    )
+    return any(needle.replace(" ", "") in compact for needle in needles)
+
+
+def _cuda_failure_summary(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    if len(text) > 180:
+        return text[:180] + "…"
+    return text
+
+
+def _pipeline_uses_cuda() -> bool:
+    if CHATBOT is None or _cuda_unavailable:
+        return False
+    device = getattr(CHATBOT, "device", None)
+    if device is not None and "cuda" in str(device).lower():
+        return True
+    model = getattr(CHATBOT, "model", None)
+    device_map = getattr(model, "hf_device_map", None)
+    if isinstance(device_map, dict):
+        return any("cuda" in str(value).lower() for value in device_map.values())
+    return False
+
+
+def _fallback_pipeline_to_cpu(exc: BaseException) -> None:
+    """Drop the CUDA pipeline and load the same model on CPU. Caller holds ``_CHAT_LOCK``."""
+    model_id = CHATBOT_MODEL_ID
+    _note_cuda_failure(exc, model_id)
+    print(
+        f"CUDA failed ({_cuda_failure_summary(exc)}); retrying on CPU.",
+        file=sys.stderr,
+        flush=True,
+    )
+    old = _chatbot_destroy_unlocked()
+    if old is not None:
+        del old
+    gc.collect()
+    try:
+        _release_torch_cache()
     except Exception:
         pass
-    text = str(exc).lower()
-    return "out of memory" in text or "with oom" in text or "cudacachingallocator" in text.replace(" ", "")
+    if model_id:
+        chatbot_create(model_id)
 
 
 @contextmanager
@@ -145,12 +260,16 @@ def chatbot_create(model_id: str):
         try:
             return _build_pipeline(placement)
         except Exception as exc:
-            if _force_cpu() or not _is_cuda_oom(exc):
+            if _force_cpu() or _cuda_unavailable or not _is_cuda_failure(exc):
                 raise
+            _note_cuda_failure(exc, CHATBOT_MODEL_ID)
             gc.collect()
-            _release_torch_cache()
+            try:
+                _release_torch_cache()
+            except Exception:
+                pass
             print(
-                "CUDA out of memory while loading the model; retrying on CPU.",
+                f"CUDA failed while loading the model ({_cuda_failure_summary(exc)}); retrying on CPU.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -845,34 +964,53 @@ def chat_stream(
         parts: list[str] = []
         used_chat_template = chatbot_has_chat_template()
         try:
-            stream = (
-                _iter_chat_template_stream(
-                    thinking,
-                    image_paths,
-                    audio_paths,
-                    video_paths,
-                    resubmit=resubmit,
-                )
-                if used_chat_template
-                else _iter_direct_pipeline_stream(message, image_paths, audio_paths, video_paths)
-            )
-            for chunk in stream:
-                parts.append(chunk)
-                yield chunk
-            stopped = CHAT_GENERATION_STOP
-            CHAT_GENERATION_STOP = False
-            if not stopped:
-                if used_chat_template:
-                    _, answer = _parse_tags_and_answer("".join(parts))
-                    if owns_history:
-                        context._context_add_assistant(answer)
-                    context._add_assistant_tokens_to_context_usage(answer)
-                else:
-                    response = "".join(parts)
-                    if owns_history:
-                        context._context_add_assistant(response)
-                    context._add_assistant_tokens_to_context_usage(response)
-                context_committed = True
+            for attempt in range(2):
+                parts.clear()
+                try:
+                    stream = (
+                        _iter_chat_template_stream(
+                            thinking,
+                            image_paths,
+                            audio_paths,
+                            video_paths,
+                            resubmit=resubmit,
+                        )
+                        if used_chat_template
+                        else _iter_direct_pipeline_stream(
+                            message, image_paths, audio_paths, video_paths
+                        )
+                    )
+                    for chunk in stream:
+                        parts.append(chunk)
+                        yield chunk
+                    stopped = CHAT_GENERATION_STOP
+                    CHAT_GENERATION_STOP = False
+                    if not stopped:
+                        if used_chat_template:
+                            _, answer = _parse_tags_and_answer("".join(parts))
+                            if owns_history:
+                                context._context_add_assistant(answer)
+                            context._add_assistant_tokens_to_context_usage(answer)
+                        else:
+                            response = "".join(parts)
+                            if owns_history:
+                                context._context_add_assistant(response)
+                            context._add_assistant_tokens_to_context_usage(response)
+                        context_committed = True
+                    break
+                except Exception as exc:
+                    # First kernel launch often fails only after weights are on the GPU.
+                    # Reload on CPU when nothing has been streamed yet.
+                    if (
+                        attempt == 0
+                        and not parts
+                        and _pipeline_uses_cuda()
+                        and _is_cuda_failure(exc)
+                    ):
+                        _fallback_pipeline_to_cpu(exc)
+                        used_chat_template = chatbot_has_chat_template()
+                        continue
+                    raise
         finally:
             if not context_committed:
                 if owns_history:

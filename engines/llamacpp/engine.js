@@ -13,7 +13,14 @@
 const path = require('path');
 const { resolveLocalGgufPaths } = require('../common/modelFormat');
 const { stripThinkingFromMessages } = require('../common/stripThinking');
-const { isForceCpu, withVendorLibPath, withSharedCudaLibPath } = require('../common/gpuRuntime');
+const {
+  isForceCpu,
+  withVendorLibPath,
+  withSharedCudaLibPath,
+  withUnsupportedCudaHidden,
+  withCudaHidden,
+  isNoCudaKernelImage,
+} = require('../common/gpuRuntime');
 const { withFfmpegEnv } = require('../common/ffmpeg');
 const server = require('./server');
 const chat = require('./chat');
@@ -67,6 +74,10 @@ let CONTEXT = [];
 
 let nCtx = FALLBACK_CTX;
 let cachedUsage = { used: 0, total: FALLBACK_CTX, valid: false };
+/** Args from the last successful or in-progress llama-server launch. */
+let llamaLaunch = null;
+/** One Vulkan retry after CUDA reports no kernel image for this process. */
+let cudaFellBackToVulkan = false;
 
 /**
  * @param {object | null | undefined} usage
@@ -278,6 +289,28 @@ function formatLlamaServerLoadError(raw) {
 }
 
 /**
+ * Start llama-server. If CUDA aborts because the GPU has no bundled image,
+ * restart once with CUDA hidden so Vulkan can take the same NVIDIA device.
+ * @param {{ bin: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, port: number, onProgress?: Function }} launch
+ */
+async function startLlamaOrVulkan(launch) {
+  llamaLaunch = launch;
+  try {
+    await server.startServer(launch);
+  } catch (err) {
+    const detail = `${err && err.message ? err.message : ''}\n${server.getRecentStderr()}`;
+    if (cudaFellBackToVulkan || !isNoCudaKernelImage(detail)) {
+      throw err;
+    }
+    cudaFellBackToVulkan = true;
+    process.stderr.write('[glaux] CUDA has no kernel image for this GPU; retrying on Vulkan.\n');
+    const next = { ...launch, env: withCudaHidden(launch.env) };
+    llamaLaunch = next;
+    await server.startServer(next);
+  }
+}
+
+/**
  * @param {string} modelId
  * @param {{ onProgress?: Function }} [options]
  */
@@ -316,7 +349,10 @@ async function chatbotCreate(modelId, options = {}) {
     ctxSize: parseLlamaCtxSize(),
   });
 
-  let env = withFfmpegEnv(withSharedCudaLibPath(withVendorLibPath({ ...process.env }, binDir)));
+  cudaFellBackToVulkan = false;
+  let env = withUnsupportedCudaHidden(
+    withFfmpegEnv(withSharedCudaLibPath(withVendorLibPath({ ...process.env }, binDir)))
+  );
 
   if (onProgress) {
     onProgress({ status: 'progress', loaded: 0, total: 100, percent: 0 });
@@ -327,7 +363,7 @@ async function chatbotCreate(modelId, options = {}) {
   cachedUsage = { used: 0, total: nCtx, valid: true };
 
   try {
-    await server.startServer({ bin, args, cwd: path.dirname(bin), env, port, onProgress });
+    await startLlamaOrVulkan({ bin, args, cwd: path.dirname(bin), env, port, onProgress });
   } catch (err) {
     await stopServer();
     activeModelId = null;
@@ -467,6 +503,7 @@ async function runChat(modelId, thinking, message, options = {}) {
 
   try {
     let reply = '';
+    let emitted = false;
 
     const openAiMessages = chat.buildInferenceOpenAIMessages(CONTEXT, resubmit);
     const body = {
@@ -483,13 +520,41 @@ async function runChat(modelId, thinking, message, options = {}) {
         body.reasoning_budget = 0;
       }
     }
-    const result = await server.streamChatCompletions(body, {
-      onToken: opts.onToken,
-      signal: abort.signal,
-    });
-    reply = result.text;
-    if (!applyUsageFromServer(result.usage)) {
-      cachedUsage.valid = false;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const result = await server.streamChatCompletions(body, {
+          onToken: (token) => {
+            if (token) {
+              emitted = true;
+            }
+            if (opts.onToken) {
+              opts.onToken(token);
+            }
+          },
+          signal: abort.signal,
+        });
+        reply = result.text;
+        if (!applyUsageFromServer(result.usage)) {
+          cachedUsage.valid = false;
+        }
+        break;
+      } catch (err) {
+        if (abort.signal.aborted || /abort/i.test(String(err && err.message))) {
+          return '';
+        }
+        const detail = `${err && err.message ? err.message : ''}\n${server.getRecentStderr()}`;
+        const canFallback =
+          attempt === 0 && !emitted && !cudaFellBackToVulkan && llamaLaunch && isNoCudaKernelImage(detail);
+        if (!canFallback) {
+          throw err;
+        }
+        cudaFellBackToVulkan = true;
+        process.stderr.write('[glaux] CUDA has no kernel image for this GPU; retrying on Vulkan.\n');
+        await server.stopServer();
+        llamaLaunch = { ...llamaLaunch, env: withCudaHidden(llamaLaunch.env) };
+        await server.startServer(llamaLaunch);
+      }
     }
 
     // Re-measure so the gauge includes the assistant reply (contextManager appends after return).
@@ -504,11 +569,6 @@ async function runChat(modelId, thinking, message, options = {}) {
       cachedUsage.valid = false;
     }
     return reply;
-  } catch (err) {
-    if (abort.signal.aborted || /abort/i.test(String(err && err.message))) {
-      return '';
-    }
-    throw err;
   } finally {
     if (activeChatAbort === abort) {
       activeChatAbort = null;

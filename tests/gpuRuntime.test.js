@@ -6,7 +6,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { isForceCpu, withForceCpuTorchEnv, withVendorLibPath, withSharedCudaLibPath } = require('../engines/common/gpuRuntime');
+const { isForceCpu, withForceCpuTorchEnv, withVendorLibPath, withSharedCudaLibPath, withUnsupportedCudaHidden, selectCudaVisibleDevices, cudaComputeCapabilitySupported, isNoCudaKernelImage } = require('../engines/common/gpuRuntime');
+const { cudaGgmlArchitectureList, keepCudaFatbinImage } = require('../engines/common/cudaArch');
 const { expectedGpuBackends, findBackendModule, findNvcc, isCuda13RedistName, isDroppedCudaDepName, missingSharedCudaRedists, withCudaToolkitEnv, copyFile, collapseDuplicateLibs, collapseDuplicateLibsRecursive, cudaArchitectureCmakeArgs, GGML_CUDA_ARCHITECTURES, shareTorchCuda13WithVendor, shareGgmlCudaBackend, ggmlCudaBackendFileName, which, requirePatchelf, elfNeeded, removeDroppedElfNeeded } = require('../scripts/gpuBackends');
 const { isStubbedCudaFamilyFile, readPeImportsAndExports, stubTorchUnusedCudaDeps } = require('../scripts/cudaStubs');
 
@@ -60,6 +61,77 @@ describe('gpuRuntime', () => {
     const env = withSharedCudaLibPath({ PATH: 'rest' }, missing);
     assert.equal(env.PATH, 'rest');
     assert.equal(env.GLAUX_CUDA_DIR, undefined);
+  });
+
+  it('keeps the ggml CUDA architecture list', () => {
+    assert.equal(cudaGgmlArchitectureList(), GGML_CUDA_ARCHITECTURES);
+    assert.equal(GGML_CUDA_ARCHITECTURES, '75-real;80-real;86-real;89-real;90-real;100-real;120');
+  });
+
+  it('accepts bundled compute capabilities and 12.0 PTX forward, and rejects the rest', () => {
+    assert.equal(cudaComputeCapabilitySupported(7, 5), true);
+    assert.equal(cudaComputeCapabilitySupported(8, 0), true);
+    assert.equal(cudaComputeCapabilitySupported(8, 6), true);
+    assert.equal(cudaComputeCapabilitySupported(8, 9), true);
+    assert.equal(cudaComputeCapabilitySupported(9, 0), true);
+    assert.equal(cudaComputeCapabilitySupported(10, 0), true);
+    assert.equal(cudaComputeCapabilitySupported(12, 0), true);
+    assert.equal(cudaComputeCapabilitySupported(12, 1), true);
+    assert.equal(cudaComputeCapabilitySupported(13, 0), true);
+    assert.equal(cudaComputeCapabilitySupported(6, 1), false);
+    assert.equal(cudaComputeCapabilitySupported(7, 0), false);
+    assert.equal(cudaComputeCapabilitySupported(8, 7), false);
+    assert.equal(cudaComputeCapabilitySupported(10, 3), false);
+  });
+
+  it('keeps listed cubins and 12.x PTX, and drops other cubins', () => {
+    assert.equal(keepCudaFatbinImage(2, 86), true);
+    assert.equal(keepCudaFatbinImage(2, 90), true);
+    assert.equal(keepCudaFatbinImage(2, 120), true);
+    assert.equal(keepCudaFatbinImage(2, 121), false);
+    assert.equal(keepCudaFatbinImage(2, 103), false);
+    assert.equal(keepCudaFatbinImage(1, 120), true);
+    assert.equal(keepCudaFatbinImage(1, 121), true);
+    assert.equal(keepCudaFatbinImage(1, 75), false);
+  });
+
+  it('recognizes a missing CUDA kernel image', () => {
+    assert.equal(
+      isNoCudaKernelImage('CUDA error: no kernel image is available for execution on the device'),
+      true
+    );
+    assert.equal(isNoCudaKernelImage('out of memory'), false);
+  });
+
+  it('hides NVIDIA GPUs that are outside the bundled architectures', () => {
+    const gpus = [
+      { index: 0, major: 6, minor: 1 },
+      { index: 1, major: 8, minor: 6 },
+    ];
+    assert.equal(selectCudaVisibleDevices(gpus, undefined), '1');
+    assert.equal(selectCudaVisibleDevices([{ index: 0, major: 6, minor: 1 }], undefined), '-1');
+    assert.equal(selectCudaVisibleDevices([{ index: 0, major: 8, minor: 6 }], undefined), undefined);
+    assert.equal(selectCudaVisibleDevices(gpus, '1'), undefined);
+    assert.equal(selectCudaVisibleDevices(gpus, '0,1'), '1');
+    assert.equal(selectCudaVisibleDevices(gpus, '-1'), undefined);
+    assert.equal(selectCudaVisibleDevices(gpus, 'GPU-abc'), undefined);
+  });
+
+  it('filters CUDA_VISIBLE_DEVICES from a probe and leaves a hidden GPU alone', () => {
+    const hidden = withUnsupportedCudaHidden(
+      { CUDA_VISIBLE_DEVICES: '-1', PATH: 'rest' },
+      () => [{ index: 0, major: 6, minor: 1 }]
+    );
+    assert.equal(hidden.CUDA_VISIBLE_DEVICES, '-1');
+
+    const filtered = withUnsupportedCudaHidden({ PATH: 'rest' }, () => [
+      { index: 0, major: 6, minor: 1 },
+    ]);
+    assert.equal(filtered.CUDA_VISIBLE_DEVICES, '-1');
+    assert.equal(filtered.PATH, 'rest');
+
+    const untouched = withUnsupportedCudaHidden({ PATH: 'rest' }, () => null);
+    assert.equal(untouched.CUDA_VISIBLE_DEVICES, undefined);
   });
 });
 
@@ -234,6 +306,21 @@ describe('dropped CUDA extras', () => {
     assert.equal(isDroppedCudaDepName('nvtx.pyi'), false);
     assert.equal(isDroppedCudaDepName('nvToolsExt64_1.dll'), true);
     assert.equal(isDroppedCudaDepName('libcudnn.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_graph.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_ops.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_cnn.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_adv.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_heuristic.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_engines_precompiled.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_engines_runtime_compiled.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_engines_tensor_ir.so.9'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_engines_tensor_ir.so.9.24.0'), false);
+    assert.equal(isDroppedCudaDepName('cudnn_engines_tensor_ir64_9.dll'), false);
+    assert.equal(isDroppedCudaDepName('cudnn64_9.dll'), false);
+    assert.equal(isDroppedCudaDepName('cudnn_graph64_9.dll'), false);
+    assert.equal(isDroppedCudaDepName('libcudnn_ext.so.9'), true);
+    assert.equal(isDroppedCudaDepName('libcudnn_ext.so'), true);
+    assert.equal(isDroppedCudaDepName('cudnn_ext64_9.dll'), true);
     assert.equal(isDroppedCudaDepName('libcublas.so.13'), false);
     assert.equal(isDroppedCudaDepName('libcudart.so.13'), false);
     assert.equal(isDroppedCudaDepName('libcufft.so.12'), false);

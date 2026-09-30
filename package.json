@@ -146,6 +146,17 @@
         }
       ]
     },
+    "deb": {
+      "fpm": [
+        "--deb-compression-level=9"
+      ]
+    },
+    "rpm": {
+      "compression": "xzmt",
+      "fpm": [
+        "--rpm-compression-level=9"
+      ]
+    },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
