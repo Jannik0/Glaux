@@ -1,5 +1,6 @@
-// Welcome tour: spotlight each panel from left to right. On first launch a
-// welcome prompt offers the tour. The Tour button can replay it.
+// Welcome tour: spotlight each panel from left to right, then the header
+// controls. On first launch a welcome prompt offers the tour. The Tour button
+// can replay it.
 
 const SUGGESTED_MODEL_ID = 'unsloth/gemma-4-E2B-it-GGUF';
 
@@ -10,6 +11,7 @@ const TOUR_STEPS = [
   { id: 'resources', selector: '#resources-panel' },
   { id: 'chat', selector: '.chat-panel' },
   { id: 'outputs', selector: '#outputs-panel' },
+  { id: 'header', selector: '.app-header-trailing' },
 ];
 
 function t(key, vars) {
@@ -128,6 +130,9 @@ function positionTour() {
   let top;
   if (step.id === 'workspaces') {
     left = rect.left + (rect.width - popRect.width) / 2;
+    top = rect.bottom + gap;
+  } else if (step.id === 'header') {
+    left = rect.right - popRect.width;
     top = rect.bottom + gap;
   } else if (step.id === 'chat') {
     left = rect.left + (rect.width - popRect.width) / 2;

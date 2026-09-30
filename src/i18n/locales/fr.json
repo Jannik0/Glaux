@@ -439,6 +439,10 @@
       "outputs": {
         "title": "Sorties",
         "body": "Les fichiers créés par le modèle et les fichiers que vous exportez depuis un tour de discussion apparaissent ici. Faites glisser une sortie vers Ressources pour la copier dans la bibliothèque, ou vers le chat pour la joindre."
+      },
+      "header": {
+        "title": "Thème, langue et visite",
+        "body": "Le sélecteur de thème bascule entre Système, Clair et Sombre. Système suit le thème de cet ordinateur. Le sélecteur de langue change la langue de l'interface. Tour relance cette visite."
       }
     }
   }

@@ -439,6 +439,10 @@
       "outputs": {
         "title": "Output",
         "body": "Qui compaiono i file creati dal modello e i file che esporti da un turno della chat. Trascina un output in Risorse per copiarlo nella libreria, oppure nella chat per allegarlo."
+      },
+      "header": {
+        "title": "Tema, lingua e tour",
+        "body": "Il selettore del tema passa tra Sistema, Chiaro e Scuro. Sistema segue il tema di questo computer. Il selettore della lingua cambia la lingua dell'interfaccia. Tour avvia di nuovo questa visita."
       }
     }
   }

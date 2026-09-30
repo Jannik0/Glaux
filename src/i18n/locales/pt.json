@@ -439,6 +439,10 @@
       "outputs": {
         "title": "Saídas",
         "body": "Aqui aparecem os arquivos criados pelo modelo e os arquivos que exporta de um turno do chat. Arraste uma saída para Recursos para a copiar para a biblioteca, ou para o chat para a anexar."
+      },
+      "header": {
+        "title": "Tema, idioma e visita",
+        "body": "O seletor de tema alterna entre Sistema, Claro e Escuro. Sistema segue o tema deste computador. O seletor de idioma muda o idioma da interface. Tour inicia novamente esta visita."
       }
     }
   }

@@ -439,6 +439,10 @@
       "outputs": {
         "title": "Outputs",
         "body": "Files the model creates, and files you export from a chat turn, appear here. Drag an output into Resources to copy it into the library, or into the chat to attach it."
+      },
+      "header": {
+        "title": "Theme, language, and tour",
+        "body": "The theme selector switches between System, Light, and Dark. System follows this computer's theme. The language selector changes the interface language. Tour starts this walkthrough again."
       }
     }
   }

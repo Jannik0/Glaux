@@ -439,6 +439,10 @@
       "outputs": {
         "title": "Ausgaben",
         "body": "Hier erscheinen Dateien, die das Modell erzeugt, und Dateien, die Sie aus einem Chat-Durchgang exportieren. Ziehen Sie eine Ausgabe in Ressourcen, um sie in die Bibliothek zu kopieren, oder in den Chat, um sie anzuhängen."
+      },
+      "header": {
+        "title": "Design, Sprache und Tour",
+        "body": "Die Designauswahl wechselt zwischen System, Hell und Dunkel. System folgt dem Design dieses Computers. Die Sprachauswahl ändert die Sprache der Oberfläche. Tour startet diese Führung erneut."
       }
     }
   }
