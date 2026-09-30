@@ -543,8 +543,44 @@ function initializeGlobalDialogInputTrap() {
   );
 }
 
+// Linux: Chromium focuses the window on drop, and GNOME notifies. Ignore focus
+// for the drag. Restoring waits until after the drop event so the panel can
+// read the files first.
+function suppressLinuxDropAttentionNotification() {
+  if (!window.api || window.api.platform !== 'linux') {
+    return;
+  }
+  let held = false;
+  let timer = 0;
+  const release = (delay) => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      timer = 0;
+      if (!held) {
+        return;
+      }
+      held = false;
+      window.api.setWindowFocusable(true);
+    }, delay);
+  };
+  document.addEventListener('dragover', () => {
+    if (!held) {
+      held = true;
+      window.api.setWindowFocusable(false);
+    }
+    release(4000);
+  }, true);
+  document.addEventListener('dragleave', (event) => {
+    if (!event.relatedTarget) {
+      release(0);
+    }
+  }, true);
+  document.addEventListener('drop', () => release(0), true);
+}
+
 initializeGlobalPanelChrome();
 initializeGlobalDialogInputTrap();
+suppressLinuxDropAttentionNotification();
 initializeThemeSelect();
 initializeLanguageSelect();
 

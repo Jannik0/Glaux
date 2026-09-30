@@ -66,6 +66,8 @@ function toStructuredRendererError(result, fallbackMessage) {
 contextBridge.exposeInMainWorld('api', {
   /** Host OS: 'win32' | 'darwin' | 'linux' | ... */
   platform: process.platform,
+  // Async: a sync IPC during dragover/drop cancels the drag.
+  setWindowFocusable: (focusable) => ipcRenderer.send('window:setFocusable', focusable === true),
   getI18n: () => {
     cachedI18n = ipcRenderer.sendSync('i18n:get');
     return cachedI18n;

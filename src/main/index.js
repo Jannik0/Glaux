@@ -1,5 +1,5 @@
 const path = require('path');
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const engineManager = require('../../engines/engineManager');
 const { APP_NAME, APP_ICON_PATH, initAppPaths, ensureModelsDirectory } = require('./paths');
 const state = require('./state');
@@ -22,6 +22,17 @@ if (isForceCpu()) {
   process.stderr.write(
     'GLAUX_FORCE_CPU is set; Hugging Face, llama.cpp, and transcribe.cpp will pin CPU.\n'
   );
+}
+
+// Linux: the renderer drops focusability during a file drag so GNOME does not
+// notify when Chromium focuses the window.
+if (process.platform === 'linux') {
+  ipcMain.on('window:setFocusable', (event, focusable) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) {
+      win.setFocusable(focusable === true);
+    }
+  });
 }
 
 function createWindow() {
