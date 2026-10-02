@@ -134,24 +134,31 @@ describe('rewriteNvFatbinSection', () => {
 describe('pruneCudaFatbinFile', () => {
   it('rewrites .nv_fatbin inside an ELF and skips symlinks', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-fatbin-'));
-    const file = path.join(dir, 'libdemo.so');
-    const payload = fatbin([
-      fatbinImage(2, 75, Buffer.from('KEEP75')),
-      fatbinImage(2, 70, Buffer.from('DROP70')),
-    ]);
-    fs.writeFileSync(file, elfWithSection('.nv_fatbin', payload));
-    const before = fs.statSync(file).size;
-    const result = pruneCudaFatbinFile(file);
-    assert.ok(result);
-    assert.ok(result.droppedBytes > 0);
-    assert.equal(fs.statSync(file).size, before);
-    const after = fs.readFileSync(file);
-    assert.equal(after.includes(Buffer.from('KEEP75')), true);
-    assert.equal(after.includes(Buffer.from('DROP70')), false);
+    try {
+      const file = path.join(dir, 'libdemo.so');
+      const payload = fatbin([
+        fatbinImage(2, 75, Buffer.from('KEEP75')),
+        fatbinImage(2, 70, Buffer.from('DROP70')),
+      ]);
+      fs.writeFileSync(file, elfWithSection('.nv_fatbin', payload));
+      const before = fs.statSync(file).size;
+      const result = pruneCudaFatbinFile(file);
+      assert.ok(result);
+      assert.ok(result.droppedBytes > 0);
+      assert.equal(fs.statSync(file).size, before);
+      const after = fs.readFileSync(file);
+      assert.equal(after.includes(Buffer.from('KEEP75')), true);
+      assert.equal(after.includes(Buffer.from('DROP70')), false);
 
-    const link = path.join(dir, 'libdemo.so.1');
-    fs.symlinkSync('libdemo.so', link);
-    assert.equal(pruneCudaFatbinFile(link), null);
-    fs.rmSync(dir, { recursive: true, force: true });
+      // Windows refuses symlink creation without elevation or Developer Mode.
+      if (process.platform === 'win32') {
+        return;
+      }
+      const link = path.join(dir, 'libdemo.so.1');
+      fs.symlinkSync('libdemo.so', link);
+      assert.equal(pruneCudaFatbinFile(link), null);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
