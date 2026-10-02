@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Glaux is a local AI workspace for Windows, macOS, and Linux. Chat, read files, and transcribe audio on your computer with any open-weights Safetensors or GGUF model — nothing is sent to a cloud AI.">
+    <meta name="theme-color" content="#0f1011">
+    <meta property="og:title" content="Glaux — Local AI Workspace">
+    <meta property="og:description" content="Chat, read files, and transcribe audio on your computer. Runs any open-weights model in Safetensors or GGUF.">
+    <meta property="og:image" content="assets/GlauxAI_Logo.png">
+    <title>Glaux — Local AI Workspace</title>
+    <link rel="icon" href="assets/favicon.ico">
+    <script>
+      (function () {
+        var storedTheme = localStorage.getItem("glaux-theme");
+        var theme =
+          storedTheme === "light" || storedTheme === "dark"
+            ? storedTheme
+            : window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+        document.documentElement.setAttribute("data-theme", theme);
+
+        var langs = ["en", "de", "fr", "es", "it", "pt"];
+        var storedLang = localStorage.getItem("glaux-lang");
+        var lang = langs.indexOf(storedLang) >= 0 ? storedLang : null;
+        if (!lang) {
+          var navLangs = navigator.languages && navigator.languages.length
+            ? navigator.languages
+            : [navigator.language];
+          for (var i = 0; i < navLangs.length; i++) {
+            var tag = String(navLangs[i] || "").replace(/_/g, "-").toLowerCase();
+            if (langs.indexOf(tag) >= 0) {
+              lang = tag;
+              break;
+            }
+            var primary = tag.split("-")[0];
+            if (langs.indexOf(primary) >= 0) {
+              lang = primary;
+              break;
+            }
+          }
+        }
+        document.documentElement.lang = lang || "en";
+      })();
+    </script>
+    <link rel="stylesheet" href="css/styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main" data-i18n="nav.skip">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="#top">
+          <img src="assets/GlauxAI_Logo.png" alt="" width="40" height="40">
+          <span>
+            <strong>Glaux</strong>
+            <small data-i18n="header.subtitle">Local AI Workspace</small>
+          </span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav">
+          <span class="nav-toggle-bars" aria-hidden="true"></span>
+          <span data-i18n="nav.menu">Menu</span>
+        </button>
+        <nav id="site-nav" class="site-nav" data-i18n-aria="nav.pageAria" aria-label="Page">
+          <a href="#models" data-i18n="nav.models">Models</a>
+          <a href="#features" data-i18n="nav.features">Features</a>
+          <a href="#how-to" data-i18n="nav.howTo">How to use</a>
+          <a href="#download" data-i18n="nav.download">Download</a>
+          <div class="theme-switch" role="group" data-i18n-aria="header.themeAria" aria-label="UI theme">
+            <button type="button" data-theme-value="light" data-i18n="header.light">Light</button>
+            <button type="button" data-theme-value="dark" data-i18n="header.dark">Dark</button>
+          </div>
+          <label class="language-label">
+            <span class="visually-hidden" data-i18n="header.languageLabel">Language</span>
+            <select
+              id="language-select"
+              class="language-select"
+              data-i18n-aria="header.languageAria"
+              aria-label="UI language"
+            >
+              <option value="en">English</option>
+              <option value="de">Deutsch</option>
+              <option value="fr">Français</option>
+              <option value="es">Español</option>
+              <option value="it">Italiano</option>
+              <option value="pt">Português</option>
+            </select>
+          </label>
+        </nav>
+        <a
+          class="header-github"
+          href="https://github.com/Jannik0/Glaux/releases"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8"/>
+          </svg>
+          Download
+        </a>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top">
+        <div class="hero-glow" aria-hidden="true"></div>
+        <div class="shell hero-grid">
+          <div class="hero-copy" data-reveal>
+            <p class="eyebrow" data-i18n="hero.eyebrow">Free open-source AI assistant</p>
+            <h1 data-i18n="hero.title">Your AI workspace, on your computer</h1>
+            <p class="lede" data-i18n="hero.lede">
+              Chat, read files, and transcribe audio on your machine — nothing is sent to a cloud AI.
+            </p>
+            <p class="hero-claim" data-i18n="hero.claim">Runs any open-weights model in Safetensors or GGUF format.</p>
+            <div class="hero-actions">
+              <a class="btn btn-primary btn-lg" href="#download" data-i18n="hero.getGlaux">Get Glaux</a>
+              <a class="btn btn-ghost btn-lg" href="#how-to" data-i18n="hero.howTo">How to use</a>
+            </div>
+          </div>
+          <div class="hero-logo" data-reveal>
+            <img src="assets/GlauxAI_Logo.png" data-i18n-alt="hero.logoAlt" alt="Glaux owl logo">
+          </div>
+        </div>
+      </section>
+
+      <section class="models" id="models">
+        <div class="shell">
+          <header class="section-heading" data-reveal>
+            <p class="eyebrow" data-i18n="models.eyebrow">Open models</p>
+            <h2 data-i18n="models.title">Any open-weights model, ready to run</h2>
+            <p data-i18n-html="models.body">
+              Pick a model from Hugging Face, download it through Glaux, and start using it. If it is published as
+              <strong>Safetensors</strong> or <strong>GGUF</strong>, Glaux can serve it locally — chat, vision, and speech included.
+              No need to tinker around or set up extra software; Glaux manages everything for you.
+            </p>
+          </header>
+          <div class="format-grid">
+            <article class="format-card" data-reveal>
+              <span class="format-chip">Safetensors</span>
+              <h3 data-i18n="models.safetensorsTitle">Full open models</h3>
+              <p data-i18n="models.safetensorsBody">
+                The standard weights format on Hugging Face. Use it when you want the complete open-weights model
+                for chatting, looking at images, or transcribing speech.
+              </p>
+            </article>
+            <article class="format-card" data-reveal>
+              <span class="format-chip format-chip-gguf">GGUF</span>
+              <h3 data-i18n="models.ggufTitle">Compact open models</h3>
+              <p data-i18n="models.ggufBody">
+                Smaller packaged versions of the same open models. Choose a GGUF build when you want capable AI
+                that fits more comfortably on your machine.
+              </p>
+            </article>
+          </div>
+          <p class="models-note" data-reveal data-i18n="models.note">
+            Some Hub models are gated. Accept the license on the model page, then set a Hugging Face access token
+            in your environment before you open Glaux.
+          </p>
+        </div>
+      </section>
+
+      <section class="uses" id="uses">
+        <div class="shell">
+          <header class="section-heading" data-reveal>
+            <p class="eyebrow" data-i18n="uses.eyebrow">Use cases</p>
+            <h2 data-i18n="uses.title">Everyday work, kept private</h2>
+            <p data-i18n="uses.lead">Glaux is a workspace for people who want local AI for writing, files, and recordings — not a developer toolkit.</p>
+          </header>
+          <div class="use-layout" data-reveal>
+            <div class="use-tabs" role="tablist" data-i18n-aria="uses.tabsAria" aria-label="Ways to use Glaux">
+              <button type="button" role="tab" id="tab-chat" aria-selected="true" aria-controls="panel-chat" data-use="chat" data-i18n="uses.chatTab">Private chat and writing</button>
+              <button type="button" role="tab" id="tab-photos" aria-selected="false" aria-controls="panel-photos" data-use="photos" data-i18n="uses.photosTab">Photos and screenshots</button>
+              <button type="button" role="tab" id="tab-audio" aria-selected="false" aria-controls="panel-audio" data-use="audio" data-i18n="uses.audioTab">Meetings and voice memos</button>
+              <button type="button" role="tab" id="tab-pdfs" aria-selected="false" aria-controls="panel-pdfs" data-use="pdfs" data-i18n="uses.pdfsTab">Answers from PDFs</button>
+              <button type="button" role="tab" id="tab-projects" aria-selected="false" aria-controls="panel-projects" data-use="projects" data-i18n="uses.projectsTab">Separate projects</button>
+            </div>
+            <div class="use-panels">
+              <article class="use-panel is-active" role="tabpanel" id="panel-chat" aria-labelledby="tab-chat">
+                <h3 data-i18n="uses.chatTitle">Chat without uploading your notes</h3>
+                <p data-i18n="uses.chatBody">
+                  Draft emails, outline ideas, and talk through a problem the way you would with a cloud assistant —
+                  except the conversation stays on your computer. Sessions are saved in your workspace so you can pick up later.
+                </p>
+              </article>
+              <article class="use-panel" role="tabpanel" id="panel-photos" aria-labelledby="tab-photos" hidden>
+                <h3 data-i18n="uses.photosTitle">Ask about what is in an image</h3>
+                <p data-i18n="uses.photosBody">
+                  Drop a photo or screenshot into the chat when the model supports images. Describe a scene, extract
+                  text from a picture, or ask what is happening — useful for receipts, whiteboards, and everyday snapshots.
+                </p>
+              </article>
+              <article class="use-panel" role="tabpanel" id="panel-audio" aria-labelledby="tab-audio" hidden>
+                <h3 data-i18n="uses.audioTitle">Turn speech into text</h3>
+                <p data-i18n="uses.audioBody">
+                  Attach a voice memo, meeting recording, or video. Glaux can transcribe the audio on your machine
+                  so you get a written record without sending the file to a transcription service.
+                </p>
+              </article>
+              <article class="use-panel" role="tabpanel" id="panel-pdfs" aria-labelledby="tab-pdfs" hidden>
+                <h3 data-i18n="uses.pdfsTitle">Read documents, then ask questions</h3>
+                <p data-i18n="uses.pdfsBody">
+                  PDFs are turned into readable text automatically. Drop in an invoice, form, or report and ask for
+                  totals, names, or a short summary — the file never leaves your workspace.
+                </p>
+              </article>
+              <article class="use-panel" role="tabpanel" id="panel-projects" aria-labelledby="tab-projects" hidden>
+                <h3 data-i18n="uses.projectsTitle">Keep work in its own workspace</h3>
+                <p data-i18n="uses.projectsBody">
+                  Each workspace has its own chats, resource library, and outputs. Switch workspaces when you change
+                  projects so files and conversations do not mix.
+                </p>
+              </article>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="preview" id="preview" data-i18n-aria="preview.sectionAria" aria-label="Glaux workspace">
+        <div class="shell">
+          <figure class="product-frame" data-reveal>
+            <button class="product-frame-shot" type="button" data-lightbox-open data-i18n-aria="preview.enlargeAria" aria-label="View a larger screenshot of the Glaux workspace">
+              <img class="shot-dark" src="assets/screenshot01_dark.png" data-i18n-alt="preview.shotAlt" alt="Glaux workspace with models, sessions, resources, chat, and outputs">
+              <img class="shot-light" src="assets/screenshot01_light.png" data-i18n-alt="preview.shotAlt" alt="Glaux workspace with models, sessions, resources, chat, and outputs">
+            </button>
+            <figcaption data-i18n="preview.caption">The Glaux workspace — click to enlarge</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="features" id="features">
+        <div class="shell">
+          <header class="section-heading" data-reveal>
+            <p class="eyebrow" data-i18n="features.eyebrow">Features</p>
+            <h2 data-i18n="features.title">A full workspace, not just a chat box</h2>
+            <p data-i18n="features.lead">Everything you need to download a model, talk to it, and keep the files that come out of that work.</p>
+          </header>
+          <div class="feature-grid">
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.localChatTitle">Local chat</h3>
+              <p data-i18n="features.localChatBody">Conversations run on your computer. Nothing is sent to a cloud AI for inference.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.openModelsTitle">Any open-weights model</h3>
+              <p data-i18n="features.openModelsBody">Download and run Safetensors or GGUF models from Hugging Face directly through Glaux.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.filesTitle">Images, audio, video, PDFs</h3>
+              <p data-i18n="features.filesBody">Attach files in chat when the selected model can use them. Simply drag and drop them into your message.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.pdfTitle">PDFs become readable text</h3>
+              <p data-i18n="features.pdfBody">Documents are parsed automatically so you can search, quote, and ask questions about them.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.transcriptionTitle">Transcription</h3>
+              <p data-i18n="features.transcriptionBody">Turn recordings and video soundtracks into text with a speech model from the Hub.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.switchTitle">Switch models mid-chat</h3>
+              <p data-i18n="features.switchBody">Change models during a session in order to mix and match capabilities as you need them and keep the conversation.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.workspacesTitle">Workspaces</h3>
+              <p data-i18n="features.workspacesBody">Separate projects, each with its own resource library, sessions, and outputs.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.sessionsTitle">Saved sessions</h3>
+              <p data-i18n="features.sessionsBody">Chats persist on disk. Search them, reopen them, and export or delete individual messages.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.resourcesTitle">Resource library</h3>
+              <p data-i18n="features.resourcesBody">Keep the files a project needs in one place, with drag-and-drop and a built-in markdown editor.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.outputsTitle">Outputs browser</h3>
+              <p data-i18n="features.outputsBody">Find generated and exported files next to the chat, ready to open or copy back into your resource library.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.themeTitle">Light and dark</h3>
+              <p data-i18n="features.themeBody">Follows your system by default. Switch to light or dark any time from the theme selector in the header.</p>
+            </article>
+            <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.platformsTitle">Windows, macOS, and Linux</h3>
+              <p data-i18n="features.platformsBody">One desktop app per platform. GPU is used automatically when your machine has one.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="how" id="how-to">
+        <div class="shell">
+          <header class="section-heading" data-reveal>
+            <p class="eyebrow" data-i18n="how.eyebrow">How to use</p>
+            <h2 data-i18n="how.title">From install to first conversation</h2>
+            <p data-i18n="how.lead">You do not need any prior experience running AI models. Simply follow these steps in the app to get started.</p>
+          </header>
+          <ol class="steps" data-reveal>
+            <li class="step is-open">
+              <button type="button" class="step-trigger" aria-expanded="true">
+                <span class="step-num">1</span>
+                <span class="step-title" data-i18n="how.s1Title">Install and open Glaux</span>
+              </button>
+              <div class="step-body">
+                <p data-i18n="how.s1Body">
+                  Download the installer for your system, run it, and launch Glaux from the Start menu, Applications,
+                  or your desktop shortcut. No extra runtimes to install.
+                </p>
+              </div>
+            </li>
+            <li class="step">
+              <button type="button" class="step-trigger" aria-expanded="false">
+                <span class="step-num">2</span>
+                <span class="step-title" data-i18n="how.s2Title">Pick or create a workspace</span>
+              </button>
+              <div class="step-body">
+                <p data-i18n="how.s2Body">
+                  The header shows the active workspace. Stay on Default, or create a new one for a project.
+                  Each workspace keeps its own chats and files.
+                </p>
+              </div>
+            </li>
+            <li class="step">
+              <button type="button" class="step-trigger" aria-expanded="false">
+                <span class="step-num">3</span>
+                <span class="step-title" data-i18n="how.s3Title">Download an open-weights model</span>
+              </button>
+              <div class="step-body">
+                <p data-i18n-html="how.s3Body">
+                  In the Models panel, paste a Hugging Face model id such as <code>org/model-name</code> and choose Add.
+                  Glaux fetches any open-weights Safetensors or GGUF model you pick. For GGUF you can choose a smaller
+                  or larger variant before the download starts.
+                </p>
+              </div>
+            </li>
+            <li class="step">
+              <button type="button" class="step-trigger" aria-expanded="false">
+                <span class="step-num">4</span>
+                <span class="step-title" data-i18n="how.s4Title">Select it and start chatting</span>
+              </button>
+              <div class="step-body">
+                <p data-i18n="how.s4Body">
+                  Click the downloaded model to load it. Type in the input field at the bottom of the chat window and send.
+                  A context meter shows how much of the model’s memory the conversation is using.
+                </p>
+              </div>
+            </li>
+            <li class="step">
+              <button type="button" class="step-trigger" aria-expanded="false">
+                <span class="step-num">5</span>
+                <span class="step-title" data-i18n="how.s5Title">Drop in files when you need them</span>
+              </button>
+              <div class="step-body">
+                <p data-i18n="how.s5Body">
+                  Drag images, audio, video, or PDFs into the your message in order to pass them to the model.
+                  Use a vision model for pictures, a speech model for recordings, or attach a PDF to ask about the document.
+                </p>
+              </div>
+            </li>
+            <li class="step">
+              <button type="button" class="step-trigger" aria-expanded="false">
+                <span class="step-num">6</span>
+                <span class="step-title" data-i18n="how.s6Title">Find chats, files, and outputs</span>
+              </button>
+              <div class="step-body">
+                <p data-i18n="how.s6Body">
+                  Sessions holds past conversations. Resources is your project library. Outputs collects files you
+                  export or generate. Everything is saved under your user profile on your computer.
+                </p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="privacy" id="privacy">
+        <div class="shell privacy-card" data-reveal>
+          <p class="eyebrow" data-i18n="privacy.eyebrow">On your machine</p>
+          <h2 data-i18n="privacy.title">Chats, files, and models stay with you at all times</h2>
+          <p data-i18n="privacy.body">
+            Glaux runs models on your computer. Sessions, resources, and outputs live in your user profile.
+            Model files are stored on disk after you download them — they are not uploaded for someone else to host.
+            If your machine has a compatible GPU, Glaux uses it automatically; otherwise it falls back to the CPU.
+          </p>
+        </div>
+      </section>
+
+      <section class="download" id="download">
+        <div class="shell download-card" data-reveal>
+          <p class="eyebrow" data-i18n="download.eyebrow">Get Glaux</p>
+          <h2 data-i18n="download.title">Install the desktop app</h2>
+          <p class="download-lead" data-i18n="download.lead">
+            The current public installer is for Windows. Models are downloaded after you install — they are not inside the setup file.
+            A GPU driver helps when you want faster responses, but it is not required.
+          </p>
+          <div class="download-actions">
+            <a
+              class="btn btn-primary btn-lg"
+              id="download-primary"
+              href="https://github.com/Jannik0/Glaux/releases/download/v1.1.1/Glaux-Setup-1.1.1.exe"
+              data-i18n="download.ctaWindows"
+            >
+              Download for Windows
+            </a>
+            <a class="btn btn-ghost btn-lg" href="https://github.com/Jannik0/Glaux/releases" id="download-all" data-i18n="download.allReleases">
+              All releases
+            </a>
+          </div>
+          <p class="download-note" id="download-note" data-i18n="download.noteWindows">
+            Windows 10 or 11. Run the setup, choose a folder if you like, then open Glaux from the Start menu.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <a class="brand brand-footer" href="#top">
+          <img src="assets/GlauxAI_Logo.png" alt="" width="32" height="32">
+          <span>Glaux</span>
+        </a>
+        <p>MIT License · © 2026 Jannik Lehmkuhl</p>
+        <a href="https://github.com/Jannik0/Glaux">GitHub</a>
+      </div>
+    </footer>
+
+    <dialog class="lightbox" id="lightbox" data-i18n-aria="preview.lightboxAria" aria-label="Workspace screenshot">
+      <form method="dialog">
+        <button class="lightbox-close" type="submit" data-i18n="preview.close" data-i18n-aria="preview.closeAria" aria-label="Close screenshot">Close</button>
+      </form>
+      <img class="shot-dark" src="assets/screenshot01_dark.png" data-i18n-alt="preview.lightboxAlt" alt="Glaux workspace with a local chat session">
+      <img class="shot-light" src="assets/screenshot01_light.png" data-i18n-alt="preview.lightboxAlt" alt="Glaux workspace with a local chat session">
+    </dialog>
+
+    <script src="js/main.js"></script>
+  </body>
+</html>
