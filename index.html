@@ -390,25 +390,60 @@
           <p class="eyebrow" data-i18n="download.eyebrow">Get Glaux</p>
           <h2 data-i18n="download.title">Install the desktop app</h2>
           <p class="download-lead" data-i18n="download.lead">
-            The current public installer is for Windows. Models are downloaded after you install — they are not inside the setup file.
+            Glaux 1.2.0 is available for Windows and Linux. Models are downloaded after you install — they are not inside the installer.
             A GPU driver helps when you want faster responses, but it is not required.
           </p>
+          <ul class="download-builds">
+            <li data-platform="windows">
+              <a
+                class="btn btn-primary btn-lg"
+                id="download-windows"
+                href="https://github.com/Jannik0/Glaux/releases/download/v1.2.0/Glaux-Setup-1.2.0.exe"
+                data-i18n="download.ctaWindows"
+              >
+                Download for Windows
+              </a>
+              <p data-i18n-html="download.noteWindows">
+                Windows 10 or 11, x64. Run the setup, choose a folder if you like, then open Glaux from the Start menu.
+              </p>
+            </li>
+            <li data-platform="linux">
+              <a
+                class="btn btn-ghost btn-lg"
+                id="download-deb"
+                href="https://github.com/Jannik0/Glaux/releases/download/v1.2.0/Glaux_1.2.0_amd64.deb"
+                data-i18n="download.ctaDeb"
+              >
+                Download for Debian and Ubuntu
+              </a>
+              <p data-i18n-html="download.noteDeb">
+                Debian and Ubuntu, x64. Debian is the tested Linux platform. Install with
+                <code>sudo apt install ./Glaux_1.2.0_amd64.deb</code>
+              </p>
+            </li>
+            <li data-platform="linux">
+              <a
+                class="btn btn-ghost btn-lg"
+                id="download-rpm"
+                href="https://github.com/Jannik0/Glaux/releases/download/v1.2.0/Glaux-1.2.0.x86_64.rpm"
+                data-i18n="download.ctaRpm"
+              >
+                Download for Fedora, RHEL, and openSUSE
+              </a>
+              <p data-i18n-html="download.noteRpm">
+                Fedora, RHEL, openSUSE, and other RPM distributions, x64. Install with
+                <code>sudo dnf install ./Glaux-1.2.0.x86_64.rpm</code>
+              </p>
+            </li>
+          </ul>
+          <p class="download-note" id="download-note" data-i18n="download.noteMac">
+            macOS packaging is supported, but those builds still need validation and are not published yet.
+          </p>
           <div class="download-actions">
-            <a
-              class="btn btn-primary btn-lg"
-              id="download-primary"
-              href="https://github.com/Jannik0/Glaux/releases/download/v1.1.1/Glaux-Setup-1.1.1.exe"
-              data-i18n="download.ctaWindows"
-            >
-              Download for Windows
-            </a>
-            <a class="btn btn-ghost btn-lg" href="https://github.com/Jannik0/Glaux/releases" id="download-all" data-i18n="download.allReleases">
+            <a class="btn btn-ghost" href="https://github.com/Jannik0/Glaux/releases" id="download-all" data-i18n="download.allReleases">
               All releases
             </a>
           </div>
-          <p class="download-note" id="download-note" data-i18n="download.noteWindows">
-            Windows 10 or 11. Run the setup, choose a folder if you like, then open Glaux from the Start menu.
-          </p>
         </div>
       </section>
     </main>

@@ -7,11 +7,13 @@
   const navToggle = document.querySelector(".nav-toggle");
   const languageSelect = document.getElementById("language-select");
   const lightbox = document.getElementById("lightbox");
-  const downloadPrimary = document.getElementById("download-primary");
-  const downloadNote = document.getElementById("download-note");
-  const WINDOWS_SETUP =
-    "https://github.com/Jannik0/Glaux/releases/download/v1.1.1/Glaux-Setup-1.1.1.exe";
-  const RELEASES = "https://github.com/Jannik0/Glaux/releases";
+  const RELEASE_VERSION = "1.2.0";
+  const RELEASE_BASE = `https://github.com/Jannik0/Glaux/releases/download/v${RELEASE_VERSION}`;
+  const BUILDS = {
+    windows: `${RELEASE_BASE}/Glaux-Setup-${RELEASE_VERSION}.exe`,
+    deb: `${RELEASE_BASE}/Glaux_${RELEASE_VERSION}_amd64.deb`,
+    rpm: `${RELEASE_BASE}/Glaux-${RELEASE_VERSION}.x86_64.rpm`,
+  };
   const catalogs = Object.create(null);
   let catalog = null;
 
@@ -78,20 +80,31 @@
   }
 
   function applyDownloadCopy() {
-    if (!downloadPrimary || !downloadNote) return;
-    if (isWindows) {
-      downloadPrimary.href = WINDOWS_SETUP;
-      downloadPrimary.textContent = lookup("download.ctaWindows") || downloadPrimary.textContent;
-      downloadNote.textContent = lookup("download.noteWindows") || downloadNote.textContent;
-    } else if (isMac) {
-      downloadPrimary.href = RELEASES;
-      downloadPrimary.textContent = lookup("download.ctaOther") || downloadPrimary.textContent;
-      downloadNote.textContent = lookup("download.noteMac") || downloadNote.textContent;
-    } else if (isLinux) {
-      downloadPrimary.href = RELEASES;
-      downloadPrimary.textContent = lookup("download.ctaOther") || downloadPrimary.textContent;
-      downloadNote.textContent = lookup("download.noteLinux") || downloadNote.textContent;
+    const windows = document.getElementById("download-windows");
+    const deb = document.getElementById("download-deb");
+    const rpm = document.getElementById("download-rpm");
+    if (windows) windows.href = BUILDS.windows;
+    if (deb) deb.href = BUILDS.deb;
+    if (rpm) rpm.href = BUILDS.rpm;
+
+    [windows, deb, rpm].filter(Boolean).forEach((button) => {
+      button.classList.remove("btn-primary");
+      button.classList.add("btn-ghost");
+    });
+
+    const matched = isLinux ? deb : isMac ? null : windows;
+    if (matched) {
+      matched.classList.add("btn-primary");
+      matched.classList.remove("btn-ghost");
     }
+
+    if (!isLinux) return;
+    const list = document.querySelector(".download-builds");
+    const debItem = deb?.closest("li");
+    const rpmItem = rpm?.closest("li");
+    if (!list || !debItem || !rpmItem) return;
+    list.prepend(rpmItem);
+    list.prepend(debItem);
   }
 
   function applyI18n() {

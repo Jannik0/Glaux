@@ -124,12 +124,14 @@
   "download": {
     "eyebrow": "Ottieni Glaux",
     "title": "Installa l’app desktop",
-    "lead": "Il programma di installazione pubblico attuale è per Windows. I modelli si scaricano dopo l’installazione — non sono nel file di setup. Un driver GPU aiuta per risposte più veloci, ma non è obbligatorio.",
+    "lead": "Glaux 1.2.0 è disponibile per Windows e Linux. I modelli si scaricano dopo l’installazione — non sono nel programma di installazione. Un driver GPU aiuta per risposte più veloci, ma non è obbligatorio.",
     "ctaWindows": "Scarica per Windows",
-    "ctaOther": "Vedi GitHub Releases",
+    "ctaDeb": "Scarica per Debian e Ubuntu",
+    "ctaRpm": "Scarica per Fedora, RHEL e openSUSE",
     "allReleases": "Tutte le versioni",
-    "noteWindows": "Windows 10 o 11. Esegui il setup, scegli una cartella se vuoi, poi apri Glaux dal menu Start.",
-    "noteMac": "Il packaging per macOS è supportato, ma l’installer pubblicato ora è per Windows. Controlla Releases per build più recenti.",
-    "noteLinux": "Il packaging per Linux è supportato, ma l’installer pubblicato ora è per Windows. Controlla Releases per build più recenti."
+    "noteWindows": "Windows 10 o 11, x64. Esegui il setup, scegli una cartella se vuoi, poi apri Glaux dal menu Start.",
+    "noteDeb": "Debian e Ubuntu, x64. Debian è la piattaforma Linux testata. Installa con <code>sudo apt install ./Glaux_1.2.0_amd64.deb</code>",
+    "noteRpm": "Fedora, RHEL, openSUSE e le altre distribuzioni RPM, x64. Installa con <code>sudo dnf install ./Glaux-1.2.0.x86_64.rpm</code>",
+    "noteMac": "Il packaging per macOS è supportato, ma queste build devono ancora essere validate e non sono ancora pubblicate."
   }
 }
