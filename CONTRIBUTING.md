@@ -17,6 +17,7 @@ This file is about how to work on Glaux. Full product setup, GPU notes, and pack
 
 These are on the roadmap. Please open an issue before starting a large implementation so the approach can be aligned:
 
+- **Image generation** — generate images on the user’s machine from a prompt, using an on-device model.
 - **Cross-session memory** — persist useful context across chats and sessions, not only within one conversation.
 - **Web research** — let the model look up current information on the web when the user asks for it.
 - **Tool usage** — let the model call tools (files, commands, and similar) as part of a turn.
