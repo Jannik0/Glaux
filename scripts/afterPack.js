@@ -4,7 +4,7 @@
  * afterPack (invoked by `npm run dist`): Chromium locale filter, then restore
  * ELF SONAME links, the shared ggml CUDA backend, and shared CUDA 13 overlap
  * that electron-builder may have copied as full files. All size cuts already
- * ran in build:python / ffmpeg / llamacpp / transcribe — this hook does not
+ * ran in build:python / ffmpeg / llamacpp / transcribe / stablediffusion — this hook does not
  * prune a second policy.
  */
 
@@ -42,7 +42,7 @@ module.exports = async function afterPack(context) {
     return;
   }
 
-  for (const name of ['cuda', 'ffmpeg', 'llamacpp', 'transcribe']) {
+  for (const name of ['cuda', 'ffmpeg', 'llamacpp', 'transcribe', 'stablediffusion']) {
     finishStagedNativeDir(path.join(resources, name), { strip: false });
   }
   if (context.electronPlatformName !== 'darwin') {

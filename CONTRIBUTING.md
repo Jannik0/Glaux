@@ -7,7 +7,7 @@ This file is about how to work on Glaux. Full product setup, GPU notes, and pack
 
 ## Ways to help
 
-- Test Hub models and real workflows; note OS, GPU, engine (safetensors / llama.cpp / transcribe.cpp), and model id.
+- Test Hub models and real workflows; note OS, GPU, engine (safetensors / llama.cpp / transcribe.cpp / stable-diffusion.cpp), and model id.
 - Reproduce and fix bugs. Include steps, OS, whether you used `npm start` or a packaged build, and any relevant logs.
 - Improve docs, translations, or accessibility.
 - Add features that stay local: Glaux is an on-device workspace, not a cloud API client.
@@ -17,7 +17,6 @@ This file is about how to work on Glaux. Full product setup, GPU notes, and pack
 
 These are on the roadmap. Please open an issue before starting a large implementation so the approach can be aligned:
 
-- **Image generation** — generate images on the user’s machine from a prompt, using an on-device model.
 - **Cross-session memory** — persist useful context across chats and sessions, not only within one conversation.
 - **Web research** — let the model look up current information on the web when the user asks for it.
 - **Tool usage** — let the model call tools (files, commands, and similar) as part of a turn.

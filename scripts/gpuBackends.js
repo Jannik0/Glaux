@@ -790,12 +790,12 @@ function resolveBuildBackends(opts = {}) {
 }
 
 /**
- * @param {'ggml' | 'transcribe'} kind
+ * @param {'ggml' | 'transcribe' | 'sd'} kind
  * @param {{ cuda: boolean, vulkan: boolean, metal: boolean }} backends
  * @returns {string[]}
  */
 function cmakeGpuArgs(kind, backends) {
-  const prefix = kind === 'transcribe' ? 'TRANSCRIBE' : 'GGML';
+  const prefix = kind === 'transcribe' ? 'TRANSCRIBE' : kind === 'sd' ? 'SD' : 'GGML';
   const onOff = (on) => (on ? 'ON' : 'OFF');
   return [
     `-D${prefix}_CUDA=${onOff(backends.cuda)}`,
@@ -921,7 +921,7 @@ function cudaBuildJobs(requestedJobs, backends) {
   return Math.min(n, 4);
 }
 
-const STAGED_LIB_NAME_RE = /^(lib)?(ggml|llama|mtmd|transcribe)/i;
+const STAGED_LIB_NAME_RE = /^(lib)?(ggml|llama|mtmd|transcribe|stable-diffusion)/i;
 
 /**
  * @param {string} buildDir
@@ -961,7 +961,7 @@ function stageLibsFromDir(fromDir, outDir) {
 }
 
 /**
- * Walk the build tree for ggml/llama/transcribe shared modules that did not
+ * Walk the build tree for ggml/llama/transcribe/stable-diffusion shared modules that did not
  * land next to the binary.
  * @param {string} dir
  * @param {string} outDir
