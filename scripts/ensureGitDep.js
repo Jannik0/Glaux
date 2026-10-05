@@ -3,6 +3,8 @@
 /**
  * Clone a git repo into dest at a pinned revision when dest is missing.
  * Existing checkouts are left untouched so local work is not overwritten.
+ * An empty directory is not a checkout: git leaves one for an unpopulated
+ * submodule gitlink, and that placeholder must still be filled in.
  */
 
 const { spawnSync } = require('child_process');
@@ -28,8 +30,16 @@ function runGit(args, options = {}) {
 /**
  * @param {{ dest: string, url: string, rev: string, name: string }} opts
  */
+function isEmptyDirectory(dest) {
+  try {
+    return fs.statSync(dest).isDirectory() && fs.readdirSync(dest).length === 0;
+  } catch {
+    return false;
+  }
+}
+
 function ensureGitDep({ dest, url, rev, name }) {
-  if (fs.existsSync(dest)) {
+  if (fs.existsSync(dest) && !isEmptyDirectory(dest)) {
     console.log(`Using existing ${name} at ${dest}`);
     return;
   }
