@@ -337,17 +337,23 @@ function contextMessageToDisplayText(msg) {
  * @returns {Array<{ source: string, relativePath: string, name: string }>}
  */
 function contextMessageToDisplayFiles(msg) {
-  if (!msg || typeof msg !== 'object' || /** @type {{ role?: string }} */ (msg).role !== 'user') {
+  if (!msg || typeof msg !== 'object') {
+    return [];
+  }
+  const role = /** @type {{ role?: string }} */ (msg).role;
+  if (role !== 'user' && role !== 'assistant') {
     return [];
   }
   const content = /** @type {{ content?: unknown }} */ (msg).content;
   const files = [];
   if (Array.isArray(content)) {
-    const raw = content
-      .filter((part) => part && typeof part === 'object' && part.type === 'text')
-      .map((part) => String(part.text || ''))
-      .join('\n');
-    files.push(...parseContextDocumentBlocks(raw).files);
+    if (role === 'user') {
+      const raw = content
+        .filter((part) => part && typeof part === 'object' && part.type === 'text')
+        .map((part) => String(part.text || ''))
+        .join('\n');
+      files.push(...parseContextDocumentBlocks(raw).files);
+    }
     for (const part of content) {
       if (!part || typeof part !== 'object') {
         continue;
@@ -358,8 +364,14 @@ function contextMessageToDisplayFiles(msg) {
       if (!CONTEXT_MEDIA_PART_TYPES.has(typed.type)) {
         continue;
       }
+      if (role === 'assistant' && typed.type !== 'image') {
+        continue;
+      }
       if (typeof typed.source === 'string' && typeof typed.relativePath === 'string' && typed.relativePath) {
-        const source = typed.source === 'outputs' ? 'outputs' : 'resources';
+        const source =
+          typed.source === 'outputs' || typed.source === 'sessions' || typed.source === 'resources'
+            ? typed.source
+            : 'resources';
         files.push({
           source,
           relativePath: typed.relativePath,
@@ -397,7 +409,7 @@ function rebuildChatFromContext(messages) {
       continue;
     }
     const text = contextMessageToDisplayText(msg);
-    const files = role === 'user' ? contextMessageToDisplayFiles(msg) : [];
+    const files = contextMessageToDisplayFiles(msg);
     appendMessage(role, text, files);
   }
 }
@@ -587,6 +599,46 @@ function createAssistantMessageStructure() {
 }
 
 /**
+ * Attachment chips. Session-sourced images open the existing media viewer.
+ * Other chips stay non-interactive, matching user attachments.
+ *
+ * @param {HTMLElement} parent
+ * @param {Array<{ source?: string, relativePath?: string, name: string }>} files
+ */
+function appendAttachmentChips(parent, files) {
+  if (!parent || !files || !files.length) {
+    return;
+  }
+  const attachmentsEl = document.createElement('div');
+  attachmentsEl.className = 'message-attachments';
+  for (const file of files) {
+    const chip = document.createElement('span');
+    chip.className = 'message-attachment-chip';
+    if (file.source === 'sessions' && file.relativePath) {
+      chip.classList.add('is-openable');
+      chip.addEventListener('click', () => {
+        const openViewer = window.api && window.api.media && window.api.media.openViewer;
+        if (typeof openViewer !== 'function') {
+          return;
+        }
+        Promise.resolve(openViewer('sessions', file.relativePath)).catch((err) => {
+          setLoadingStatusMessage((err && err.message) || String(err));
+        });
+      });
+    }
+    const iconEl = document.createElement('span');
+    iconEl.className = 'tree-icon';
+    iconEl.textContent = window.Glaux.MediaKinds.getFileIcon(file.name);
+    const nameEl = document.createElement('span');
+    nameEl.className = 'message-attachment-name';
+    nameEl.textContent = file.name;
+    chip.append(iconEl, nameEl);
+    attachmentsEl.appendChild(chip);
+  }
+  parent.appendChild(attachmentsEl);
+}
+
+/**
  * @param {string} role
  * @param {string} text
  * @param {Array<{ source: string, relativePath: string, name: string }>} [files]
@@ -600,6 +652,7 @@ function appendMessage(role, text, files = []) {
       details.style.display = '';
       renderFormattedMessage(thoughtsContent, thinking);
       renderFormattedMessage(answerContent, answer);
+      appendAttachmentChips(container, files);
       messagesEl.appendChild(container);
       scrollMessagesToBottom();
       return container;
@@ -611,22 +664,8 @@ function appendMessage(role, text, files = []) {
   bodyEl.className = 'message-body';
   renderFormattedMessage(bodyEl, text);
   div.appendChild(bodyEl);
-  if (role === 'user' && files.length > 0) {
-    const attachmentsEl = document.createElement('div');
-    attachmentsEl.className = 'message-attachments';
-    for (const file of files) {
-      const chip = document.createElement('span');
-      chip.className = 'message-attachment-chip';
-      const iconEl = document.createElement('span');
-      iconEl.className = 'tree-icon';
-      iconEl.textContent = window.Glaux.MediaKinds.getFileIcon(file.name);
-      const nameEl = document.createElement('span');
-      nameEl.className = 'message-attachment-name';
-      nameEl.textContent = file.name;
-      chip.append(iconEl, nameEl);
-      attachmentsEl.appendChild(chip);
-    }
-    div.appendChild(attachmentsEl);
+  if (files.length > 0) {
+    appendAttachmentChips(div, files);
   }
   messagesEl.appendChild(div);
   scrollMessagesToBottom();
@@ -960,6 +999,10 @@ formEl.addEventListener('submit', async (event) => {
       enableThinking,
       resubmit,
       files,
+      onImages: (images) => {
+        appendAttachmentChips(container, images);
+        scrollMessagesToBottomAfterRender();
+      },
       onStarted: (meta) => {
         streamStartsInThinking = Boolean(meta && meta.startsInThinking);
         ensureStreamParser();

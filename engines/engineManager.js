@@ -1,8 +1,9 @@
 /**
  * Inference facade. The rest of the app talks to engineManager only.
  * Routes by weight format and pipeline_tag:
- *   safetensors/pytorch → huggingface
+ *   safetensors/pytorch → huggingface (including diffusers text-to-image)
  *   GGUF + ASR          → transcribecpp
+ *   GGUF + text-to-image → stablediffusion
  *   GGUF (chat/other)   → llamacpp
  * Hub downloads always use the huggingface downloader stack.
  */
@@ -12,6 +13,7 @@ const path = require('path');
 const hfEngine = require('./huggingface/engine');
 const llamaEngine = require('./llamacpp/engine');
 const transcribeEngine = require('./transcribecpp/engine');
+const stableDiffusionEngine = require('./stablediffusion/engine');
 const contextManager = require('./contextManager');
 const { detectModelFormat } = require('./common/modelFormat');
 const { stripThinkingFromMessages } = require('./common/stripThinking');
@@ -26,9 +28,10 @@ const {
 const { extractPdfToMarkdown } = require('./common/extractPdf');
 const { extractVideoToWav } = require('./common/extractVideo');
 const { readModelPipelineTag: readPipelineTagFromCache } = require('./common/pipelineTag');
-const { ASR_PIPELINE_TAG, resolveEngineId } = require('./common/resolveEngineId');
+const { ASR_PIPELINE_TAG, TEXT_TO_IMAGE_PIPELINE_TAG, resolveEngineId } = require('./common/resolveEngineId');
+const { assertTextToImagePrompt } = require('./common/textToImage');
 
-/** @type {{ resourcesRoot?: string, outputsRoot?: string, modelsCacheDir?: string, modelId?: string, onProgress?: (info: object) => void } | null} */
+/** @type {{ resourcesRoot?: string, outputsRoot?: string, sessionsRoot?: string, modelsCacheDir?: string, modelId?: string, onProgress?: (info: object) => void } | null} */
 let initOptions = null;
 
 /** @type {string | null} */
@@ -37,7 +40,7 @@ let activeModelId = null;
 /** @type {string | null} */
 let activePipelineTag = null;
 
-/** @type {'huggingface' | 'llamacpp' | 'transcribecpp' | null} */
+/** @type {'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusion' | null} */
 let activeEngineId = null;
 
 /** @type {'idle' | 'loading' | 'generating' | 'downloading'} */
@@ -52,6 +55,7 @@ const engines = {
   huggingface: hfEngine,
   llamacpp: llamaEngine,
   transcribecpp: transcribeEngine,
+  stablediffusion: stableDiffusionEngine,
 };
 
 function getActiveEngine() {
@@ -89,6 +93,7 @@ async function ensureEnginePaths(opts) {
   };
   await llamaEngine.configure(mediaOpts);
   await transcribeEngine.configure(mediaOpts);
+  await stableDiffusionEngine.configure(mediaOpts);
   return dir;
 }
 
@@ -117,7 +122,7 @@ async function readModelPipelineTag(modelId) {
 
 /**
  * @param {string} modelId
- * @returns {Promise<'huggingface' | 'llamacpp' | 'transcribecpp'>}
+ * @returns {Promise<'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusion'>}
  */
 async function resolveEngineForModel(modelId) {
   const dir = initOptions && initOptions.modelsCacheDir;
@@ -326,10 +331,78 @@ async function configurePaths(opts) {
   initOptions = {
     resourcesRoot: opts.resourcesRoot,
     outputsRoot: opts.outputsRoot,
+    sessionsRoot: opts.sessionsRoot,
     modelsCacheDir: opts.modelsCacheDir,
     onProgress: opts.onProgress,
   };
   await ensureEnginePaths(opts);
+}
+
+/**
+ * Drop a generated file when it lives inside the sessions directory.
+ * Outputs copies are never passed here.
+ *
+ * @param {string | undefined} outputPath
+ */
+async function discardGeneratedOutput(outputPath) {
+  const sessionsRoot = initOptions && initOptions.sessionsRoot;
+  if (typeof outputPath !== 'string' || !outputPath || !sessionsRoot) {
+    return;
+  }
+  const root = path.resolve(sessionsRoot);
+  const file = path.resolve(outputPath);
+  const rel = path.relative(root, file);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return;
+  }
+  try {
+    const stats = await fs.stat(file);
+    if (stats.isFile()) {
+      await fs.unlink(file);
+    }
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * @param {string[]} imagePaths
+ * @param {string} text
+ */
+function imageResultFromPaths(imagePaths, text) {
+  const sessionsRoot = initOptions && initOptions.sessionsRoot;
+  const imageParts = [];
+  const images = [];
+  for (const raw of imagePaths) {
+    if (typeof raw !== 'string' || !raw) {
+      continue;
+    }
+    const abs = path.resolve(raw);
+    let relativePath = path.basename(abs);
+    if (sessionsRoot) {
+      const rel = path.relative(path.resolve(sessionsRoot), abs);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+        relativePath = rel.split(path.sep).join('/');
+      }
+    }
+    imageParts.push({
+      type: 'image',
+      path: abs,
+      relativePath,
+      source: 'sessions',
+    });
+    images.push({
+      source: 'sessions',
+      relativePath,
+      name: path.basename(relativePath),
+    });
+  }
+  return {
+    text: typeof text === 'string' ? text : '',
+    imagePaths: imageParts.map((part) => part.path),
+    images,
+    imageParts,
+  };
 }
 
 /**
@@ -544,6 +617,64 @@ async function sendPrompt(message, options = {}) {
     throw new Error('Engine is busy.');
   }
 
+  if (activePipelineTag === TEXT_TO_IMAGE_PIPELINE_TAG) {
+    const prompt = assertTextToImagePrompt(message, options.files);
+    if (typeof options.outputPath !== 'string' || !options.outputPath.trim()) {
+      throw new Error('Text-to-image output path is not configured.');
+    }
+    const outputPath = options.outputPath;
+    cancelRequested = false;
+    contextManager.appendUser(prompt);
+    generationInFlight = true;
+    phase = 'generating';
+    try {
+      const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
+        onToken: options.onToken,
+        onReplace: options.onReplace,
+        messages: [],
+        outputPath,
+        imagePaths: [],
+        audioPaths: [],
+        videoPaths: [],
+      });
+      if (cancelRequested) {
+        await discardGeneratedOutput(outputPath);
+        const stopped = withStopMarker('');
+        contextManager.appendAssistant(stopped);
+        return stopped;
+      }
+      const rawPaths =
+        response && typeof response === 'object' && Array.isArray(response.imagePaths)
+          ? response.imagePaths
+          : [];
+      const text =
+        response && typeof response === 'object' && typeof response.text === 'string'
+          ? response.text
+          : typeof response === 'string'
+            ? response
+            : '';
+      if (!rawPaths.length) {
+        throw new Error('Text-to-image did not return an image.');
+      }
+      const packed = imageResultFromPaths(rawPaths, text);
+      contextManager.appendAssistant(packed.text, { imageParts: packed.imageParts });
+      return { text: packed.text, imagePaths: packed.imagePaths, images: packed.images };
+    } catch (err) {
+      if (cancelRequested) {
+        await discardGeneratedOutput(outputPath);
+        const stopped = withStopMarker('');
+        contextManager.appendAssistant(stopped);
+        return stopped;
+      }
+      await discardGeneratedOutput(outputPath);
+      contextManager.rollbackLastUser();
+      throw err;
+    } finally {
+      generationInFlight = false;
+      phase = 'idle';
+    }
+  }
+
   const enableThinking = options.enableThinking === true;
   const resubmit = options.resubmit !== false;
   const { message: enrichedMessage, imagePaths, audioPaths, videoPaths } =
@@ -617,6 +748,9 @@ async function chatbotHasChatTemplate() {
 
 async function chatGenerationStartsInThinking(message, options = {}) {
   if (!activeModelId || !activeEngineId) {
+    return false;
+  }
+  if (activePipelineTag === TEXT_TO_IMAGE_PIPELINE_TAG) {
     return false;
   }
   const enableThinking = options.enableThinking === true;

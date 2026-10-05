@@ -3,6 +3,9 @@
 torch==2.14.0
 torchvision==0.29.0
 transformers==5.17.0
+# Version declared by transformers 5.17.0 testing extras. Do not float this:
+# newer diffusers releases require a newer torch than this runtime pins.
+diffusers==0.35.2
 accelerate==1.15.0
 pillow==12.3.0
 timm==1.0.30

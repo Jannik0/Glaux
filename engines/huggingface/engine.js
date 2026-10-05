@@ -53,10 +53,15 @@ def _handle(q):
  if n=="run_chat":
   try:
    full=[]
-   for t in m.chat_stream(a["model_id"],a.get("thinking",False),a["message"],a.get("image_paths"),a.get("audio_paths"),a.get("video_paths"),resubmit=a.get("resubmit",True),messages=a.get("messages")):
+   for t in m.chat_stream(a["model_id"],a.get("thinking",False),a["message"],a.get("image_paths"),a.get("audio_paths"),a.get("video_paths"),resubmit=a.get("resubmit",True),messages=a.get("messages"),output_path=a.get("output_path")):
     full.append(t)
     _emit({"id":i,"stream":True,"text":t})
-   _emit({"id":i,"ok":True,"result":"".join(full)})
+   done={"id":i,"ok":True,"result":"".join(full)}
+   if hasattr(m,"take_generated_image_paths"):
+    images=m.take_generated_image_paths()
+    if images:
+     done["images"]=images
+   _emit(done)
   except Exception as e:
    _emit({"id":i,"ok":False,"error":str(e),"errorType":type(e).__name__})
   return
@@ -260,7 +265,14 @@ function attachReaders(proc) {
     }
     pending.delete(id);
     if (msg.ok) {
-      p.resolve(msg.result);
+      if (Array.isArray(msg.images) && msg.images.length) {
+        p.resolve({
+          text: typeof msg.result === 'string' ? msg.result : '',
+          imagePaths: msg.images.filter((item) => typeof item === 'string' && item),
+        });
+      } else {
+        p.resolve(msg.result);
+      }
     } else {
       const err = new Error(msg.error || 'Python RPC error');
       if (msg.errorType) err.pythonErrorType = msg.errorType;
@@ -409,7 +421,7 @@ function rpcVoid(method, args = {}) {
  * @param {boolean} thinking
  * @param {string} message
  * @param {{ onToken?: (chunk: string) => void, imagePaths?: string[], audioPaths?: string[], videoPaths?: string[], resubmit?: boolean } | ((chunk: string) => void)} [options]
- * @returns {Promise<string>}
+ * @returns {Promise<string | { text: string, imagePaths: string[] }>}
  */
 function runChat(modelId, thinking, message, options) {
   const opts = typeof options === 'function' ? { onToken: options } : options || {};
@@ -422,6 +434,7 @@ function runChat(modelId, thinking, message, options) {
   if (opts.videoPaths?.length) args.video_paths = opts.videoPaths;
   if (opts.resubmit === false) args.resubmit = false;
   if (Array.isArray(opts.messages)) args.messages = opts.messages;
+  if (typeof opts.outputPath === 'string' && opts.outputPath) args.output_path = opts.outputPath;
   const payload =
     JSON.stringify({
       id,

@@ -3,6 +3,7 @@ const state = require('../state');
 const {
   getResourcesRoot,
   getOutputsRoot,
+  getSessionsRoot,
   getModelsRoot,
 } = require('../paths');
 const { updatePreferences } = require('./preferences');
@@ -136,6 +137,7 @@ function getEngineInitOptions() {
   return {
     resourcesRoot: getResourcesRoot(),
     outputsRoot: getOutputsRoot(),
+    sessionsRoot: getSessionsRoot(),
     modelsCacheDir: getModelsRoot(),
     modelId: getEngineInitModelId(),
     onProgress: (info) => {

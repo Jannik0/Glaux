@@ -319,6 +319,7 @@
       "noActiveWorkspace": "Kein aktiver Arbeitsbereich.",
       "pathEscapesResources": "Der Pfad verlässt das Ressourcenverzeichnis.",
       "pathEscapesOutputs": "Der Pfad verlässt das Ausgabeverzeichnis.",
+      "pathEscapesSessions": "Der Pfad verlässt das Sitzungsverzeichnis.",
       "invalidSessionFilePath": "Ungültiger Sitzungsdateipfad.",
       "invalidModelFolderPath": "Ungültiger Modellordnerpfad.",
       "modelFolderNotFound": "Modellordner wurde nicht gefunden.",

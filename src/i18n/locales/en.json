@@ -319,6 +319,7 @@
       "noActiveWorkspace": "No active workspace.",
       "pathEscapesResources": "Path escapes resources directory.",
       "pathEscapesOutputs": "Path escapes outputs directory.",
+      "pathEscapesSessions": "Path escapes sessions directory.",
       "invalidSessionFilePath": "Invalid session file path.",
       "invalidModelFolderPath": "Invalid model folder path.",
       "modelFolderNotFound": "Model folder was not found.",

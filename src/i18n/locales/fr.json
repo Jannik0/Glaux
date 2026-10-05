@@ -319,6 +319,7 @@
       "noActiveWorkspace": "Aucun espace de travail actif.",
       "pathEscapesResources": "Le chemin sort du répertoire des ressources.",
       "pathEscapesOutputs": "Le chemin sort du répertoire des sorties.",
+      "pathEscapesSessions": "Le chemin sort du répertoire des sessions.",
       "invalidSessionFilePath": "Chemin de fichier de session invalide.",
       "invalidModelFolderPath": "Chemin de dossier de modèle invalide.",
       "modelFolderNotFound": "Le dossier du modèle est introuvable.",

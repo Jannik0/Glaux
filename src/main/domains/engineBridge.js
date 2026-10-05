@@ -6,9 +6,12 @@ const { ok, fail, toStructuredError, emitStreamEvent } = require('../ipc/result'
 const {
   getResourcesRoot,
   getOutputsRoot,
+  getSessionsRoot,
   getModelsRoot,
 } = require('../paths');
-const { persistActiveSession } = require('./sessions');
+const { persistActiveSession, reserveActiveSessionFilename } = require('./sessions');
+const { allocateSessionImagePath } = require('../sessionImages');
+const { TEXT_TO_IMAGE_PIPELINE_TAG } = require('../../../engines/common/resolveEngineId');
 const { clearPersistedModelIfNotCached, modelIdHasCachedWeights } = require('./modelsPrefs');
 const {
   getEngineInitModelId,
@@ -35,6 +38,39 @@ function validateMessagePayload(message, { allowEmpty = false } = {}) {
     throw new Error(t('errors.engineBridge.messageTooLong', { max: MAX_MESSAGE_LENGTH }));
   }
   return message;
+}
+
+/**
+ * Reserve a session JSON name and a sibling PNG before text-to-image runs.
+ * The session file itself is written after the turn, next to that image.
+ *
+ * @returns {Promise<string | undefined>}
+ */
+async function textToImageOutputPath() {
+  const status = engineManager.getStatus();
+  if (!status || status.pipelineTag !== TEXT_TO_IMAGE_PIPELINE_TAG) {
+    return undefined;
+  }
+  const filename = reserveActiveSessionFilename();
+  const allocated = await allocateSessionImagePath(getSessionsRoot(), filename);
+  return allocated.absolutePath;
+}
+
+/**
+ * @param {unknown} response
+ * @returns {{ text: string, images: Array<object> }}
+ */
+function splitPromptResult(response) {
+  if (response && typeof response === 'object' && Array.isArray(response.imagePaths)) {
+    return {
+      text: typeof response.text === 'string' ? response.text : '',
+      images: Array.isArray(response.images) ? response.images : [],
+    };
+  }
+  return {
+    text: typeof response === 'string' ? response : '',
+    images: [],
+  };
 }
 
 function normalizeFilesPayload(rawFiles) {
@@ -83,6 +119,7 @@ function registerEngineBridgeIpc() {
       await engineManager.configurePaths({
         resourcesRoot: getResourcesRoot(),
         outputsRoot: getOutputsRoot(),
+        sessionsRoot: getSessionsRoot(),
         modelsCacheDir: getModelsRoot(),
         onProgress: (info) => emitInitProgress(info),
       });
@@ -128,8 +165,15 @@ function registerEngineBridgeIpc() {
     }
     try {
       const { message, enableThinking, resubmit, files } = parseInferenceRequest(payload);
-      const response = await engineManager.sendPrompt(message, { enableThinking, resubmit, files });
-      return ok({ response });
+      const outputPath = await textToImageOutputPath();
+      const response = await engineManager.sendPrompt(message, {
+        enableThinking,
+        resubmit,
+        files,
+        outputPath,
+      });
+      const split = splitPromptResult(response);
+      return ok({ response: split.text, images: split.images });
     } catch (err) {
       return fail(err, 'E_INFERENCE');
     }
@@ -291,10 +335,12 @@ function registerEngineBridgeIpc() {
       };
       let sendPromptPromise;
       try {
+        const outputPath = await textToImageOutputPath();
         sendPromptPromise = engineManager.sendPrompt(message, {
           enableThinking,
           resubmit,
           files,
+          outputPath,
           onToken: (chunk) => {
             if (streamState.canceled) {
               return;
@@ -339,10 +385,16 @@ function registerEngineBridgeIpc() {
           return;
         }
 
-        if (!streamedAnyChunk && typeof response === 'string' && response.length > 0) {
-          emitStreamEvent(sender, { requestId, type: 'chunk', chunk: response });
+        const split = splitPromptResult(response);
+        if (!streamedAnyChunk && split.text.length > 0) {
+          emitStreamEvent(sender, { requestId, type: 'chunk', chunk: split.text });
         }
-        emitStreamEvent(sender, { requestId, type: 'done', response: response || '' });
+        emitStreamEvent(sender, {
+          requestId,
+          type: 'done',
+          response: split.text,
+          images: split.images,
+        });
         try {
           await persistActiveSession();
         } catch (persistErr) {

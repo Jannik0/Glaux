@@ -11,6 +11,7 @@ describe('resolveEngineId', () => {
       resolveEngineId('huggingface', 'automatic-speech-recognition'),
       'huggingface'
     );
+    assert.equal(resolveEngineId('huggingface', 'text-to-image'), 'huggingface');
   });
 
   it('routes ASR GGUF to transcribecpp', () => {
@@ -23,6 +24,10 @@ describe('resolveEngineId', () => {
   it('routes chat GGUF to llamacpp', () => {
     assert.equal(resolveEngineId('llamacpp', 'text-generation'), 'llamacpp');
     assert.equal(resolveEngineId('llamacpp', null), 'llamacpp');
+  });
+
+  it('routes text-to-image GGUF to stablediffusion', () => {
+    assert.equal(resolveEngineId('llamacpp', 'text-to-image'), 'stablediffusion');
   });
 
   it('returns null for unknown format', () => {

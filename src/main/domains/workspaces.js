@@ -11,6 +11,7 @@ const {
   getModelsRoot,
   getResourcesRoot,
   getOutputsRoot,
+  getSessionsRoot,
   listWorkspaceNames,
   resolveWorkspaceDir,
   setActiveWorkspacePaths,
@@ -95,6 +96,7 @@ async function reconfigureEnginePathsIfReady() {
     await engineManager.configurePaths({
       resourcesRoot,
       outputsRoot,
+      sessionsRoot: getSessionsRoot(),
       modelsCacheDir: getModelsRoot(),
     });
   } catch (err) {

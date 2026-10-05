@@ -91,12 +91,35 @@ function buildUserMessage(text, media = {}) {
 
 /**
  * @param {string} text
+ * @param {Array<{ type: string, path?: string, relativePath?: string, source?: string }> | undefined} [imageParts]
  */
-function buildAssistantMessage(text) {
-  return {
-    role: 'assistant',
-    content: [{ type: 'text', text: typeof text === 'string' ? text : '' }],
-  };
+function buildAssistantMessage(text, imageParts) {
+  const content = [];
+  for (const part of imageParts || []) {
+    if (!part || part.type !== 'image') {
+      continue;
+    }
+    const image = { type: 'image' };
+    if (typeof part.path === 'string' && part.path) {
+      image.path = part.path;
+    }
+    if (typeof part.relativePath === 'string' && part.relativePath) {
+      image.relativePath = part.relativePath;
+    }
+    if (typeof part.source === 'string' && part.source) {
+      image.source = part.source;
+    }
+    if (image.path || image.relativePath) {
+      content.push(image);
+    }
+  }
+  if (typeof text === 'string' && text.length) {
+    content.push({ type: 'text', text });
+  }
+  if (!content.length) {
+    content.push({ type: 'text', text: typeof text === 'string' ? text : '' });
+  }
+  return { role: 'assistant', content };
 }
 
 /**
@@ -122,9 +145,11 @@ function appendUser(text, media) {
 
 /**
  * @param {string} text
+ * @param {{ imageParts?: Array<object> }} [extras]
  */
-function appendAssistant(text) {
-  append(buildAssistantMessage(text));
+function appendAssistant(text, extras) {
+  const imageParts = extras && Array.isArray(extras.imageParts) ? extras.imageParts : undefined;
+  append(buildAssistantMessage(text, imageParts));
 }
 
 /**

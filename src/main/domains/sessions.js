@@ -9,6 +9,7 @@ const {
   assertValidSessionFilename,
   resolveSessionsPath,
   getSessionsRoot,
+  getResourcesRoot,
   ensureOutputsDirectory,
   getOutputsRoot,
   moveEntryToRecycleBin,
@@ -17,6 +18,10 @@ const {
 } = require('../paths');
 const { outputsFs } = require('./outputs');
 const { t } = require('../../i18n');
+const {
+  copyAssistantImagesToOutputs,
+  deleteSessionSidecarImages,
+} = require('../sessionImages');
 
 function formatSessionTimestamp() {
   const d = new Date();
@@ -107,6 +112,13 @@ async function renameSessionFile(oldName, newName) {
 
 async function trashSessionFile(filename) {
   const abs = resolveSessionsPath(filename);
+  try {
+    const messages = await readSessionFile(filename);
+    await deleteSessionSidecarImages(messages, getSessionsRoot());
+  } catch {
+    // Unreadable session JSON still goes to the recycle bin. Sidecars that
+    // cannot be resolved from the file are left in place.
+  }
   await moveEntryToRecycleBin(abs);
 }
 
@@ -170,11 +182,16 @@ function getSessionExportBaseName() {
   return 'untitled';
 }
 
-async function persistActiveSession() {
-  const messages = await engineManager.contextSnapshot();
+function reserveActiveSessionFilename() {
   if (!state.activeSessionFilename) {
     state.activeSessionFilename = `${formatSessionTimestamp()}.json`;
   }
+  return state.activeSessionFilename;
+}
+
+async function persistActiveSession() {
+  const messages = await engineManager.contextSnapshot();
+  reserveActiveSessionFilename();
   await writeSessionFile(state.activeSessionFilename, messages);
 }
 
@@ -278,6 +295,8 @@ function registerSessionsIpc() {
       if (messageIndex >= messages.length) {
         throw new Error(t('errors.sessions.messageDoesNotExist'));
       }
+      const removed = messages[messageIndex];
+      await deleteSessionSidecarImages([removed], getSessionsRoot());
       messages.splice(messageIndex, 1);
       await engineManager.contextReplace(messages);
       if (state.activeSessionFilename) {
@@ -304,11 +323,25 @@ function registerSessionsIpc() {
       const msg = messages[messageIndex];
       const sessionBase = getSessionExportBaseName();
       const messageNumber = messageIndex + 1;
-      const fileName = assertValidEntryName(`${sessionBase}-${messageNumber}.md`);
-      const markdown = messageToExportMarkdown(msg);
       await ensureOutputsDirectory();
-      const destinationPath = path.join(getOutputsRoot(), fileName);
-      await fs.writeFile(destinationPath, markdown, 'utf8');
+      const imageNames = await copyAssistantImagesToOutputs(msg, {
+        sessionsRoot: getSessionsRoot(),
+        resourcesRoot: getResourcesRoot(),
+        outputsRoot: getOutputsRoot(),
+      });
+      const markdown = messageToExportMarkdown(msg);
+      const assistantImagesOnly =
+        msg.role === 'assistant' &&
+        imageNames.length > 0 &&
+        !String(markdown || '').trim();
+      const written = [];
+      if (!assistantImagesOnly) {
+        const mdName = assertValidEntryName(`${sessionBase}-${messageNumber}.md`);
+        await fs.writeFile(path.join(getOutputsRoot(), mdName), markdown, 'utf8');
+        written.push(mdName);
+      }
+      written.push(...imageNames);
+      const fileName = written.join(', ');
       const tree = await outputsFs.getTree();
       return ok({ tree, fileName });
     } catch (err) {
@@ -320,4 +353,5 @@ function registerSessionsIpc() {
 module.exports = {
   registerSessionsIpc,
   persistActiveSession,
+  reserveActiveSessionFilename,
 };
