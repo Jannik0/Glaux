@@ -22,7 +22,7 @@ function isDiffusionPipelineTag(pipelineTag) {
 /**
  * @param {'huggingface' | 'llamacpp' | null} format
  * @param {string | null | undefined} pipelineTag
- * @returns {'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusion' | null}
+ * @returns {'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusioncpp' | null}
  */
 function resolveEngineId(format, pipelineTag) {
   if (format === 'huggingface') {
@@ -33,7 +33,7 @@ function resolveEngineId(format, pipelineTag) {
       return 'transcribecpp';
     }
     if (isDiffusionPipelineTag(pipelineTag)) {
-      return 'stablediffusion';
+      return 'stablediffusioncpp';
     }
     return 'llamacpp';
   }

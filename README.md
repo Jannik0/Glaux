@@ -100,7 +100,7 @@ export HF_TOKEN=hf_your_token
       safetensors                   Hub downloads                 *.gguf (by tag)
   engines/huggingface           (HF model-downloader)             chat → llamacpp
 (Python / Transformers +                                        ASR → transcribecpp
- Diffusers t2i / i2i)                             text/image-to-image → stablediffusion
+ Diffusers t2i / i2i)                             text/image-to-image → stablediffusioncpp
 ```
 
 1. **Electron** hosts the UI (`src/renderer/`) and filesystem/IPC logic (`src/main/`, `src/preload/`).
@@ -108,7 +108,7 @@ export HF_TOKEN=hf_your_token
 3. The **Hugging Face engine** (`engines/huggingface/`) spawns a long-lived Python worker (`engine.py` → `worker/`) and talks JSON-RPC over stdin/stdout. It uses CUDA or MPS when Torch reports them, otherwise CPU.
 4. The **llama.cpp engine** (`engines/llamacpp/`) spawns a long-lived bundled `llama-server` (dynamic CUDA/Vulkan/Metal backends) and uses its OpenAI-compatible HTTP API (chat / multimodal GGUFs).
 5. The **transcribe.cpp engine** (`engines/transcribecpp/`) spawns a one-shot bundled `transcribe-cli` per transcription (`--backend auto`; ASR GGUFs, including Nemotron cache-aware streaming).
-6. The **stable-diffusion.cpp engine** (`engines/stablediffusion/`) spawns a one-shot bundled `sd-cli` per image (`--mode img_gen`; text-to-image and image-to-image GGUFs). An optional image is passed with `--ref-image` for FLUX and Qwen Image, and with `--init-img` for Z-Image and image-to-image, plus `--vae-tiling`. `--width` / `--height` keep it within the CLI's 512-pixel canvas. Z-Image uses a noise level of 0.4. Steps, CFG, seed, and other strength stay at the CLI / model defaults. Safetensors image generation stays on the Hugging Face worker (`worker/t2i.py`, Diffusers). See [Image generation](#image-generation).
+6. The **stable-diffusion.cpp engine** (`engines/stablediffusioncpp/`) spawns a one-shot bundled `sd-cli` per image (`--mode img_gen`; text-to-image and image-to-image GGUFs). An optional image is passed with `--ref-image` for FLUX and Qwen Image, and with `--init-img` for Z-Image and image-to-image, plus `--vae-tiling`. `--width` / `--height` keep it within the CLI's 512-pixel canvas. Z-Image uses a noise level of 0.4. Steps, CFG, seed, and other strength stay at the CLI / model defaults. Safetensors image generation stays on the Hugging Face worker (`worker/t2i.py`, Diffusers). See [Image generation](#image-generation).
 7. Models are stored under the OS app-data directory (not inside the app install). Other user data lives beside that:
 
 
@@ -403,7 +403,7 @@ Glaux/
       worker/                     # Modular Python HF worker (chat, ASR, image generation, download, …)
     llamacpp/                     # llama-server HTTP bridge
     transcribecpp/                # transcribe-cli bridge
-    stablediffusion/              # sd-cli bridge (one-shot text-to-image and image-to-image GGUF)
+    stablediffusioncpp/           # sd-cli bridge (one-shot text-to-image and image-to-image GGUF)
   tests/                          # Node unit tests (`npm test`)
   scripts/                        # Build scripts
   assets/                         # App icons and README screenshot

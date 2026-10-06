@@ -26,13 +26,13 @@ describe('resolveEngineId', () => {
     assert.equal(resolveEngineId('llamacpp', null), 'llamacpp');
   });
 
-  it('routes text-to-image GGUF to stablediffusion', () => {
-    assert.equal(resolveEngineId('llamacpp', 'text-to-image'), 'stablediffusion');
+  it('routes text-to-image GGUF to stablediffusioncpp', () => {
+    assert.equal(resolveEngineId('llamacpp', 'text-to-image'), 'stablediffusioncpp');
   });
 
-  it('routes image-to-image GGUF to stablediffusion', () => {
+  it('routes image-to-image GGUF to stablediffusioncpp', () => {
     assert.equal(resolveEngineId('huggingface', 'image-to-image'), 'huggingface');
-    assert.equal(resolveEngineId('llamacpp', 'image-to-image'), 'stablediffusion');
+    assert.equal(resolveEngineId('llamacpp', 'image-to-image'), 'stablediffusioncpp');
   });
 
   it('returns null for unknown format', () => {

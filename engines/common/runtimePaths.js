@@ -3,7 +3,7 @@
 /**
  * Shared runtime path/binary resolution helpers used by engine backends
  * (huggingface → Python; llamacpp → llama-server; transcribecpp → transcribe-cli;
- *  stablediffusion → sd-cli; ffmpeg → ffmpeg + ffprobe).
+ *  stablediffusioncpp → sd-cli; ffmpeg → ffmpeg + ffprobe).
  * Packaged Electron apps ship bundled runtimes under `process.resourcesPath`;
  * dev checkouts use `vendor/<name>` instead.
  */

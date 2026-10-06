@@ -100,7 +100,7 @@ async function chatbotCreate(modelId, options = {}) {
   const tag = (await readModelPipelineTag(modelsCacheDir, modelId)) || null;
   if (!isDiffusionPipelineTag(tag)) {
     throw new Error(
-      'stablediffusion engine requires pipeline_tag: text-to-image or image-to-image ' +
+      'stablediffusioncpp engine requires pipeline_tag: text-to-image or image-to-image ' +
         `(got ${tag || 'none'}). Chat GGUFs should use the llama.cpp engine.`
     );
   }

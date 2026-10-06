@@ -3,7 +3,7 @@
  * Routes by weight format and pipeline_tag:
  *   safetensors/pytorch → huggingface (including diffusers text- and image-to-image)
  *   GGUF + ASR          → transcribecpp
- *   GGUF + text-to-image or image-to-image → stablediffusion
+ *   GGUF + text-to-image or image-to-image → stablediffusioncpp
  *   GGUF (chat/other)   → llamacpp
  * Hub downloads always use the huggingface downloader stack.
  */
@@ -13,10 +13,10 @@ const path = require('path');
 const hfEngine = require('./huggingface/engine');
 const llamaEngine = require('./llamacpp/engine');
 const transcribeEngine = require('./transcribecpp/engine');
-const stableDiffusionEngine = require('./stablediffusion/engine');
+const stableDiffusionEngine = require('./stablediffusioncpp/engine');
 const contextManager = require('./contextManager');
 const { COMPANION_ALLOW_PATTERNS, detectModelFormat } = require('./common/modelFormat');
-const { baseCompanionsReady, missingBaseCompanions } = require('./stablediffusion/weights');
+const { baseCompanionsReady, missingBaseCompanions } = require('./stablediffusioncpp/weights');
 const { stripThinkingFromMessages } = require('./common/stripThinking');
 const { withStopMarker } = require('./common/stopMarker');
 const {
@@ -50,7 +50,7 @@ let activeModelId = null;
 /** @type {string | null} */
 let activePipelineTag = null;
 
-/** @type {'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusion' | null} */
+/** @type {'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusioncpp' | null} */
 let activeEngineId = null;
 
 /** @type {'idle' | 'loading' | 'generating' | 'downloading'} */
@@ -78,7 +78,7 @@ const engines = {
   huggingface: hfEngine,
   llamacpp: llamaEngine,
   transcribecpp: transcribeEngine,
-  stablediffusion: stableDiffusionEngine,
+  stablediffusioncpp: stableDiffusionEngine,
 };
 
 function getActiveEngine() {
@@ -185,7 +185,7 @@ async function readModelPipelineTag(modelId) {
 
 /**
  * @param {string} modelId
- * @returns {Promise<'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusion'>}
+ * @returns {Promise<'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusioncpp'>}
  */
 async function resolveEngineForModel(modelId) {
   const dir = initOptions && initOptions.modelsCacheDir;
@@ -524,7 +524,7 @@ async function initialize(opts) {
   const modelId = opts.modelId.trim();
   const engineId = await resolveEngineForModel(modelId);
   const modelsCacheDir = initOptions && initOptions.modelsCacheDir;
-  if (engineId === 'stablediffusion' && modelsCacheDir) {
+  if (engineId === 'stablediffusioncpp' && modelsCacheDir) {
     const modelRoot = path.join(modelsCacheDir, ...modelId.split('/'));
     if (missingBaseCompanions(modelRoot, modelsCacheDir)) {
       activeModelId = null;
@@ -559,7 +559,7 @@ async function initialize(opts) {
       },
     });
     emitProgress({ phase: 'loading', status: 'complete', modelId: activeModelId });
-    if (activeEngineId === 'stablediffusion') {
+    if (activeEngineId === 'stablediffusioncpp') {
       startCompanionRestore(activeModelId);
     }
   } catch (err) {
@@ -900,7 +900,7 @@ async function sendPrompt(message, options = {}) {
     const imageToImage = activePipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
     const checked = imageToImage
       ? assertImageToImagePrompt(message, options.files)
-      : activeEngineId === 'stablediffusion'
+      : activeEngineId === 'stablediffusioncpp'
         ? assertGgufTextToImagePrompt(message, options.files)
         : { prompt: assertTextToImagePrompt(message, options.files), imageFile: null };
     const prompt = checked.prompt;

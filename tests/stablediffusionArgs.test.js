@@ -10,13 +10,13 @@ const {
   fitInitCanvas,
   formatSdCliError,
   imageSizeFromBuffer,
-} = require('../engines/stablediffusion/generate');
+} = require('../engines/stablediffusioncpp/generate');
 const {
   findLocalComponents,
   readBaseModelId,
   missingBaseCompanions,
   resolveRunComponents,
-} = require('../engines/stablediffusion/weights');
+} = require('../engines/stablediffusioncpp/weights');
 
 describe('buildSdCliArgs', () => {
   const base = {

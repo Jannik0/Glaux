@@ -8,7 +8,7 @@
  * This is the facade: process lifecycle + raw HTTP live in ./server;
  * message conversion + media URLs live in ./chat.
  * ASR GGUFs are routed to engines/transcribecpp by engineManager.
- * Text-to-image GGUFs are routed to engines/stablediffusion.
+ * Text-to-image GGUFs are routed to engines/stablediffusioncpp.
  */
 
 const path = require('path');
