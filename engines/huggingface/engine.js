@@ -645,6 +645,6 @@ module.exports = {
 
   runChat,
 
-  /** Requests the current `runChat()` generation to stop at the next token (via StoppingCriteria). */
+  /** Requests the current `runChat()` to stop: next token for chat and ASR, next denoising step for diffusion. */
   chatStop: () => (isChildAlive(child) ? rpcVoid('chat_stop', {}) : Promise.resolve()),
 };

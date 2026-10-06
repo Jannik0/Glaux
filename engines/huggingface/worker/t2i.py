@@ -5,8 +5,13 @@ unconditional pipelines are rejected. An image-to-image load may use an
 img2img class. Callers pass only the current prompt and, for image-to-image,
 an optional init image. Size, steps, seed, and CFG stay at the pipeline
 defaults.
+
+Stop uses the same ``CHAT_GENERATION_STOP`` flag as chat and ASR. Those paths
+check it from a ``StoppingCriteria`` at each new token. Diffusion checks it at
+each denoising step and aborts before the remaining steps and the VAE decode.
 """
 
+import inspect
 import json
 import shutil
 import sys
@@ -210,6 +215,86 @@ def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: 
     return pipe
 
 
+class DiffusionStopped(Exception):
+    """The user stopped image generation between denoising steps."""
+
+
+def _generation_stop_requested() -> bool:
+    """Read the flag ``chat_stop()`` sets for chat, ASR, and diffusion."""
+    from .chat import CHAT_GENERATION_STOP
+
+    return bool(CHAT_GENERATION_STOP)
+
+
+def _request_pipeline_interrupt(pipe) -> None:
+    """Ask the denoising loop to skip later steps if the callback raise is swallowed."""
+    if hasattr(pipe, "_interrupt"):
+        pipe._interrupt = True
+        return
+    try:
+        pipe.interrupt = True
+    except Exception:
+        pass
+
+
+def _release_pipeline_hooks(pipe) -> None:
+    """Run the cleanup ``__call__`` would have reached after a full sample."""
+    release = getattr(pipe, "maybe_free_model_hooks", None)
+    if not callable(release):
+        return
+    try:
+        release()
+    except Exception:
+        pass
+
+
+def _on_diffusion_step_end(pipe, step_index, timestep, callback_kwargs):
+    """Diffusion counterpart of ``_ChatStopCriteria``.
+
+    Diffusers calls this at the end of a denoising step. Raising here leaves
+    the current step finished and skips every later step, including the VAE
+    decode that still runs when only ``pipe._interrupt`` is set.
+    """
+    if _generation_stop_requested():
+        _request_pipeline_interrupt(pipe)
+        raise DiffusionStopped("Generation canceled.")
+    return callback_kwargs
+
+
+def _declares_step_end_callback(pipe) -> bool:
+    call = getattr(pipe, "__call__", None)
+    if call is None:
+        return False
+    try:
+        # Unwrap ``torch.no_grad`` so the real ``__call__`` parameters are visible.
+        signature = inspect.signature(inspect.unwrap(call))
+    except (TypeError, ValueError):
+        return False
+    return "callback_on_step_end" in signature.parameters
+
+
+def _arm_scheduler_stop(pipe) -> None:
+    """Watch ``scheduler.step`` when the pipeline has no step-end callback.
+
+    The denoising loop calls ``scheduler.step`` once per step, which is the
+    same boundary as ``callback_on_step_end``.
+    """
+    scheduler = getattr(pipe, "scheduler", None)
+    step = getattr(scheduler, "step", None)
+    if not callable(step) or getattr(step, "_glaux_stop_hook", False):
+        return
+
+    def hooked(*args, **kwargs):
+        result = step(*args, **kwargs)
+        if _generation_stop_requested():
+            _request_pipeline_interrupt(pipe)
+            raise DiffusionStopped("Generation canceled.")
+        return result
+
+    hooked._glaux_stop_hook = True
+    scheduler.step = hooked
+
+
 def generate_text_to_image(pipe, prompt: str, output_path: str, image_path: str | None = None) -> str:
     """Run the pipeline on ``prompt`` and write one image to ``output_path``.
 
@@ -219,19 +304,35 @@ def generate_text_to_image(pipe, prompt: str, output_path: str, image_path: str 
     Prompt and image are passed by name. Some pipelines, including Flux2,
     take the image as the first positional argument, so a positional prompt
     lands in that slot.
+
+    ``chat_stop()`` ends the run at the next denoising step. The partial image
+    is not saved.
     """
     text = prompt.strip()
     if not text:
         raise ValueError("Image generation requires a prompt.")
     if not output_path:
         raise ValueError("Image generation output path is not configured.")
+    if _generation_stop_requested():
+        raise DiffusionStopped("Generation canceled.")
     call = {"prompt": text}
     if image_path:
         from PIL import Image
 
         with Image.open(image_path) as opened:
             call["image"] = opened.convert("RGB")
-    result = pipe(**call)
+    if _declares_step_end_callback(pipe):
+        call["callback_on_step_end"] = _on_diffusion_step_end
+    else:
+        _arm_scheduler_stop(pipe)
+    try:
+        result = pipe(**call)
+    except DiffusionStopped:
+        _release_pipeline_hooks(pipe)
+        raise
+    if _generation_stop_requested():
+        _release_pipeline_hooks(pipe)
+        raise DiffusionStopped("Generation canceled.")
     images = getattr(result, "images", None)
     if not images:
         raise RuntimeError("Text-to-image pipeline returned no images.")

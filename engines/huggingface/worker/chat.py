@@ -24,7 +24,7 @@ from transformers.generation.stopping_criteria import StoppingCriteria, Stopping
 from . import context
 from . import download as _download
 from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_local_dir, read_model_pipeline_tag
-from .t2i import generate_text_to_image, load_text_to_image_pipeline
+from .t2i import DiffusionStopped, generate_text_to_image, load_text_to_image_pipeline
 from .thinking import (
     _iter_stripped_non_thinking_markup,
     _parse_tags_and_answer,
@@ -982,9 +982,13 @@ def _generate_text_to_image_turn(
     """One image from the current prompt. Caller holds ``_CHAT_LOCK``.
 
     Chat history is ignored. Size, steps, seed, and CFG stay at pipeline defaults.
+    ``chat_stop()`` ends sampling at the next denoising step and yields no image.
     """
-    global _GENERATED_IMAGE_PATHS
+    global CHAT_GENERATION_STOP, _GENERATED_IMAGE_PATHS
     _GENERATED_IMAGE_PATHS = []
+    # Same as the chat and ASR streams: a stop from an earlier turn must not
+    # cancel this one. Stops that arrive after this point are seen at the next step.
+    CHAT_GENERATION_STOP = False
     init_image = _reject_diffusion_media(
         image_paths,
         audio_paths,
@@ -997,15 +1001,26 @@ def _generate_text_to_image_turn(
     if not output_path:
         raise ValueError("Image generation output path is not configured.")
     saved: str | None = None
-    for attempt in range(2):
-        try:
-            saved = generate_text_to_image(CHATBOT, prompt, output_path, init_image)
-            break
-        except Exception as exc:
-            if attempt == 0 and _pipeline_uses_cuda() and _is_cuda_failure(exc):
-                _fallback_pipeline_to_cpu(exc)
-                continue
-            raise
+    stopped = False
+    try:
+        for attempt in range(2):
+            try:
+                saved = generate_text_to_image(CHATBOT, prompt, output_path, init_image)
+                break
+            except DiffusionStopped:
+                stopped = True
+                break
+            except Exception as exc:
+                if attempt == 0 and _pipeline_uses_cuda() and _is_cuda_failure(exc):
+                    _fallback_pipeline_to_cpu(exc)
+                    continue
+                raise
+    finally:
+        if CHAT_GENERATION_STOP:
+            stopped = True
+        CHAT_GENERATION_STOP = False
+    if stopped:
+        return ""
     if not saved:
         raise RuntimeError("Text-to-image pipeline returned no images.")
     _GENERATED_IMAGE_PATHS = [saved]
