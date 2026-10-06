@@ -1,9 +1,9 @@
 /**
  * Inference facade. The rest of the app talks to engineManager only.
  * Routes by weight format and pipeline_tag:
- *   safetensors/pytorch → huggingface (including diffusers text-to-image)
+ *   safetensors/pytorch → huggingface (including diffusers text- and image-to-image)
  *   GGUF + ASR          → transcribecpp
- *   GGUF + text-to-image → stablediffusion
+ *   GGUF + text-to-image or image-to-image → stablediffusion
  *   GGUF (chat/other)   → llamacpp
  * Hub downloads always use the huggingface downloader stack.
  */
@@ -15,7 +15,8 @@ const llamaEngine = require('./llamacpp/engine');
 const transcribeEngine = require('./transcribecpp/engine');
 const stableDiffusionEngine = require('./stablediffusion/engine');
 const contextManager = require('./contextManager');
-const { detectModelFormat } = require('./common/modelFormat');
+const { COMPANION_ALLOW_PATTERNS, detectModelFormat } = require('./common/modelFormat');
+const { baseCompanionsReady, missingBaseCompanions } = require('./stablediffusion/weights');
 const { stripThinkingFromMessages } = require('./common/stripThinking');
 const { withStopMarker } = require('./common/stopMarker');
 const {
@@ -28,8 +29,13 @@ const {
 const { extractPdfToMarkdown } = require('./common/extractPdf');
 const { extractVideoToWav } = require('./common/extractVideo');
 const { readModelPipelineTag: readPipelineTagFromCache } = require('./common/pipelineTag');
-const { ASR_PIPELINE_TAG, TEXT_TO_IMAGE_PIPELINE_TAG, resolveEngineId } = require('./common/resolveEngineId');
-const { assertTextToImagePrompt } = require('./common/textToImage');
+const {
+  ASR_PIPELINE_TAG,
+  IMAGE_TO_IMAGE_PIPELINE_TAG,
+  isDiffusionPipelineTag,
+  resolveEngineId,
+} = require('./common/resolveEngineId');
+const { assertImageToImagePrompt, assertTextToImagePrompt } = require('./common/textToImage');
 
 /** @type {{ resourcesRoot?: string, outputsRoot?: string, sessionsRoot?: string, modelsCacheDir?: string, modelId?: string, onProgress?: (info: object) => void } | null} */
 let initOptions = null;
@@ -50,6 +56,19 @@ let generationInFlight = false;
 
 /** Set by cancelGeneration so sendPrompt can keep the partial assistant turn. */
 let cancelRequested = false;
+
+/**
+ * GGUF id whose base-repo companion download is in flight. Cancel uses this
+ * id because the snapshot reports progress under the model the user is running.
+ * @type {string | null}
+ */
+let baseCompanionDownloadId = null;
+/**
+ * VAE and text-encoder fetches keyed by GGUF id. Switching models leaves these
+ * running; only an explicit stop cancels one.
+ * @type {Map<string, { promise: Promise<void>, cancelled: boolean }>}
+ */
+const companionJobs = new Map();
 
 const engines = {
   huggingface: hfEngine,
@@ -110,6 +129,46 @@ function emitProgress(info) {
   if (initOptions && typeof initOptions.onProgress === 'function') {
     initOptions.onProgress(info);
   }
+}
+
+/** @type {((modelId: string, info: object) => void) | null} */
+let modelDownloadProgressListener = null;
+
+/**
+ * Models-list progress for a transfer that is not the panel's Add-model download
+ * (a VAE and text encoder fetched while running a diffusion GGUF).
+ *
+ * @param {(modelId: string, info: object) => void} listener
+ */
+function setModelDownloadProgressListener(listener) {
+  modelDownloadProgressListener = typeof listener === 'function' ? listener : null;
+}
+
+/**
+ * @param {string} modelId
+ * @param {object} info
+ */
+function emitModelDownloadProgress(modelId, info) {
+  if (typeof modelDownloadProgressListener !== 'function') {
+    return;
+  }
+  try {
+    modelDownloadProgressListener(modelId, info);
+  } catch {
+    // The models list observes the transfer; it must not fail or cancel it.
+  }
+}
+
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isDownloadCancelledError(err) {
+  return Boolean(
+    err &&
+      (/** @type {{ code?: string, message?: string }} */ (err).code === 'DOWNLOAD_CANCELLED' ||
+        /cancelled/i.test(String(/** @type {{ message?: string }} */ (err).message || '')))
+  );
 }
 
 /**
@@ -416,6 +475,18 @@ async function initialize(opts) {
   await ensureEnginePaths(opts);
   const modelId = opts.modelId.trim();
   const engineId = await resolveEngineForModel(modelId);
+  const modelsCacheDir = initOptions && initOptions.modelsCacheDir;
+  if (engineId === 'stablediffusion' && modelsCacheDir) {
+    const modelRoot = path.join(modelsCacheDir, ...modelId.split('/'));
+    if (missingBaseCompanions(modelRoot, modelsCacheDir)) {
+      activeModelId = null;
+      activePipelineTag = null;
+      activeEngineId = null;
+      phase = 'idle';
+      startCompanionRestore(modelId);
+      return { downloadRequired: true };
+    }
+  }
   const engine = engines[engineId];
 
   activeModelId = modelId;
@@ -440,6 +511,9 @@ async function initialize(opts) {
       },
     });
     emitProgress({ phase: 'loading', status: 'complete', modelId: activeModelId });
+    if (activeEngineId === 'stablediffusion') {
+      startCompanionRestore(activeModelId);
+    }
   } catch (err) {
     activeModelId = null;
     activePipelineTag = null;
@@ -450,17 +524,165 @@ async function initialize(opts) {
       phase = 'idle';
     }
   }
+  return { downloadRequired: false };
 }
 
 /**
+ * A GGUF download passes a variant key or an allow-list that names a .gguf file.
  * @param {object} opts
+ * @returns {boolean}
  */
+function isGgufDownload(opts) {
+  if (opts && typeof opts.ggufVariant === 'string' && opts.ggufVariant.trim()) {
+    return true;
+  }
+  return (
+    Array.isArray(opts && opts.allowPatterns) &&
+    opts.allowPatterns.some((pattern) => typeof pattern === 'string' && /\.gguf$/i.test(pattern))
+  );
+}
+
+/**
+ * @param {string} baseModelId
+ * @param {string} progressModelId
+ * @param {((info: object) => void) | undefined} report
+ */
+async function downloadBaseCompanions(baseModelId, progressModelId, report) {
+  process.stderr.write(`[glaux] Fetching VAE and text encoder into ${baseModelId}.\n`);
+  baseCompanionDownloadId = progressModelId;
+  try {
+    await hfEngine.downloadModel(baseModelId, {
+      allowPatterns: COMPANION_ALLOW_PATTERNS,
+      progressId: progressModelId,
+      onProgress: typeof report === 'function' ? (event) => report(event) : undefined,
+    });
+  } finally {
+    if (baseCompanionDownloadId === progressModelId) {
+      baseCompanionDownloadId = null;
+    }
+  }
+}
+
+/**
+ * Text-to-image GGUF downloads need the base repo's VAE and text encoder in
+ * that repo's cache folder before the GGUF itself is fetched.
+ * @param {string} modelId
+ * @param {string} modelsCacheDir
+ * @param {(info: object) => void} report
+ */
+async function ensureT2iBaseCompanions(modelId, modelsCacheDir, report) {
+  const card = await hfEngine.readHubModelCard(modelId);
+  const pipelineTag = card && typeof card.pipeline_tag === 'string' ? card.pipeline_tag : '';
+  const baseModelId = card && typeof card.base_model === 'string' ? card.base_model : '';
+  if (!isDiffusionPipelineTag(pipelineTag) || !baseModelId) {
+    return;
+  }
+  const baseRoot = path.join(modelsCacheDir, ...baseModelId.split('/'));
+  if (baseCompanionsReady(baseRoot)) {
+    return;
+  }
+  await downloadBaseCompanions(baseModelId, modelId, report);
+}
+
+/**
+ * Stop one GGUF's VAE and text-encoder fetch and clear its models-list row.
+ * Does not remove the GGUF that was already downloaded, and does not affect
+ * another model's fetch.
+ * @param {string} modelId
+ * @returns {Promise<void>}
+ */
+function abandonCompanionRestore(modelId) {
+  const id = typeof modelId === 'string' ? modelId.trim() : '';
+  const job = id ? companionJobs.get(id) : null;
+  if (!job) {
+    return Promise.resolve();
+  }
+  job.cancelled = true;
+  hfEngine.cancelDownloadModel(id).catch(() => {});
+  emitModelDownloadProgress(id, {
+    phase: 'download',
+    status: 'cancelled',
+    modelId: id,
+  });
+  return job.promise.catch(() => {});
+}
+
+/**
+ * Check the selected diffusion GGUF's base repo and download a missing VAE and
+ * text encoder. The model load does not wait for the transfer. A fetch already
+ * running for this GGUF, or for another one, is left running.
+ * @param {string} modelId
+ */
+function startCompanionRestore(modelId) {
+  const existing = companionJobs.get(modelId);
+  if (existing) {
+    return existing.promise;
+  }
+  /** @type {{ promise: Promise<void>, cancelled: boolean }} */
+  const job = { promise: Promise.resolve(), cancelled: false };
+  const tracked = restoreMissingBaseCompanions(modelId, job).finally(() => {
+    if (companionJobs.get(modelId) === job) {
+      companionJobs.delete(modelId);
+    }
+  });
+  job.promise = tracked;
+  companionJobs.set(modelId, job);
+  tracked.catch(() => {});
+  return tracked;
+}
+
+/**
+ * A diffusion GGUF reads its VAE and text encoder from the base repo folder.
+ * Fetch them when that folder does not have both.
+ * @param {string} modelId
+ * @param {{ cancelled: boolean }} job
+ */
+async function restoreMissingBaseCompanions(modelId, job) {
+  const modelsCacheDir = initOptions && initOptions.modelsCacheDir;
+  if (!modelsCacheDir || !modelId || job.cancelled) {
+    return;
+  }
+  const modelRoot = path.join(modelsCacheDir, ...String(modelId).split('/'));
+  const baseModelId = missingBaseCompanions(modelRoot, modelsCacheDir);
+  if (!baseModelId || job.cancelled) {
+    return;
+  }
+  await ensureDownloadEnginePaths({ modelsCacheDir });
+  if (job.cancelled) {
+    return;
+  }
+  const report = (event) => {
+    if (job.cancelled) {
+      return;
+    }
+    emitModelDownloadProgress(modelId, event && typeof event === 'object' ? event : {});
+  };
+  report({ phase: 'download', status: 'starting', modelId });
+  try {
+    await downloadBaseCompanions(baseModelId, modelId, report);
+  } catch (err) {
+    const cancelled = job.cancelled || isDownloadCancelledError(err);
+    report({
+      phase: 'download',
+      status: cancelled ? 'cancelled' : 'error',
+      modelId,
+      message: err && err.message ? String(err.message) : '',
+    });
+    throw err;
+  }
+  if (job.cancelled) {
+    report({ phase: 'download', status: 'cancelled', modelId });
+    return;
+  }
+  report({ phase: 'download', status: 'complete', modelId });
+}
+
 async function downloadModel(opts) {
   if (!opts || typeof opts.modelId !== 'string' || !opts.modelId.trim()) {
     throw new Error('Model id is required.');
   }
   const modelId = opts.modelId.trim();
-  await ensureDownloadEnginePaths(opts);
+  const modelsCacheDir = await ensureDownloadEnginePaths(opts);
   const report = (info) => {
     try {
       if (typeof opts.onProgress === 'function') {
@@ -473,6 +695,9 @@ async function downloadModel(opts) {
     }
   };
   report({ phase: 'download', status: 'starting', modelId });
+  if (isGgufDownload(opts)) {
+    await ensureT2iBaseCompanions(modelId, modelsCacheDir, report);
+  }
   await hfEngine.downloadModel(modelId, {
     onProgress: (event) => report(event),
     allowPatterns: opts.allowPatterns,
@@ -541,6 +766,9 @@ async function ejectModel() {
   if (generationInFlight) {
     throw new Error('Wait until generation finishes before ejecting the model.');
   }
+  if (activeModelId) {
+    await abandonCompanionRestore(activeModelId);
+  }
   if (!activeModelId || !activeEngineId) {
     return;
   }
@@ -595,6 +823,9 @@ async function resetInferenceWorker() {
 
 function cancelGeneration() {
   cancelRequested = true;
+  if (activeModelId) {
+    abandonCompanionRestore(activeModelId);
+  }
   if (activeEngineId) {
     engines[activeEngineId].chatStop();
   }
@@ -617,23 +848,40 @@ async function sendPrompt(message, options = {}) {
     throw new Error('Engine is busy.');
   }
 
-  if (activePipelineTag === TEXT_TO_IMAGE_PIPELINE_TAG) {
-    const prompt = assertTextToImagePrompt(message, options.files);
+  if (isDiffusionPipelineTag(activePipelineTag)) {
+    const imageToImage = activePipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
+    const checked = imageToImage
+      ? assertImageToImagePrompt(message, options.files)
+      : { prompt: assertTextToImagePrompt(message, options.files), imageFile: null };
+    const prompt = checked.prompt;
+    const imagePaths = checked.imageFile
+      ? mediaPathsFromFiles([checked.imageFile]).imagePaths
+      : [];
     if (typeof options.outputPath !== 'string' || !options.outputPath.trim()) {
-      throw new Error('Text-to-image output path is not configured.');
+      throw new Error('Image generation output path is not configured.');
     }
     const outputPath = options.outputPath;
     cancelRequested = false;
-    contextManager.appendUser(prompt);
+    contextManager.appendUser(prompt, { imagePaths });
     generationInFlight = true;
     phase = 'generating';
+    const pendingCompanions = companionJobs.get(activeModelId)?.promise;
     try {
+      if (pendingCompanions) {
+        await pendingCompanions;
+      }
+      if (cancelRequested) {
+        await discardGeneratedOutput(outputPath);
+        const stopped = withStopMarker('');
+        contextManager.appendAssistant(stopped);
+        return stopped;
+      }
       const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
         onToken: options.onToken,
         onReplace: options.onReplace,
         messages: [],
         outputPath,
-        imagePaths: [],
+        imagePaths,
         audioPaths: [],
         videoPaths: [],
       });
@@ -654,7 +902,7 @@ async function sendPrompt(message, options = {}) {
             ? response
             : '';
       if (!rawPaths.length) {
-        throw new Error('Text-to-image did not return an image.');
+        throw new Error('Image generation did not return an image.');
       }
       const packed = imageResultFromPaths(rawPaths, text);
       contextManager.appendAssistant(packed.text, { imageParts: packed.imageParts });
@@ -750,7 +998,7 @@ async function chatGenerationStartsInThinking(message, options = {}) {
   if (!activeModelId || !activeEngineId) {
     return false;
   }
-  if (activePipelineTag === TEXT_TO_IMAGE_PIPELINE_TAG) {
+  if (isDiffusionPipelineTag(activePipelineTag)) {
     return false;
   }
   const enableThinking = options.enableThinking === true;
@@ -828,6 +1076,8 @@ async function contextUsage(resubmit = true, options = {}) {
 module.exports = {
   configurePaths,
   initialize,
+  setModelDownloadProgressListener,
+  cancelCompanionDownload: abandonCompanionRestore,
   downloadModel,
   cancelModelDownload,
   listHubModelFiles,

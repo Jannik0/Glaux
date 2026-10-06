@@ -3,9 +3,10 @@
 torch==2.14.0
 torchvision==0.29.0
 transformers==5.17.0
-# Version declared by transformers 5.17.0 testing extras. Do not float this:
-# newer diffusers releases require a newer torch than this runtime pins.
-diffusers==0.35.2
+# Pin a commit newer than the last numbered release so model_index.json can
+# name pipeline classes that release does not ship. The base install does not
+# upgrade torch.
+diffusers @ git+https://github.com/huggingface/diffusers.git@c2798cc7859f258c6cfc5b2460e82b6cac71f235
 accelerate==1.15.0
 pillow==12.3.0
 timm==1.0.30

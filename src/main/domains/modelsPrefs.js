@@ -19,6 +19,7 @@ const {
   emitInitProgress,
   enterNoModelState,
   getEngineInitOptions,
+  noteCompanionDownloadRequired,
   persistSelectedModelId,
 } = require('./engineCore');
 const { readModelPipelineTag } = require('../../../engines/common/pipelineTag');
@@ -216,6 +217,36 @@ function rememberDownloadProgress(session, event) {
   }
 }
 
+/** @type {Map<string, { modelId: string, loaded: number, total: number }>} */
+const runCompanionDownloads = new Map();
+
+/**
+ * Bytes for a VAE and text-encoder fetch started by running a diffusion GGUF.
+ * Kept beside the panel download so a reloaded window can paint that row.
+ *
+ * @param {string} modelId
+ * @param {unknown} event
+ */
+function noteRunCompanionDownload(modelId, event) {
+  if (!modelId || !event || typeof event !== 'object') {
+    return;
+  }
+  const info = /** @type {{ phase?: string, status?: string }} */ (event);
+  const terminal =
+    info.phase === 'download' &&
+    (info.status === 'complete' || info.status === 'cancelled' || info.status === 'error');
+  if (terminal) {
+    runCompanionDownloads.delete(modelId);
+    return;
+  }
+  let session = runCompanionDownloads.get(modelId);
+  if (!session) {
+    session = { modelId, loaded: 0, total: 0 };
+    runCompanionDownloads.set(modelId, session);
+  }
+  rememberDownloadProgress(session, event);
+}
+
 /**
  * Deliver a download event to the current main window.
  * Language switches reload that window; send throws once the frame is disposed,
@@ -241,6 +272,11 @@ function publishModelDownloadEvent(modelId, event) {
 }
 
 function registerModelsPrefsIpc() {
+  engineManager.setModelDownloadProgressListener((modelId, info) => {
+    noteRunCompanionDownload(modelId, info);
+    publishModelDownloadEvent(modelId, info);
+  });
+
   ipcMain.handle('prefs:getSelectedModelId', async () => {
     try {
       return ok({ modelId: state.selectedModelId });
@@ -326,19 +362,27 @@ function registerModelsPrefsIpc() {
 
   ipcMain.handle('models:listActiveDownloads', async () => {
     try {
+      /** @type {Array<{ modelId: string, loaded: number, total: number }>} */
+      const downloads = [];
       const active = state.activePanelModelDownload;
-      if (!active || typeof active.modelId !== 'string' || !active.modelId) {
-        return ok({ downloads: [] });
+      if (active && typeof active.modelId === 'string' && active.modelId) {
+        downloads.push({
+          modelId: active.modelId,
+          loaded: Number(active.loaded) || 0,
+          total: Number(active.total) || 0,
+        });
       }
-      return ok({
-        downloads: [
-          {
-            modelId: active.modelId,
-            loaded: Number(active.loaded) || 0,
-            total: Number(active.total) || 0,
-          },
-        ],
-      });
+      for (const session of runCompanionDownloads.values()) {
+        if (!session.modelId || downloads.some((item) => item.modelId === session.modelId)) {
+          continue;
+        }
+        downloads.push({
+          modelId: session.modelId,
+          loaded: Number(session.loaded) || 0,
+          total: Number(session.total) || 0,
+        });
+      }
+      return ok({ downloads });
     } catch (err) {
       return fail(err, 'E_DOWNLOAD');
     }
@@ -421,6 +465,10 @@ function registerModelsPrefsIpc() {
         state.activePanelModelDownload && state.activePanelModelDownload.modelId === modelId
           ? state.activePanelModelDownload
           : null;
+      if (!active && runCompanionDownloads.has(modelId)) {
+        await engineManager.cancelCompanionDownload(modelId);
+        return ok({ modelId, cancelled: true });
+      }
       let workerWasReset = false;
       if (active) {
         await engineManager.cancelModelDownload(modelId, { modelsCacheDir: getModelsRoot() });
@@ -443,7 +491,10 @@ function registerModelsPrefsIpc() {
       if (workerWasReset && state.engineBootstrapped && state.selectedModelId) {
         try {
           if (await modelIdHasCachedWeights(state.selectedModelId)) {
-            await engineManager.reinitialize(getEngineInitOptions());
+            const loaded = await engineManager.reinitialize(getEngineInitOptions());
+            if (loaded && loaded.downloadRequired) {
+              await noteCompanionDownloadRequired(state.selectedModelId);
+            }
           } else {
             await enterNoModelState();
           }

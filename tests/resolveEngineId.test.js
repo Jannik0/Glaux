@@ -30,6 +30,11 @@ describe('resolveEngineId', () => {
     assert.equal(resolveEngineId('llamacpp', 'text-to-image'), 'stablediffusion');
   });
 
+  it('routes image-to-image GGUF to stablediffusion', () => {
+    assert.equal(resolveEngineId('huggingface', 'image-to-image'), 'huggingface');
+    assert.equal(resolveEngineId('llamacpp', 'image-to-image'), 'stablediffusion');
+  });
+
   it('returns null for unknown format', () => {
     assert.equal(resolveEngineId(null, null), null);
   });

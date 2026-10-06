@@ -66,22 +66,34 @@ def _handle(q):
    _emit({"id":i,"ok":False,"error":str(e),"errorType":type(e).__name__})
   return
  if n=="download_model":
+  tracked=(a.get("progress_id") or a.get("model_id") or "").strip()
   try:
    def _sink(ev):
     _emit({"id":i,"download":True,"event":ev})
-   m.set_download_progress_callback(_sink)
+   if tracked:
+    m.set_download_progress_callback(_sink, tracked)
+   else:
+    m.set_download_progress_callback(_sink)
    try:
     kw={"model_id":a["model_id"]}
     if a.get("allow_patterns") is not None:
      kw["allow_patterns"]=a.get("allow_patterns")
     if a.get("gguf_variant") is not None:
      kw["gguf_variant"]=a.get("gguf_variant")
+    if a.get("progress_id") is not None:
+     kw["progress_id"]=a.get("progress_id")
     r=m.download_model(**kw)
    finally:
-    m.set_download_progress_callback(None)
+    if tracked:
+     m.set_download_progress_callback(None, tracked)
+    else:
+     m.set_download_progress_callback(None)
    _emit({"id":i,"ok":True,"result":r})
   except Exception as e:
-   m.set_download_progress_callback(None)
+   if tracked:
+    m.set_download_progress_callback(None, tracked)
+   else:
+    m.set_download_progress_callback(None)
    _emit({"id":i,"ok":False,"error":str(e),"errorType":type(e).__name__})
   return
  if n=="download_model_cancel":
@@ -494,7 +506,7 @@ module.exports = {
 
   /**
    * @param {string} modelId
-   * @param {{ onProgress?: (event: { status: string, file?: string, loaded?: number, total?: number }) => void, allowPatterns?: string[], ggufVariant?: string }} [options]
+   * @param {{ onProgress?: (event: { status: string, file?: string, loaded?: number, total?: number }) => void, allowPatterns?: string[], ggufVariant?: string, progressId?: string }} [options]
    */
   downloadModel: (modelId, options) => {
     const onProgress =
@@ -503,6 +515,10 @@ module.exports = {
       options && typeof options === 'object' ? options.allowPatterns : undefined;
     const ggufVariant =
       options && typeof options === 'object' ? options.ggufVariant : undefined;
+    const progressId =
+      options && typeof options === 'object' && typeof options.progressId === 'string'
+        ? options.progressId.trim()
+        : '';
     ensureChild();
     const id = ++nextId;
     const args = { model_id: modelId };
@@ -511,6 +527,9 @@ module.exports = {
     }
     if (typeof ggufVariant === 'string' && ggufVariant.trim()) {
       args.gguf_variant = ggufVariant.trim();
+    }
+    if (progressId) {
+      args.progress_id = progressId;
     }
     const payload = JSON.stringify({ id, method: 'download_model', args }) + '\n';
 
@@ -532,6 +551,12 @@ module.exports = {
    * @returns {Promise<Array<{ path: string, size: number }>>}
    */
   listModelFiles: (modelId) => rpc('list_model_files', { model_id: modelId }),
+
+  /**
+   * @param {string} modelId
+   * @returns {Promise<{ pipeline_tag: string | null, base_model: string | null }>}
+   */
+  readHubModelCard: (modelId) => rpc('read_hub_model_card', { model_id: modelId }),
 
   /**
    * Ask Python to cancel an in-flight download. Does not resolve the download RPC;

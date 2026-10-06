@@ -83,6 +83,7 @@ _PIPELINE_CONTENT_TYPES: dict[str, frozenset[str]] = {
     "text-generation": frozenset({"text"}),
     "summarization": frozenset({"text"}),
     "image-text-to-text": frozenset({"text", "image"}),
+    "image-to-image": frozenset({"text", "image"}),
     "automatic-speech-recognition": frozenset({"audio"}),
     "any-to-any": frozenset({"text", "image", "audio", "video"}),
 }

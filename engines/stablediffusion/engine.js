@@ -10,7 +10,10 @@
 const path = require('path');
 const { resolveLocalGgufPaths } = require('../common/modelFormat');
 const { readModelPipelineTag } = require('../common/pipelineTag');
-const { TEXT_TO_IMAGE_PIPELINE_TAG } = require('../common/resolveEngineId');
+const {
+  IMAGE_TO_IMAGE_PIPELINE_TAG,
+  isDiffusionPipelineTag,
+} = require('../common/resolveEngineId');
 const { pickSdCli } = require('./cli');
 const { generateImage } = require('./generate');
 
@@ -27,6 +30,8 @@ let outputsRoot = null;
 let activeModelId = null;
 /** @type {string | null} */
 let activeModelPath = null;
+/** @type {string | null} */
+let activeModelRoot = null;
 /** @type {string | null} */
 let pipelineTag = null;
 /** @type {AbortController | null} */
@@ -61,6 +66,7 @@ function configure(options = {}) {
 function clearActive() {
   activeModelId = null;
   activeModelPath = null;
+  activeModelRoot = null;
   pipelineTag = null;
   CONTEXT = [];
   cachedUsage = { used: 0, total: null, valid: false };
@@ -92,9 +98,9 @@ async function chatbotCreate(modelId, options = {}) {
   pickSdCli();
 
   const tag = (await readModelPipelineTag(modelsCacheDir, modelId)) || null;
-  if (tag !== TEXT_TO_IMAGE_PIPELINE_TAG) {
+  if (!isDiffusionPipelineTag(tag)) {
     throw new Error(
-      `stablediffusion engine requires pipeline_tag: ${TEXT_TO_IMAGE_PIPELINE_TAG} ` +
+      'stablediffusion engine requires pipeline_tag: text-to-image or image-to-image ' +
         `(got ${tag || 'none'}). Chat GGUFs should use the llama.cpp engine.`
     );
   }
@@ -108,6 +114,7 @@ async function chatbotCreate(modelId, options = {}) {
 
   activeModelId = modelId;
   activeModelPath = modelPath;
+  activeModelRoot = modelRoot;
   pipelineTag = tag;
   cachedUsage = { used: 0, total: null, valid: false };
 
@@ -173,8 +180,16 @@ async function runChat(modelId, _thinking, message, options = {}) {
   // Prior turns stay in the session. sd-cli sees only this prompt.
   CONTEXT = [];
 
-  if (imagePaths.length > 0 || audioPaths.length > 0 || videoPaths.length > 0) {
-    throw new Error('Text-to-image models accept a text prompt only.');
+  const allowImage = pipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
+  if (audioPaths.length > 0 || videoPaths.length > 0 || (!allowImage && imagePaths.length > 0)) {
+    throw new Error(
+      allowImage
+        ? 'Image-to-image models accept a text prompt and an optional image.'
+        : 'Text-to-image models accept a text prompt only.'
+    );
+  }
+  if (imagePaths.length > 1) {
+    throw new Error('Image-to-image models accept at most one image.');
   }
   const prompt = typeof message === 'string' ? message.trim() : '';
   if (!prompt) {
@@ -190,6 +205,9 @@ async function runChat(modelId, _thinking, message, options = {}) {
   try {
     const written = await generateImage(activeModelPath, prompt, opts.outputPath, {
       signal: abort.signal,
+      modelRoot: activeModelRoot || undefined,
+      modelsCacheDir,
+      initImage: imagePaths[0] || null,
     });
     cachedUsage.valid = false;
     if (!written) {

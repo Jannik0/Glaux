@@ -176,6 +176,7 @@
     "errorPrefix": "[Error] {message}",
     "couldNotDeleteMessage": "No se pudo eliminar el mensaje: {message}",
     "modelReady": "Modelo listo",
+    "downloadRequired": "Descarga necesaria",
     "noModelLoadedHeading": "Ningún modelo cargado",
     "noModelLoadedBody": "Ningún modelo cargado.\n\nDescargue y seleccione un modelo en el panel Modelos.",
     "failedToLoadModel": "No se pudo cargar el modelo: {message}",

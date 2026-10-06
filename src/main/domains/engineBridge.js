@@ -11,7 +11,7 @@ const {
 } = require('../paths');
 const { persistActiveSession, reserveActiveSessionFilename } = require('./sessions');
 const { allocateSessionImagePath } = require('../sessionImages');
-const { TEXT_TO_IMAGE_PIPELINE_TAG } = require('../../../engines/common/resolveEngineId');
+const { isDiffusionPipelineTag } = require('../../../engines/common/resolveEngineId');
 const { clearPersistedModelIfNotCached, modelIdHasCachedWeights } = require('./modelsPrefs');
 const {
   getEngineInitModelId,
@@ -20,6 +20,7 @@ const {
   buildEngineStatusForRenderer,
   getEngineInitOptions,
   finishEngineBootstrapModelLoad,
+  noteCompanionDownloadRequired,
 } = require('./engineCore');
 
 const STREAM_TIMEOUT_MS = 120000;
@@ -41,14 +42,14 @@ function validateMessagePayload(message, { allowEmpty = false } = {}) {
 }
 
 /**
- * Reserve a session JSON name and a sibling PNG before text-to-image runs.
+ * Reserve a session JSON name and a sibling PNG before a diffusion run.
  * The session file itself is written after the turn, next to that image.
  *
  * @returns {Promise<string | undefined>}
  */
 async function textToImageOutputPath() {
   const status = engineManager.getStatus();
-  if (!status || status.pipelineTag !== TEXT_TO_IMAGE_PIPELINE_TAG) {
+  if (!status || !isDiffusionPipelineTag(status.pipelineTag)) {
     return undefined;
   }
   const filename = reserveActiveSessionFilename();
@@ -210,7 +211,17 @@ function registerEngineBridgeIpc() {
         await enterNoModelState();
         throw new Error(t('errors.engineBridge.modelNotDownloaded', { modelId }));
       }
-      await engineManager.reinitialize(getEngineInitOptions());
+      const loaded = await engineManager.reinitialize(getEngineInitOptions());
+      if (loaded && loaded.downloadRequired) {
+        await noteCompanionDownloadRequired(modelId);
+        return ok({
+          modelId: null,
+          fellBack: false,
+          clearedPreference: true,
+          loadFailed: false,
+          downloadRequired: true,
+        });
+      }
       state.engineBootstrapped = true;
       emitInitProgress({ phase: 'loading', status: 'complete', modelId });
       return ok({
@@ -422,8 +433,12 @@ function registerEngineBridgeIpc() {
             await clearPersistedModelIfNotCached();
             const modelId = getEngineInitModelId();
             if (modelId && (await modelIdHasCachedWeights(modelId))) {
-              await engineManager.reinitialize(getEngineInitOptions());
-              state.engineBootstrapped = true;
+              const loaded = await engineManager.reinitialize(getEngineInitOptions());
+              if (loaded && loaded.downloadRequired) {
+                await noteCompanionDownloadRequired(modelId);
+              } else {
+                state.engineBootstrapped = true;
+              }
             } else {
               await enterNoModelState();
             }

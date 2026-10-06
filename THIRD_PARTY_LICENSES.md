@@ -57,7 +57,7 @@ The NVIDIA NCCL, cuSPARSELt, NVSHMEM, and cuFile binaries are not shipped. On Wi
 
 - **CPython** from [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (PSF License for CPython; see that project for packaging terms)
 - **PyTorch** / **TorchVision** — BSD-style license (https://github.com/pytorch/pytorch)
-- **Hugging Face Transformers**, **Diffusers**, **huggingface_hub**, **Accelerate**, **safetensors**, and related Hub client libraries — Apache License 2.0. Diffusers is pinned at 0.35.2 (the release transformers 5.17.0 declares) for safetensors text-to-image.
+- **Hugging Face Transformers**, **Diffusers**, **huggingface_hub**, **Accelerate**, **safetensors**, and related Hub client libraries — Apache License 2.0. Diffusers is pinned to commit `c2798cc7859f258c6cfc5b2460e82b6cac71f235` (0.41.0.dev0) so safetensors text-to-image can load pipeline classes published after the last numbered release.
 - Other pinned packages from `engines/huggingface/requirements.txt` and their transitive dependencies — licenses are in each wheel’s `*.dist-info`
 
 The Hugging Face engine also uses **DOMPurify**, **marked**, and **pdf-parse** from the Electron `package.json` (Apache-2.0 / MPL-2.0, MIT, and MIT respectively) for renderer-side HTML sanitization, markdown, and PDF text extraction.

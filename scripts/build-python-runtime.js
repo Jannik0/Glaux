@@ -547,7 +547,9 @@ function verifyRuntimeImports(pythonExe, env) {
     pythonExe,
     [
       '-c',
-      'import torch, transformers, PIL, librosa; x = torch.zeros(1); ' +
+      'import torch, transformers, diffusers, PIL, librosa; ' +
+        'from diffusers import DiffusionPipeline; ' +
+        'x = torch.zeros(1); ' +
         'x = x.cuda() if torch.cuda.is_available() else x; ' +
         'a = torch.ones(8, 8, device=x.device); b = a @ a; ' +
         'print("ok", torch.__version__, "cuda", torch.version.cuda, transformers.__version__, float(b[0, 0]))',

@@ -4,7 +4,7 @@
 
 # Glaux
 
-Glaux is a **local AI workspace** for Windows, macOS, and Linux. It runs Hugging Face [Transformers](https://github.com/huggingface/transformers) and [Diffusers](https://github.com/huggingface/diffusers) models, and GGUF models (via [llama.cpp](https://github.com/ggml-org/llama.cpp) for chat, [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) for ASR, and [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) for text-to-image) on your machine through a desktop UI — no cloud API required for inference.
+Glaux is a **local AI workspace** for Windows, macOS, and Linux. It runs Hugging Face [Transformers](https://github.com/huggingface/transformers) and [Diffusers](https://github.com/huggingface/diffusers) models, and GGUF models (via [llama.cpp](https://github.com/ggml-org/llama.cpp) for chat, [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) for ASR, and [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) for text-to-image and image-to-image) on your machine through a desktop UI — no cloud API required for inference.
 
 It is designed to be as **user-friendly and accessible as possible**: you do not need any prior knowledge or experience running AI models. Pick a model from the [Hub](https://huggingface.co/models), download it through Glaux, and start chatting. Attach images, audio, video, or PDFs (parsed into markdown) when the model supports them. All content and sessions stay on disk under your user profile.
 
@@ -27,13 +27,24 @@ These models have been tested and confirmed fully working with Glaux:
 | Ministral 3 3B Instruct | ✓ [`mistralai/Ministral-3-3B-Instruct-2512`] | ✓ [`unsloth/Ministral-3-3B-Instruct-2512-GGUF`] |
 | Ministral 3 3B Reasoning | ✓ [`mistralai/Ministral-3-3B-Reasoning-2512`] | ✓ [`unsloth/Ministral-3-3B-Reasoning-2512-GGUF`] |
 | Qwen 3.5 2B | ✓ [`Qwen/Qwen3.5-2B`] | ✓ [`unsloth/Qwen3.5-2B-GGUF`] |
-| Nemotron ASR streaming 0.6B<br/>(cache-aware input streaming of files supported) | ✓ [`nvidia/nemotron-3.5-asr-streaming-0.6b`] | ✓ [`handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf`] |
+| Nemotron ASR streaming 0.6B | ✓ [`nvidia/nemotron-3.5-asr-streaming-0.6b`] | ✓ [`handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf`] |
 | Parakeet TDT 0.6B v3 | ✓ [`nvidia/parakeet-tdt-0.6b-v3`] | ✓ [`handy-computer/parakeet-tdt-0.6b-v3-gguf`] |
 | Whisper Large V3 Turbo | ✓ [`openai/whisper-large-v3-turbo`] | ✓ [`handy-computer/whisper-large-v3-turbo-gguf`] |
+| FLUX.2 klein 4B | ✓ [`black-forest-labs/FLUX.2-klein-4B`] | ✓ [`leejet/FLUX.2-klein-4B-GGUF`] |
+| Qwen Image 2.1 | ✓ [`Qwen/Qwen-Image-2.1`] | ✓ [`leejet/Qwen-Image-2.1-GGUF`] |
+| Z-Image Turbo | ✓ [`Tongyi-MAI/Z-Image-Turbo`] | ✓ [`leejet/Z-Image-Turbo-GGUF`] |
 
-Other Hub models may work as well; safetensors chat and ASR support depends on the [Transformers](https://github.com/huggingface/transformers) stack, safetensors text-to-image support depends on [Diffusers](https://github.com/huggingface/diffusers), chat GGUF support depends on [llama.cpp](https://github.com/ggml-org/llama.cpp), ASR GGUF support depends on [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), and text-to-image GGUF support depends on [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
+Other Hub models may work as well; safetensors chat and ASR support depends on the [Transformers](https://github.com/huggingface/transformers) stack, safetensors text-to-image and image-to-image support depends on [Diffusers](https://github.com/huggingface/diffusers), chat GGUF support depends on [llama.cpp](https://github.com/ggml-org/llama.cpp), ASR GGUF support depends on [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), and text-to-image and image-to-image GGUF support depends on [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
 
-> **Note:** Some models do not declare a pipeline_tag in their README.md. The safetensors engine defaults to text-generation if no explicit pipeline_tag is given. For full support of model capabilities add the proper pipeline_tag in the model's README.md yourself (refer to the task the model is categorized under on Hugging Face to determine the correct pipeline_tag).
+> **Note:** Glaux reads `pipeline_tag` from the model card. When that field is missing, it uses the first of `automatic-speech-recognition`, `text-to-image`, or `image-to-image` in the card's `tags` list. A safetensors model with none of those defaults to text-generation. A GGUF model with none of those is treated as chat. Other Hugging Face tasks (`summarization`, `image-text-to-text`, `any-to-any`, and the rest) are recognized only from `pipeline_tag`.
+
+### Image generation
+
+Text-to-image and image-to-image use Diffusers for safetensors and stable-diffusion.cpp for GGUF. Width, height, steps, CFG, and seed stay at the pipeline or CLI defaults. Image-to-image also leaves strength at that default.
+
+A prompt is required. Text-to-image accepts the prompt alone. Image-to-image accepts the prompt and one optional image.
+
+A diffusion GGUF is often the denoiser only. When its card names a base repo, Glaux keeps the VAE and text encoder in that repo's cache folder — the same place a download of the base model would use. If that folder does not already contain both files, they are downloaded there before the GGUF. Selecting the GGUF checks again and downloads them when they are missing. Quants of the same base model share the folder. While the folder holds only those files, it is not listed as its own model.
 
 ### Gated models (`HF_TOKEN`)
 
@@ -57,8 +68,8 @@ export HF_TOKEN=hf_your_token
 
 ## Features
 
-- Local chat with Hugging Face Transformers models (PyTorch), chat GGUFs (llama.cpp `llama-server`), and ASR GGUFs (transcribe.cpp `transcribe-cli`), plus text-to-image (Diffusers for safetensors, stable-diffusion.cpp `sd-cli` for GGUF), with **automatic GPU** (CUDA / Vulkan / Metal / MPS) and CPU fallback
-- Automatic engine routing (safetensors → Transformers or Diffusers, ASR GGUF → transcribe.cpp, text-to-image GGUF → stable-diffusion.cpp, other GGUF → llama.cpp) — invisible to the user
+- Local chat with Hugging Face Transformers models (PyTorch), chat GGUFs (llama.cpp `llama-server`), and ASR GGUFs (transcribe.cpp `transcribe-cli`), plus text-to-image and image-to-image (Diffusers for safetensors, stable-diffusion.cpp `sd-cli` for GGUF), with **automatic GPU** (CUDA / Vulkan / Metal / MPS) and CPU fallback
+- Automatic engine routing (safetensors → Transformers or Diffusers, ASR GGUF → transcribe.cpp, text-to-image and image-to-image GGUF → stable-diffusion.cpp, other GGUF → llama.cpp) — invisible to the user
 - Model download and cache management from the Hub, including a GGUF quant-variant picker (download only the selected Q4_K_M / Q8_0 / … files)
 - Multimodal inputs (images, audio, video, PDF) when the selected model supports them
 - Automatic parsing of PDFs into markdown
@@ -89,15 +100,15 @@ export HF_TOKEN=hf_your_token
       safetensors                   Hub downloads                 *.gguf (by tag)
   engines/huggingface           (HF model-downloader)             chat → llamacpp
 (Python / Transformers +                                        ASR → transcribecpp
- Diffusers text-to-image)                                 text-to-image → stablediffusion
+ Diffusers t2i / i2i)                             text/image-to-image → stablediffusion
 ```
 
 1. **Electron** hosts the UI (`src/renderer/`) and filesystem/IPC logic (`src/main/`, `src/preload/`).
-2. `engines/engineManager.js` is the only inference facade the app talks to. It routes by weight format and `pipeline_tag`.
+2. `engines/engineManager.js` is the only inference facade the app talks to. It routes by weight format and `pipeline_tag`. When `pipeline_tag` is absent, `automatic-speech-recognition`, `text-to-image`, and `image-to-image` are read from `tags`.
 3. The **Hugging Face engine** (`engines/huggingface/`) spawns a long-lived Python worker (`engine.py` → `worker/`) and talks JSON-RPC over stdin/stdout. It uses CUDA or MPS when Torch reports them, otherwise CPU.
 4. The **llama.cpp engine** (`engines/llamacpp/`) spawns a long-lived bundled `llama-server` (dynamic CUDA/Vulkan/Metal backends) and uses its OpenAI-compatible HTTP API (chat / multimodal GGUFs).
 5. The **transcribe.cpp engine** (`engines/transcribecpp/`) spawns a one-shot bundled `transcribe-cli` per transcription (`--backend auto`; ASR GGUFs, including Nemotron cache-aware streaming).
-6. The **stable-diffusion.cpp engine** (`engines/stablediffusion/`) spawns a one-shot bundled `sd-cli` per image (`--mode img_gen`; text-to-image GGUFs). Width, height, steps, CFG, and seed stay at the CLI / model defaults. Safetensors text-to-image stays on the Hugging Face worker (`worker/t2i.py`, Diffusers).
+6. The **stable-diffusion.cpp engine** (`engines/stablediffusion/`) spawns a one-shot bundled `sd-cli` per image (`--mode img_gen`; text-to-image and image-to-image GGUFs). An optional init image is passed with `--init-img`. Width, height, steps, CFG, seed, and strength stay at the CLI / model defaults. Safetensors image generation stays on the Hugging Face worker (`worker/t2i.py`, Diffusers). See [Image generation](#image-generation).
 7. Models are stored under the OS app-data directory (not inside the app install). Other user data lives beside that:
 
 
@@ -126,7 +137,7 @@ export HF_TOKEN=hf_your_token
 - For GGUF inference in development:
   - Chat / multimodal: `npm run build:llamacpp` (clones a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) into `deps/llama.cpp` if missing)
   - ASR: `npm run build:transcribe` (clones a pinned [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) into `deps/transcribe.cpp` if missing)
-  - Text-to-image GGUF: `npm run build:stablediffusion` (clones a pinned [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) into `deps/stable-diffusion.cpp` if missing, plus its ggml pin)
+  - Text-to-image and image-to-image GGUF: `npm run build:stablediffusion` (clones a pinned [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) into `deps/stable-diffusion.cpp` if missing, plus its ggml pin)
   - Install **CMake** + a C++ toolchain (VS 2022 on Windows, Xcode CLT on macOS, `build-essential` on Linux)
   - On Windows/Linux, also install the **CUDA Toolkit** (`nvcc`) and **Vulkan SDK** (or Debian/Ubuntu `sudo apt install libvulkan-dev glslc spirv-headers`) so GPU backends are compiled into the vendor trees (not required on the end-user machine)
   - Non-WAV / video ASR prep and Hugging Face audio/video decode use ffmpeg/ffprobe from `vendor/ffmpeg` (built by `npm run build:ffmpeg`)
@@ -269,7 +280,7 @@ npm run build:python
 
 This downloads a platform-matched CPython, installs pinned requirements from `engines/huggingface/requirements.txt`, and writes `vendor/python/`.
 
-Default on Windows/Linux is a **CUDA 13** PyTorch wheel (still runs on CPU when no NVIDIA GPU is present). Overlapping CUDA 13 runtime libraries are staged once into `vendor/cuda/` (shared with llama.cpp, transcribe.cpp, and stable-diffusion.cpp; Torch’s `nvidia/cu13` copies become symlinks to that folder). macOS always installs the default PyPI wheels (MPS-capable). The Python stack also pins Diffusers for safetensors text-to-image (`diffusers==0.35.2` in `engines/huggingface/requirements.txt`, the release transformers 5.17.0 declares).
+Default on Windows/Linux is a **CUDA 13** PyTorch wheel (still runs on CPU when no NVIDIA GPU is present). Overlapping CUDA 13 runtime libraries are staged once into `vendor/cuda/` (shared with llama.cpp, transcribe.cpp, and stable-diffusion.cpp; Torch’s `nvidia/cu13` copies become symlinks to that folder). macOS always installs the default PyPI wheels (MPS-capable). The Python stack also pins Diffusers for safetensors text-to-image and image-to-image to a commit newer than the last numbered release, so a pipeline class named in `model_index.json` still loads when that release does not ship it (`engines/huggingface/requirements.txt`).
 
 The runtime then drops packaging leftovers that inference does not load: **triton** (`torch.compile`), NVTX / `cuda-bindings`, CUDA headers / static libs / profiling extras (`nvperf`, `nvrtc*.alt`, cusolverMg), and unused CPython stdlib (`idlelib`, `test`, `tkinter`). The same names are removed on Windows (DLLs / `.lib`) and Linux (`.so` / `.a`). Linux also collapses ELF SONAME copies and uses **patchelf** to strip leftover `DT_NEEDED` entries so Torch still loads. Prebuilt CUDA fatbins in this tree (PyTorch, cuDNN, cuBLAS, cuFFT, nvJitLink, and the other bundled CUDA libraries) are cut to those same architectures: cubins for 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0, plus PTX for 12.0 and newer. cuDNN stays, including the Tensor IR engine (convolution fails with `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` if that library is missing). The cuDNN ext plugin is dropped (`libcudnn_ext` on Linux, `cudnn_ext64_9.dll` on Windows); cuDNN loads it only when the file is present. cuFFT, cuRAND, NVRTC, cuSOLVER, cuSPARSE, and CUPTI stay (libtorch calls them). PyTorch’s `libtorch_nvshmem.so` stays. **NCCL, cuSPARSELt, NVSHMEM, and cuFile** are replaced with tiny loader stubs on Windows and Linux: libtorch still links those names, but the NVIDIA binaries are not shipped. NVSHMEM device bitcode and bootstrap plugins are deleted. The wheel `*.dist-info` directories for those four packages stay with the tree. That drops multi-GPU collectives, 2:4 structured sparsity, and GPUDirect Storage, which Glaux does not use. **librosa** (and scipy / sklearn / numba) stay — many Hub audio models import them. Change prune logic and rerun `npm run build:python`; `npm run dist` only restores copies electron-builder may have flattened.
 
@@ -285,7 +296,7 @@ node scripts/build-python-runtime.js --torch-variant=cpu
 npm run build:ffmpeg
 ```
 
-This downloads FFmpeg 7.1.1 and dav1d 1.5.1, configures a shared LGPL-minimal decode-oriented build, and stages `ffmpeg`, `ffprobe`, and `libav*` / `libdav1d` into `vendor/ffmpeg/`. llama.cpp, transcribe.cpp, and the Hugging Face worker all use this tree. Text-to-image does not.
+This downloads FFmpeg 7.1.1 and dav1d 1.5.1, configures a shared LGPL-minimal decode-oriented build, and stages `ffmpeg`, `ffprobe`, and `libav*` / `libdav1d` into `vendor/ffmpeg/`. llama.cpp, transcribe.cpp, and the Hugging Face worker all use this tree. Image generation does not.
 
 Requires **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Windows, use MSYS2 MinGW64 (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-meson mingw-w64-x86_64-ninja mingw-w64-x86_64-pkg-config`). On Debian/Ubuntu: `sudo apt install build-essential nasm meson ninja-build pkg-config patchelf`. Linux also requires **patchelf** to bake `$ORIGIN` into DT_RUNPATH.
 
@@ -389,10 +400,10 @@ Glaux/
     contextManager.js             # Canonical chat history
     common/                       # Format detection, GPU helpers, PDF/video, ffmpeg
     huggingface/                  # JS bridge + Python Transformers / Diffusers worker
-      worker/                     # Modular Python HF worker (chat, ASR, text-to-image, download, …)
+      worker/                     # Modular Python HF worker (chat, ASR, image generation, download, …)
     llamacpp/                     # llama-server HTTP bridge
     transcribecpp/                # transcribe-cli bridge
-    stablediffusion/              # sd-cli bridge (one-shot text-to-image GGUF)
+    stablediffusion/              # sd-cli bridge (one-shot text-to-image and image-to-image GGUF)
   tests/                          # Node unit tests (`npm test`)
   scripts/                        # Build scripts
   assets/                         # App icons and README screenshot

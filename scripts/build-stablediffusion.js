@@ -13,7 +13,8 @@
  * ABI-compatible with llama/transcribe and is not shared. CUDA runtime
  * libraries (cudart/cublas) still go to vendor/cuda.
  *
- * One-shot CLI. No Glaux source patches: sd-cli already loads dynamic backends.
+ * One-shot CLI. One name-conversion patch maps a Hugging Face text encoder's
+ * `embed_tokens` weight onto the tensor name sd-cli already expects.
  *
  * Usage:
  *   node scripts/build-stablediffusion.js
@@ -126,6 +127,33 @@ function findBuiltCli(buildDir) {
   return null;
 }
 
+/**
+ * Some Hugging Face text encoders name the tied embedding `embed_tokens`.
+ * The LLM name map only rewrote `word_embeddings`, so metadata validation
+ * missed `text_encoders.llm.model.embed_tokens.weight`.
+ * @param {string} srcDir
+ */
+function patchLlmEmbedTokens(srcDir) {
+  const file = path.join(srcDir, 'src', 'name_conversion.cpp');
+  const marker = '{"model.language_model.embed_tokens.", "model.embed_tokens."}';
+  const needle = '{"model.language_model.word_embeddings.", "model.embed_tokens."}';
+  let src = fs.readFileSync(file, 'utf8');
+  if (src.includes(marker)) {
+    return;
+  }
+  if (!src.includes(needle)) {
+    throw new Error(
+      'Could not locate the LLM embedding rename in name_conversion.cpp.'
+    );
+  }
+  src = src.replace(
+    needle,
+    `${marker},\n        ${needle}`
+  );
+  fs.writeFileSync(file, src);
+  console.log('Patched LLM embed_tokens name conversion.');
+}
+
 function ensureSources(srcDir) {
   if (srcDir === DEFAULT_SRC) {
     ensureGitDep({
@@ -153,6 +181,7 @@ function main() {
   }
 
   ensureSources(opts.srcDir);
+  patchLlmEmbedTokens(opts.srcDir);
   if (!which('cmake')) {
     throw new Error('cmake not found on PATH. Install CMake to build stable-diffusion.cpp.');
   }

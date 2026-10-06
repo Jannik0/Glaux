@@ -649,6 +649,19 @@ void (async () => {
         })();
         return;
       }
+      if (info.status === 'downloadRequired') {
+        setEngineLoading(false);
+        hideModelLoadModal();
+        setReady(false);
+        chatTemplateSupported = false;
+        setContextUsageLabel('');
+        activeEnginePipelineTag = null;
+        modelsPanelSelectedId = null;
+        setLoadingStatusMessage(t('chat.downloadRequired'));
+        void refreshModelsCacheList();
+        void pollStatus();
+        return;
+      }
       if (info.status === 'ejected') {
         setEngineLoading(false);
         hideModelLoadModal();

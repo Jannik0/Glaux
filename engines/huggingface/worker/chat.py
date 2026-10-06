@@ -53,6 +53,8 @@ _cuda_oom_model_ids: set[str] = set()
 # Paths written by the current text-to-image call. Node reads them after the stream.
 _GENERATED_IMAGE_PATHS: list[str] = []
 TEXT_TO_IMAGE_PIPELINE_TAG = "text-to-image"
+IMAGE_TO_IMAGE_PIPELINE_TAG = "image-to-image"
+_DIFFUSION_PIPELINE_TAGS = frozenset({TEXT_TO_IMAGE_PIPELINE_TAG, IMAGE_TO_IMAGE_PIPELINE_TAG})
 
 
 def _force_cpu() -> bool:
@@ -238,7 +240,7 @@ def chatbot_has_chat_template() -> bool:
     """True when the loaded tokenizer/processor defines a usable chat template."""
     # Diffusion pipelines are not chat models. Reporting no template keeps the
     # thinking UI and context-usage gauge off.
-    if CHATBOT is None or CHATBOT_PIPELINE_TAG == TEXT_TO_IMAGE_PIPELINE_TAG:
+    if CHATBOT is None or CHATBOT_PIPELINE_TAG in _DIFFUSION_PIPELINE_TAGS:
         return False
     backend = _chat_template_backend()
     if backend is None or not hasattr(backend, "apply_chat_template"):
@@ -270,8 +272,12 @@ def chatbot_create(model_id: str):
         return "cpu"
 
     def _build_pipeline(placement: dict):
-        if CHATBOT_PIPELINE_TAG == TEXT_TO_IMAGE_PIPELINE_TAG:
-            return load_text_to_image_pipeline(model_path, _diffusion_device(placement))
+        if CHATBOT_PIPELINE_TAG in _DIFFUSION_PIPELINE_TAGS:
+            return load_text_to_image_pipeline(
+                model_path,
+                _diffusion_device(placement),
+                allow_img2img=CHATBOT_PIPELINE_TAG == IMAGE_TO_IMAGE_PIPELINE_TAG,
+            )
         return pipeline(
             CHATBOT_PIPELINE_TAG,
             model=model_path,
@@ -946,13 +952,24 @@ def _iter_direct_pipeline_stream(
     yield from _iter_direct_pipeline_batch(pipeline_input)
 
 
-def _reject_text_to_image_media(
+def _reject_diffusion_media(
     image_paths: list[str] | None,
     audio_paths: list[str] | None,
     video_paths: list[str] | None,
-) -> None:
-    if image_paths or audio_paths or video_paths:
-        raise RuntimeError("Text-to-image models accept a text prompt only.")
+    *,
+    allow_image: bool,
+) -> str | None:
+    """Return the optional init-image path. Reject anything else."""
+    images = [path for path in (image_paths or []) if path]
+    if audio_paths or video_paths or (images and not allow_image):
+        raise RuntimeError(
+            "Image-to-image models accept a text prompt and an optional image."
+            if allow_image
+            else "Text-to-image models accept a text prompt only."
+        )
+    if len(images) > 1:
+        raise RuntimeError("Image-to-image models accept at most one image.")
+    return images[0] if images else None
 
 
 def _generate_text_to_image_turn(
@@ -968,16 +985,21 @@ def _generate_text_to_image_turn(
     """
     global _GENERATED_IMAGE_PATHS
     _GENERATED_IMAGE_PATHS = []
-    _reject_text_to_image_media(image_paths, audio_paths, video_paths)
+    init_image = _reject_diffusion_media(
+        image_paths,
+        audio_paths,
+        video_paths,
+        allow_image=_active_pipeline_tag() == IMAGE_TO_IMAGE_PIPELINE_TAG,
+    )
     prompt = (message or "").strip()
     if not prompt:
-        raise ValueError("Text-to-image requires a prompt.")
+        raise ValueError("Image generation requires a prompt.")
     if not output_path:
-        raise ValueError("Text-to-image output path is not configured.")
+        raise ValueError("Image generation output path is not configured.")
     saved: str | None = None
     for attempt in range(2):
         try:
-            saved = generate_text_to_image(CHATBOT, prompt, output_path)
+            saved = generate_text_to_image(CHATBOT, prompt, output_path, init_image)
             break
         except Exception as exc:
             if attempt == 0 and _pipeline_uses_cuda() and _is_cuda_failure(exc):
@@ -1020,7 +1042,7 @@ def chat_stream(
             old = None
         if CHATBOT is None:
             chatbot_create(model_id)
-        if _active_pipeline_tag() == TEXT_TO_IMAGE_PIPELINE_TAG:
+        if _active_pipeline_tag() in _DIFFUSION_PIPELINE_TAGS:
             try:
                 _generate_text_to_image_turn(
                     message,
