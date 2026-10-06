@@ -35,7 +35,11 @@ const {
   isDiffusionPipelineTag,
   resolveEngineId,
 } = require('./common/resolveEngineId');
-const { assertImageToImagePrompt, assertTextToImagePrompt } = require('./common/textToImage');
+const {
+  assertGgufTextToImagePrompt,
+  assertImageToImagePrompt,
+  assertTextToImagePrompt,
+} = require('./common/textToImage');
 
 /** @type {{ resourcesRoot?: string, outputsRoot?: string, sessionsRoot?: string, modelsCacheDir?: string, modelId?: string, onProgress?: (info: object) => void } | null} */
 let initOptions = null;
@@ -234,6 +238,36 @@ function resolveInferenceFilePath(file) {
 }
 
 /**
+ * Workspace identity for each attachment, keyed later by absolute path.
+ * Documents keep their original relative path (a PDF stays a PDF, not the
+ * extracted markdown path written into the prompt).
+ *
+ * @param {Array<{ source: string, relativePath: string }>} files
+ * @returns {Array<{ path: string, source: string, relativePath: string, kind: string }>}
+ */
+function describeAttachments(files) {
+  const described = [];
+  for (const file of files || []) {
+    if (!file || typeof file.relativePath !== 'string' || !file.relativePath) {
+      continue;
+    }
+    const abs = resolveInferenceFilePath(file);
+    const mediaKind = mediaKindFromPath(abs);
+    const kind = mediaKind || (isDocumentPath(abs) ? 'document' : null);
+    if (!kind || typeof file.source !== 'string' || !file.source) {
+      continue;
+    }
+    described.push({
+      path: abs,
+      source: file.source,
+      relativePath: file.relativePath,
+      kind,
+    });
+  }
+  return described;
+}
+
+/**
  * @param {Array<{ source: string, relativePath: string }>} files
  * @returns {{ imagePaths: string[], audioPaths: string[], videoPaths: string[] }}
  */
@@ -358,9 +392,10 @@ async function enrichMessageWithDocumentAttachments(message, files) {
 /**
  * @param {string} message
  * @param {Array<{ source: string, relativePath: string }>} [files]
- * @returns {Promise<{ message: string, imagePaths: string[], audioPaths: string[], videoPaths: string[] }>}
+ * @returns {Promise<{ message: string, imagePaths: string[], audioPaths: string[], videoPaths: string[], attachmentFiles: Array<{ path: string, source: string, relativePath: string, kind: string }> }>}
  */
 async function prepareInferenceRequest(message, files) {
+  const attachmentFiles = describeAttachments(files);
   const enriched = await enrichMessageWithDocumentAttachments(message, files);
   let finalMessage = enriched.message;
   if (!String(finalMessage || '').trim() && enriched.files.length > 0) {
@@ -371,6 +406,18 @@ async function prepareInferenceRequest(message, files) {
   }
   const { imagePaths, audioPaths, videoPaths } = mediaPathsFromFiles(enriched.files);
   const asrWavPaths = await convertAsrVideoToAudio(videoPaths);
+  for (let i = 0; i < asrWavPaths.length; i += 1) {
+    const video = attachmentFiles.find((item) => item.path === videoPaths[i] && item.kind === 'video');
+    if (!video) {
+      continue;
+    }
+    attachmentFiles.push({
+      path: asrWavPaths[i],
+      source: video.source,
+      relativePath: video.relativePath,
+      kind: 'audio',
+    });
+  }
   const finalAudioPaths = [...audioPaths, ...asrWavPaths];
   const finalVideoPaths = activePipelineTag === ASR_PIPELINE_TAG ? [] : videoPaths;
   return {
@@ -378,6 +425,7 @@ async function prepareInferenceRequest(message, files) {
     imagePaths,
     audioPaths: finalAudioPaths,
     videoPaths: finalVideoPaths,
+    attachmentFiles,
   };
 }
 
@@ -852,7 +900,9 @@ async function sendPrompt(message, options = {}) {
     const imageToImage = activePipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
     const checked = imageToImage
       ? assertImageToImagePrompt(message, options.files)
-      : { prompt: assertTextToImagePrompt(message, options.files), imageFile: null };
+      : activeEngineId === 'stablediffusion'
+        ? assertGgufTextToImagePrompt(message, options.files)
+        : { prompt: assertTextToImagePrompt(message, options.files), imageFile: null };
     const prompt = checked.prompt;
     const imagePaths = checked.imageFile
       ? mediaPathsFromFiles([checked.imageFile]).imagePaths
@@ -862,7 +912,10 @@ async function sendPrompt(message, options = {}) {
     }
     const outputPath = options.outputPath;
     cancelRequested = false;
-    contextManager.appendUser(prompt, { imagePaths });
+    contextManager.appendUser(prompt, {
+      imagePaths,
+      files: checked.imageFile ? describeAttachments([checked.imageFile]) : [],
+    });
     generationInFlight = true;
     phase = 'generating';
     const pendingCompanions = companionJobs.get(activeModelId)?.promise;
@@ -925,11 +978,16 @@ async function sendPrompt(message, options = {}) {
 
   const enableThinking = options.enableThinking === true;
   const resubmit = options.resubmit !== false;
-  const { message: enrichedMessage, imagePaths, audioPaths, videoPaths } =
+  const { message: enrichedMessage, imagePaths, audioPaths, videoPaths, attachmentFiles } =
     await prepareInferenceRequest(message, options.files);
 
   cancelRequested = false;
-  contextManager.appendUser(enrichedMessage, { imagePaths, audioPaths, videoPaths });
+  contextManager.appendUser(enrichedMessage, {
+    imagePaths,
+    audioPaths,
+    videoPaths,
+    files: attachmentFiles,
+  });
 
   generationInFlight = true;
   phase = 'generating';

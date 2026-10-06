@@ -42,7 +42,7 @@ Other Hub models may work as well; safetensors chat and ASR support depends on t
 
 Text-to-image and image-to-image use Diffusers for safetensors and stable-diffusion.cpp for GGUF. Width, height, steps, CFG, and seed stay at the pipeline or CLI defaults. Image-to-image also leaves strength at that default.
 
-A prompt is required. Text-to-image accepts the prompt alone. Image-to-image accepts the prompt and one optional image.
+A prompt is required. Safetensors text-to-image accepts the prompt alone. GGUF text-to-image and image-to-image accept the prompt and one optional image. FLUX and Qwen Image receive it as a reference image. Z-Image receives it as the init image, because a reference image makes this stable-diffusion.cpp build abort, at a noise level of 0.4 so the attachment stays in the picture. Image-to-image also uses the init image, and its strength stays at the CLI default. Either image is fit within the CLI's 512-pixel canvas, on a 64-pixel grid, and VAE tiling is enabled so the encode fits.
 
 A diffusion GGUF is often the denoiser only. When its card names a base repo, Glaux keeps the VAE and text encoder in that repo's cache folder — the same place a download of the base model would use. If that folder does not already contain both files, they are downloaded there before the GGUF. Selecting the GGUF checks again and downloads them when they are missing. Quants of the same base model share the folder. While the folder holds only those files, it is not listed as its own model.
 
@@ -108,7 +108,7 @@ export HF_TOKEN=hf_your_token
 3. The **Hugging Face engine** (`engines/huggingface/`) spawns a long-lived Python worker (`engine.py` → `worker/`) and talks JSON-RPC over stdin/stdout. It uses CUDA or MPS when Torch reports them, otherwise CPU.
 4. The **llama.cpp engine** (`engines/llamacpp/`) spawns a long-lived bundled `llama-server` (dynamic CUDA/Vulkan/Metal backends) and uses its OpenAI-compatible HTTP API (chat / multimodal GGUFs).
 5. The **transcribe.cpp engine** (`engines/transcribecpp/`) spawns a one-shot bundled `transcribe-cli` per transcription (`--backend auto`; ASR GGUFs, including Nemotron cache-aware streaming).
-6. The **stable-diffusion.cpp engine** (`engines/stablediffusion/`) spawns a one-shot bundled `sd-cli` per image (`--mode img_gen`; text-to-image and image-to-image GGUFs). An optional init image is passed with `--init-img`. Width, height, steps, CFG, seed, and strength stay at the CLI / model defaults. Safetensors image generation stays on the Hugging Face worker (`worker/t2i.py`, Diffusers). See [Image generation](#image-generation).
+6. The **stable-diffusion.cpp engine** (`engines/stablediffusion/`) spawns a one-shot bundled `sd-cli` per image (`--mode img_gen`; text-to-image and image-to-image GGUFs). An optional image is passed with `--ref-image` for FLUX and Qwen Image, and with `--init-img` for Z-Image and image-to-image, plus `--vae-tiling`. `--width` / `--height` keep it within the CLI's 512-pixel canvas. Z-Image uses a noise level of 0.4. Steps, CFG, seed, and other strength stay at the CLI / model defaults. Safetensors image generation stays on the Hugging Face worker (`worker/t2i.py`, Diffusers). See [Image generation](#image-generation).
 7. Models are stored under the OS app-data directory (not inside the app install). Other user data lives beside that:
 
 

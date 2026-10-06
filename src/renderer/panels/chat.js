@@ -333,6 +333,33 @@ function contextMessageToDisplayText(msg) {
 }
 
 /**
+ * @param {{ source?: unknown, relativePath?: unknown, path?: unknown }} part
+ * @returns {{ source: string, relativePath: string, name: string } | null}
+ */
+function describeStoredAttachment(part) {
+  if (typeof part.source === 'string' && typeof part.relativePath === 'string' && part.relativePath) {
+    const source =
+      part.source === 'outputs' || part.source === 'sessions' || part.source === 'resources'
+        ? part.source
+        : 'resources';
+    return {
+      source,
+      relativePath: part.relativePath,
+      name: fileNameFromPath(part.relativePath),
+    };
+  }
+  if (typeof part.path !== 'string' || !part.path.trim()) {
+    return null;
+  }
+  const name = fileNameFromPath(part.path);
+  return {
+    source: 'resources',
+    relativePath: name,
+    name,
+  };
+}
+
+/**
  * @param {unknown} msg
  * @returns {Array<{ source: string, relativePath: string, name: string }>}
  */
@@ -347,13 +374,9 @@ function contextMessageToDisplayFiles(msg) {
   const content = /** @type {{ content?: unknown }} */ (msg).content;
   const files = [];
   if (Array.isArray(content)) {
-    if (role === 'user') {
-      const raw = content
-        .filter((part) => part && typeof part === 'object' && part.type === 'text')
-        .map((part) => String(part.text || ''))
-        .join('\n');
-      files.push(...parseContextDocumentBlocks(raw).files);
-    }
+    const documentFiles = [];
+    let hasDocumentParts = false;
+    const mediaFiles = [];
     for (const part of content) {
       if (!part || typeof part !== 'object') {
         continue;
@@ -361,34 +384,33 @@ function contextMessageToDisplayFiles(msg) {
       const typed = /** @type {{ type?: string, path?: unknown, source?: unknown, relativePath?: unknown }} */ (
         part
       );
+      if (typed.type === 'file') {
+        hasDocumentParts = true;
+        const described = describeStoredAttachment(typed);
+        if (described) {
+          documentFiles.push(described);
+        }
+        continue;
+      }
       if (!CONTEXT_MEDIA_PART_TYPES.has(typed.type)) {
         continue;
       }
       if (role === 'assistant' && typed.type !== 'image') {
         continue;
       }
-      if (typeof typed.source === 'string' && typeof typed.relativePath === 'string' && typed.relativePath) {
-        const source =
-          typed.source === 'outputs' || typed.source === 'sessions' || typed.source === 'resources'
-            ? typed.source
-            : 'resources';
-        files.push({
-          source,
-          relativePath: typed.relativePath,
-          name: fileNameFromPath(typed.relativePath),
-        });
-        continue;
+      const described = describeStoredAttachment(typed);
+      if (described) {
+        mediaFiles.push(described);
       }
-      if (typeof typed.path !== 'string' || !typed.path.trim()) {
-        continue;
-      }
-      const name = fileNameFromPath(typed.path);
-      files.push({
-        source: 'resources',
-        relativePath: name,
-        name,
-      });
     }
+    if (role === 'user' && !hasDocumentParts) {
+      const raw = content
+        .filter((part) => part && typeof part === 'object' && part.type === 'text')
+        .map((part) => String(part.text || ''))
+        .join('\n');
+      files.push(...parseContextDocumentBlocks(raw).files);
+    }
+    files.push(...documentFiles, ...mediaFiles);
   }
   return files;
 }
@@ -418,12 +440,24 @@ function getChatMessageElements() {
   return [...messagesEl.querySelectorAll('.message.user, .message.assistant')];
 }
 
+function markFailedTurn(assistantContainer, userMessageEl) {
+  assistantContainer.classList.add('failed');
+  if (userMessageEl) {
+    userMessageEl.classList.add('failed');
+  }
+}
+
 function getChatMessageContextIndex(messageEl) {
   if (!messageEl) {
     return -1;
   }
+  // A failed generation stays on screen, but context rolls the user turn back
+  // and never stores the error. Count only turns context still has.
   let contextIndex = -1;
   for (const el of getChatMessageElements()) {
+    if (el.classList.contains('failed')) {
+      continue;
+    }
     contextIndex += 1;
     if (el === messageEl) {
       return contextIndex;
@@ -599,8 +633,19 @@ function createAssistantMessageStructure() {
 }
 
 /**
- * Attachment chips. Session-sourced images open the existing media viewer.
- * Other chips stay non-interactive, matching user attachments.
+ * True when a tree double-click would open this file (editor or media viewer).
+ *
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isTreeOpenableAttachment(name) {
+  const MediaKinds = window.Glaux.MediaKinds;
+  return MediaKinds.isMarkdownFile(name) || MediaKinds.isOpenableMediaFile(name);
+}
+
+/**
+ * Attachment chips open in the same editor or viewer as a Resources or Outputs
+ * tree file, for every sender and every openable type.
  *
  * @param {HTMLElement} parent
  * @param {Array<{ source?: string, relativePath?: string, name: string }>} files
@@ -614,24 +659,22 @@ function appendAttachmentChips(parent, files) {
   for (const file of files) {
     const chip = document.createElement('span');
     chip.className = 'message-attachment-chip';
-    if (file.source === 'sessions' && file.relativePath) {
+    const name = file.name || fileNameFromPath(file.relativePath || '');
+    if (file.source && file.relativePath && isTreeOpenableAttachment(name)) {
       chip.classList.add('is-openable');
       chip.addEventListener('click', () => {
-        const openViewer = window.api && window.api.media && window.api.media.openViewer;
-        if (typeof openViewer !== 'function') {
-          return;
-        }
-        Promise.resolve(openViewer('sessions', file.relativePath)).catch((err) => {
+        const openPanelFile = window.Glaux.MediaKinds.openPanelFile;
+        Promise.resolve(openPanelFile(file.source, file.relativePath, name)).catch((err) => {
           setLoadingStatusMessage((err && err.message) || String(err));
         });
       });
     }
     const iconEl = document.createElement('span');
     iconEl.className = 'tree-icon';
-    iconEl.textContent = window.Glaux.MediaKinds.getFileIcon(file.name);
+    iconEl.textContent = window.Glaux.MediaKinds.getFileIcon(name);
     const nameEl = document.createElement('span');
     nameEl.className = 'message-attachment-name';
-    nameEl.textContent = file.name;
+    nameEl.textContent = file.name || name;
     chip.append(iconEl, nameEl);
     attachmentsEl.appendChild(chip);
   }
@@ -1080,6 +1123,7 @@ formEl.addEventListener('submit', async (event) => {
       answerContent.textContent = '';
       renderFormattedMessage(answerContent, t('chat.errorPrefix', { message: err.message || String(err) }));
       container.classList.remove('thinking');
+      markFailedTurn(container, userMessageEl);
     }
   } finally {
     activeStream = null;

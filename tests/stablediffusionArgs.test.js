@@ -5,7 +5,12 @@ const os = require('os');
 const path = require('path');
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { buildSdCliArgs, formatSdCliError } = require('../engines/stablediffusion/generate');
+const {
+  buildSdCliArgs,
+  fitInitCanvas,
+  formatSdCliError,
+  imageSizeFromBuffer,
+} = require('../engines/stablediffusion/generate');
 const {
   findLocalComponents,
   readBaseModelId,
@@ -32,7 +37,7 @@ describe('buildSdCliArgs', () => {
       '-o',
       base.outputPath,
     ]);
-    for (const flag of ['--steps', '--cfg-scale', '--width', '--height', '--seed', '--init-img', '--batch-count']) {
+    for (const flag of ['--steps', '--cfg-scale', '--width', '--height', '--seed', '--init-img', '--vae-tiling', '--batch-count']) {
       assert.equal(args.includes(flag), false, flag);
     }
   });
@@ -70,15 +75,72 @@ describe('buildSdCliArgs', () => {
     assert.equal(args.includes('-m'), false);
   });
 
-  it('passes one init image and leaves strength at the CLI default', () => {
-    const args = buildSdCliArgs({
+  it('fits an init image to the prompt-only canvas and leaves strength at the CLI default', () => {
+    const unknown = buildSdCliArgs({
       ...base,
       initImage: '/sessions/source.png',
       forceCpu: false,
     });
-    assert.equal(args.includes('--init-img'), true);
-    assert.equal(args[args.indexOf('--init-img') + 1], '/sessions/source.png');
+    assert.equal(unknown[unknown.indexOf('--init-img') + 1], '/sessions/source.png');
+    assert.equal(unknown[unknown.indexOf('--width') + 1], '512');
+    assert.equal(unknown[unknown.indexOf('--height') + 1], '512');
+    assert.equal(unknown.includes('--vae-tiling'), true);
+    assert.equal(unknown.includes('--strength'), false);
+
+    const photo = buildSdCliArgs({
+      ...base,
+      initImage: '/sessions/source.png',
+      width: 1920,
+      height: 1080,
+      forceCpu: false,
+    });
+    assert.equal(photo[photo.indexOf('--width') + 1], '512');
+    assert.equal(photo[photo.indexOf('--height') + 1], '256');
+    assert.equal(photo.includes('--ref-image'), false);
+  });
+
+  it('passes a text-to-image attachment as a reference image', () => {
+    const args = buildSdCliArgs({
+      ...base,
+      referenceImage: '/sessions/source.png',
+      width: 1920,
+      height: 1080,
+      forceCpu: false,
+    });
+    assert.equal(args[args.indexOf('--ref-image') + 1], '/sessions/source.png');
+    assert.equal(args.includes('--init-img'), false);
     assert.equal(args.includes('--strength'), false);
+    assert.equal(args[args.indexOf('--width') + 1], '512');
+    assert.equal(args[args.indexOf('--height') + 1], '256');
+    assert.equal(args.includes('--vae-tiling'), true);
+  });
+
+  it('passes a Z-Image attachment as an init image', () => {
+    const named = buildSdCliArgs({
+      ...base,
+      modelPath: '/models/leejet/Z-Image-Turbo-GGUF/z-image-turbo-Q4_K.gguf',
+      referenceImage: '/sessions/source.png',
+      forceCpu: false,
+    });
+    assert.equal(named.includes('--init-img'), true);
+    assert.equal(named.includes('--ref-image'), false);
+    assert.equal(named[named.indexOf('--strength') + 1], '0.4');
+    assert.equal(
+      named[named.indexOf('--extra-sample-args') + 1],
+      'strength_as_noise_level=true,force_first_sigma=true'
+    );
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-zimage-'));
+    const modelPath = path.join(root, 'weights.gguf');
+    fs.writeFileSync(modelPath, Buffer.from('model.diffusion_model.cap_embedder.0.weight'));
+    const scanned = buildSdCliArgs({
+      ...base,
+      modelPath,
+      referenceImage: '/sessions/source.png',
+      forceCpu: false,
+    });
+    assert.equal(scanned[scanned.indexOf('--init-img') + 1], '/sessions/source.png');
+    assert.equal(scanned.includes('--ref-image'), false);
   });
 
   it('pins CPU only when forceCpu is set', () => {
@@ -87,6 +149,37 @@ describe('buildSdCliArgs', () => {
     assert.equal(cpu.at(-1), 'cpu');
     const gpu = buildSdCliArgs({ ...base, forceCpu: false });
     assert.equal(gpu.includes('--backend'), false);
+  });
+});
+
+describe('fitInitCanvas', () => {
+  it('keeps a square default and scales a wide photo down to a 64-pixel grid', () => {
+    assert.deepEqual(fitInitCanvas(512, 512), { width: 512, height: 512 });
+    assert.deepEqual(fitInitCanvas(1920, 1080), { width: 512, height: 256 });
+    assert.deepEqual(fitInitCanvas(400, 300), { width: 384, height: 256 });
+    assert.deepEqual(fitInitCanvas(0, 1080), { width: 512, height: 512 });
+  });
+});
+
+describe('imageSizeFromBuffer', () => {
+  it('reads a PNG header', () => {
+    const buf = Buffer.alloc(24);
+    buf[0] = 0x89;
+    buf.write('PNG', 1, 'ascii');
+    buf.writeUInt32BE(1920, 16);
+    buf.writeUInt32BE(1080, 20);
+    assert.deepEqual(imageSizeFromBuffer(buf), { width: 1920, height: 1080 });
+  });
+
+  it('reads a JPEG frame header', () => {
+    const buf = Buffer.from([
+      0xff, 0xd8,
+      0xff, 0xe0, 0x00, 0x04, 0x00, 0x00,
+      0xff, 0xc0, 0x00, 0x0b, 0x08,
+      0x04, 0x38,
+      0x07, 0x80,
+    ]);
+    assert.deepEqual(imageSizeFromBuffer(buf), { width: 1920, height: 1080 });
   });
 });
 
@@ -99,6 +192,20 @@ describe('formatSdCliError', () => {
       '[ERROR  ] diffusion_engine.cpp:1270 - model metadata validation failed',
     ].join('\n');
     assert.equal(formatSdCliError(stderr, '', 1), 'model metadata validation failed');
+  });
+
+  it('keeps a Z-Image assertion that sits under the CUDA init log', () => {
+    const stderr = [
+      'ggml_cuda_init: found 1 CUDA devices (Total VRAM: 6143 MiB)',
+      'load_backend: loaded CUDA backend from ggml-cuda.dll',
+      'ggml_vulkan: Found 2 Vulkan devices:',
+      'ggml_vulkan: 0 = NVIDIA GeForce RTX 3060 Laptop GPU',
+      'GGML_ASSERT(txt->ne[1] + img->ne[1] == pe->ne[3]) failed',
+    ].join('\n');
+    assert.equal(
+      formatSdCliError(stderr, '', 3),
+      'GGML_ASSERT(txt->ne[1] + img->ne[1] == pe->ne[3]) failed'
+    );
   });
 });
 

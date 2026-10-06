@@ -3,7 +3,8 @@
 /**
  * Diffusion request checks shared by engineManager and the native engines.
  * Generation uses the current prompt only — callers must not pass chat history.
- * Image-to-image accepts the same prompt, plus an optional image.
+ * Image-to-image, and GGUF text-to-image, accept the same prompt plus an optional image.
+ * Safetensors text-to-image stays prompt-only.
  */
 
 const { mediaKindFromPath } = require('./mediaKinds');
@@ -39,23 +40,43 @@ function assertTextToImagePrompt(message, files) {
  * A text prompt, and at most one image. Audio, video, and documents are rejected.
  * @param {unknown} message
  * @param {Array<{ relativePath?: string }> | null | undefined} files
+ * @param {string} label
  * @returns {{ prompt: string, imageFile: { relativePath?: string } | null }}
  */
-function assertImageToImagePrompt(message, files) {
+function assertOptionalImagePrompt(message, files, label) {
   const list = Array.isArray(files) ? files : [];
   /** @type {Array<{ relativePath?: string }>} */
   const images = [];
   for (const file of list) {
     const rel = file && typeof file.relativePath === 'string' ? file.relativePath : '';
     if (mediaKindFromPath(rel) !== 'image') {
-      throw new Error('Image-to-image models accept a text prompt and an optional image.');
+      throw new Error(`${label} models accept a text prompt and an optional image.`);
     }
     images.push(file);
   }
   if (images.length > 1) {
-    throw new Error('Image-to-image models accept at most one image.');
+    throw new Error(`${label} models accept at most one image.`);
   }
-  return { prompt: requirePrompt(message, 'Image-to-image'), imageFile: images[0] || null };
+  return { prompt: requirePrompt(message, label), imageFile: images[0] || null };
+}
+
+/**
+ * @param {unknown} message
+ * @param {Array<{ relativePath?: string }> | null | undefined} files
+ * @returns {{ prompt: string, imageFile: { relativePath?: string } | null }}
+ */
+function assertImageToImagePrompt(message, files) {
+  return assertOptionalImagePrompt(message, files, 'Image-to-image');
+}
+
+/**
+ * GGUF text-to-image. The image is the stable-diffusion.cpp init image.
+ * @param {unknown} message
+ * @param {Array<{ relativePath?: string }> | null | undefined} files
+ * @returns {{ prompt: string, imageFile: { relativePath?: string } | null }}
+ */
+function assertGgufTextToImagePrompt(message, files) {
+  return assertOptionalImagePrompt(message, files, 'Text-to-image');
 }
 
 module.exports = {
@@ -63,4 +84,5 @@ module.exports = {
   IMAGE_TO_IMAGE_PIPELINE_TAG,
   assertTextToImagePrompt,
   assertImageToImagePrompt,
+  assertGgufTextToImagePrompt,
 };

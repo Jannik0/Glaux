@@ -158,7 +158,7 @@ function messageToExportMarkdown(msg) {
         continue;
       }
       const type = part.type;
-      if (type !== 'image' && type !== 'audio' && type !== 'video') {
+      if (type !== 'image' && type !== 'audio' && type !== 'video' && type !== 'file') {
         continue;
       }
       let label = '';

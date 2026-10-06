@@ -2,8 +2,14 @@
 
 /**
  * Text-to-image via a one-shot bundled sd-cli process.
- * Width, height, steps, CFG, and seed are omitted so the CLI / model defaults apply.
- * One image, current prompt only.
+ * Steps, CFG, and seed are omitted so the CLI / model defaults apply.
+ * An attached image would otherwise adopt the file's pixel size. That canvas is
+ * fit back to the CLI default (512 on the long side) so the denoiser matches a
+ * prompt-only run. Text-to-image passes the file as a reference image. FLUX and
+ * Qwen Image edit from that reference. Z-Image cannot: this build concatenates
+ * a reference latent and then builds positions without it, so sd-cli aborts.
+ * Z-Image receives the file as --init-img at noise level 0.4. Image-to-image
+ * keeps --init-img at the CLI strength. One image, current prompt only.
  */
 
 const fs = require('fs');
@@ -12,6 +18,208 @@ const path = require('path');
 const { isForceCpu, isNoCudaKernelImage, withCudaHidden } = require('../common/gpuRuntime');
 const { runSdCli } = require('./cli');
 const { hasSplitWeights, resolveRunComponents } = require('./weights');
+
+/** sd.cpp identifies Z-Image by this diffusion tensor. */
+const Z_IMAGE_TENSOR = 'cap_embedder.0.weight';
+/**
+ * Flow img2img mixes the latent as image * (1 - sigma) + noise * sigma.
+ * The CLI default strength of 0.75 is 75% noise, so Z-Image draws a new picture.
+ * 0.4 keeps the attachment and still lets the prompt change it.
+ */
+const Z_IMAGE_NOISE_LEVEL = '0.4';
+/** Header plus tensor names. The weight blob starts after this. */
+const Z_IMAGE_SCAN_BYTES = 16 * 1024 * 1024;
+
+/** sd-cli's default canvas when -W/-H are omitted. */
+const INIT_CANVAS = 512;
+/** Shared by SD (8), SDXL (8), and FLUX (16). */
+const INIT_ALIGN = 64;
+
+/**
+ * Fit an init image inside the prompt-only canvas, preserving aspect ratio.
+ * @param {number} width
+ * @param {number} height
+ * @returns {{ width: number, height: number }}
+ */
+function fitInitCanvas(width, height) {
+  const w0 = Number(width);
+  const h0 = Number(height);
+  if (!Number.isFinite(w0) || !Number.isFinite(h0) || w0 < 1 || h0 < 1) {
+    return { width: INIT_CANVAS, height: INIT_CANVAS };
+  }
+  const scale = Math.min(1, INIT_CANVAS / w0, INIT_CANVAS / h0);
+  const align = (n) => Math.max(INIT_ALIGN, Math.floor((n * scale) / INIT_ALIGN) * INIT_ALIGN);
+  return { width: align(w0), height: align(h0) };
+}
+
+/**
+ * @param {Buffer} buf
+ * @returns {{ width: number, height: number } | null}
+ */
+function imageSizeFromBuffer(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 10) {
+    return null;
+  }
+  if (buf[0] === 0x89 && buf.toString('ascii', 1, 4) === 'PNG' && buf.length >= 24) {
+    return positiveSize(buf.readUInt32BE(16), buf.readUInt32BE(20));
+  }
+  if (buf.toString('ascii', 0, 3) === 'GIF' && buf.length >= 10) {
+    return positiveSize(buf.readUInt16LE(6), buf.readUInt16LE(8));
+  }
+  if (buf[0] === 0x42 && buf[1] === 0x4d && buf.length >= 26) {
+    const header = buf.readUInt32LE(14);
+    if (header === 12 && buf.length >= 22) {
+      return positiveSize(buf.readUInt16LE(18), buf.readUInt16LE(20));
+    }
+    return positiveSize(buf.readInt32LE(18), Math.abs(buf.readInt32LE(22)));
+  }
+  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
+    return webpSize(buf);
+  }
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    return jpegSize(buf);
+  }
+  return null;
+}
+
+/**
+ * @param {number} width
+ * @param {number} height
+ * @returns {{ width: number, height: number } | null}
+ */
+function positiveSize(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) {
+    return null;
+  }
+  return { width, height };
+}
+
+/**
+ * @param {Buffer} buf
+ * @returns {{ width: number, height: number } | null}
+ */
+function webpSize(buf) {
+  if (buf.length < 30) {
+    return null;
+  }
+  const kind = buf.toString('ascii', 12, 16);
+  if (kind === 'VP8X') {
+    return positiveSize(1 + buf.readUIntLE(24, 3), 1 + buf.readUIntLE(27, 3));
+  }
+  if (kind === 'VP8 ') {
+    return positiveSize(buf.readUInt16LE(26) & 0x3fff, buf.readUInt16LE(28) & 0x3fff);
+  }
+  if (kind === 'VP8L' && buf.length >= 25 && buf[20] === 0x2f) {
+    const b0 = buf[21];
+    const b1 = buf[22];
+    const b2 = buf[23];
+    const b3 = buf[24];
+    const width = 1 + (((b1 & 0x3f) << 8) | b0);
+    const height = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6));
+    return positiveSize(width, height);
+  }
+  return null;
+}
+
+/**
+ * @param {Buffer} buf
+ * @returns {{ width: number, height: number } | null}
+ */
+function jpegSize(buf) {
+  let i = 2;
+  while (i + 8 < buf.length) {
+    if (buf[i] !== 0xff) {
+      i += 1;
+      continue;
+    }
+    const marker = buf[i + 1];
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) {
+      i += 2;
+      continue;
+    }
+    if (i + 3 >= buf.length) {
+      return null;
+    }
+    const len = buf.readUInt16BE(i + 2);
+    if (len < 2) {
+      return null;
+    }
+    if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+      if (i + 8 >= buf.length) {
+        return null;
+      }
+      return positiveSize(buf.readUInt16BE(i + 7), buf.readUInt16BE(i + 5));
+    }
+    i += 2 + len;
+  }
+  return null;
+}
+
+/**
+ * @param {string} filePath
+ * @returns {{ width: number, height: number } | null}
+ */
+function readImageSize(filePath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(512 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return imageSizeFromBuffer(buf.subarray(0, n));
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // The size is optional; a missing header falls back to 512x512.
+      }
+    }
+  }
+}
+
+/**
+ * Z-Image reference images abort sd-cli (GGML_ASSERT on the position table).
+ * The repo folder or the GGUF tensor name is enough to tell it from FLUX.
+ * @param {string} modelPath
+ * @returns {boolean}
+ */
+function isZImageModel(modelPath) {
+  if (typeof modelPath !== 'string' || !modelPath.trim()) {
+    return false;
+  }
+  if (/z[-_ ]?image/i.test(modelPath)) {
+    return true;
+  }
+  let fd = null;
+  try {
+    fd = fs.openSync(modelPath, 'r');
+    const buf = Buffer.alloc(Z_IMAGE_SCAN_BYTES);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.subarray(0, n).includes(Z_IMAGE_TENSOR);
+  } catch {
+    return false;
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // A missing model file is not Z-Image.
+      }
+    }
+  }
+}
+
+function attachedImage(opts) {
+  if (typeof opts.referenceImage === 'string' && opts.referenceImage.trim()) {
+    return { path: opts.referenceImage, mode: 'reference' };
+  }
+  if (typeof opts.initImage === 'string' && opts.initImage.trim()) {
+    return { path: opts.initImage, mode: 'init' };
+  }
+  return null;
+}
 
 /**
  * @param {{
@@ -27,6 +235,9 @@ const { hasSplitWeights, resolveRunComponents } = require('./weights');
  *   } | null,
  *   diffusionOnly?: boolean,
  *   initImage?: string | null,
+ *   referenceImage?: string | null,
+ *   width?: number,
+ *   height?: number,
  *   forceCpu?: boolean,
  * }} opts
  * @returns {string[]}
@@ -65,8 +276,28 @@ function buildSdCliArgs(opts) {
     '-o',
     opts.outputPath,
   );
-  if (typeof opts.initImage === 'string' && opts.initImage.trim()) {
-    args.push('--init-img', opts.initImage);
+  const attached = attachedImage(opts);
+  if (attached) {
+    const canvas = fitInitCanvas(opts.width, opts.height);
+    const zImage = isZImageModel(opts.modelPath);
+    if (attached.mode === 'reference' && !zImage) {
+      // --init-img noises the latent at strength 0.75. On a flow schedule that
+      // is nearly pure noise, so FLUX draws a new image. A reference latent is
+      // what these models actually edit from.
+      args.push('--ref-image', attached.path);
+    } else {
+      args.push('--init-img', attached.path);
+      if (zImage) {
+        args.push('--strength', Z_IMAGE_NOISE_LEVEL);
+        args.push('--extra-sample-args', 'strength_as_noise_level=true,force_first_sigma=true');
+      }
+    }
+    // The CLI otherwise sets the canvas to the file's pixel size. A full-resolution
+    // FLUX double block then fails while preparing weights.
+    args.push('--width', String(canvas.width), '--height', String(canvas.height));
+    // Decode retries a full-frame VAE graph with tiling when it does not fit.
+    // Encode does not, so the same graph fails while preparing weights.
+    args.push('--vae-tiling');
   }
   if (forceCpu) {
     args.push('--backend', 'cpu');
@@ -92,10 +323,10 @@ function formatSdCliError(stderr, stdout, code) {
     if (/not in model metadata/i.test(line)) {
       continue;
     }
-    if (/^(ggml_cuda_init|ggml_vulkan|load_backend):/i.test(line)) {
+    if (isBackendInitLine(line)) {
       continue;
     }
-    if (!/\[ERROR\s*\]|error:/i.test(line)) {
+    if (!/\[ERROR\s*\]|error:|GGML_ASSERT|Assertion |cudaMalloc failed|out of memory/i.test(line)) {
       continue;
     }
     const text = line.replace(/^\[[A-Z]+\s*\]\s+\S+\s+-\s+/, '').trim();
@@ -107,18 +338,26 @@ function formatSdCliError(stderr, stdout, code) {
   if (message) {
     return message.length > 500 ? `${message.slice(0, 500)}…` : message;
   }
-  const fallback = (stderr || stdout || '').replace(/\s+/g, ' ').trim();
+  const fallback = lines
+    .filter((line) => !isBackendInitLine(line) && !/not in model metadata/i.test(line))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (fallback.length > 400) {
-    return `${fallback.slice(0, 400)}…`;
+    return `…${fallback.slice(-400)}`;
   }
   return fallback || `sd-cli failed (${code})`;
+}
+
+function isBackendInitLine(line) {
+  return /^(ggml_cuda_init|ggml_vulkan|load_backend):/i.test(line);
 }
 
 /**
  * @param {string} modelPath
  * @param {string} prompt
  * @param {string} outputPath
- * @param {{ signal?: AbortSignal, modelRoot?: string, modelsCacheDir?: string, initImage?: string | null }} [opts]
+ * @param {{ signal?: AbortSignal, modelRoot?: string, modelsCacheDir?: string, initImage?: string | null, referenceImage?: string | null }} [opts]
  * @returns {Promise<string>}
  */
 async function generateImage(modelPath, prompt, outputPath, opts = {}) {
@@ -149,6 +388,8 @@ async function generateImage(modelPath, prompt, outputPath, opts = {}) {
     return result;
   };
 
+  const attached = attachedImage(opts);
+  const imageSize = attached ? readImageSize(attached.path) : null;
   const result = await runOnce(
     buildSdCliArgs({
       modelPath,
@@ -156,6 +397,9 @@ async function generateImage(modelPath, prompt, outputPath, opts = {}) {
       outputPath,
       components,
       initImage: opts.initImage,
+      referenceImage: opts.referenceImage,
+      width: imageSize ? imageSize.width : undefined,
+      height: imageSize ? imageSize.height : undefined,
     })
   );
 
@@ -189,6 +433,8 @@ async function generateImage(modelPath, prompt, outputPath, opts = {}) {
 
 module.exports = {
   buildSdCliArgs,
+  fitInitCanvas,
   formatSdCliError,
   generateImage,
+  imageSizeFromBuffer,
 };

@@ -2,7 +2,11 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { assertImageToImagePrompt, assertTextToImagePrompt } = require('../engines/common/textToImage');
+const {
+  assertGgufTextToImagePrompt,
+  assertImageToImagePrompt,
+  assertTextToImagePrompt,
+} = require('../engines/common/textToImage');
 
 describe('assertTextToImagePrompt', () => {
   it('returns the trimmed prompt', () => {
@@ -20,6 +24,36 @@ describe('assertTextToImagePrompt', () => {
   it('rejects a blank prompt', () => {
     assert.throws(() => assertTextToImagePrompt('   ', []), /requires a prompt/);
     assert.throws(() => assertTextToImagePrompt('', []), /requires a prompt/);
+  });
+});
+
+describe('assertGgufTextToImagePrompt', () => {
+  it('accepts a prompt with no image', () => {
+    const result = assertGgufTextToImagePrompt('  a red fox  ', []);
+    assert.equal(result.prompt, 'a red fox');
+    assert.equal(result.imageFile, null);
+  });
+
+  it('accepts one image', () => {
+    const file = { source: 'resources', relativePath: 'photo.png' };
+    const result = assertGgufTextToImagePrompt('repaint this', [file]);
+    assert.equal(result.prompt, 'repaint this');
+    assert.equal(result.imageFile, file);
+  });
+
+  it('rejects a second image and non-image files', () => {
+    assert.throws(
+      () =>
+        assertGgufTextToImagePrompt('a', [
+          { relativePath: 'a.png' },
+          { relativePath: 'b.jpg' },
+        ]),
+      /at most one image/
+    );
+    assert.throws(
+      () => assertGgufTextToImagePrompt('a', [{ relativePath: 'note.wav' }]),
+      /optional image/
+    );
   });
 });
 

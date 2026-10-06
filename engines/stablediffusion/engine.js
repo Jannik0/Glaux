@@ -180,16 +180,12 @@ async function runChat(modelId, _thinking, message, options = {}) {
   // Prior turns stay in the session. sd-cli sees only this prompt.
   CONTEXT = [];
 
-  const allowImage = pipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
-  if (audioPaths.length > 0 || videoPaths.length > 0 || (!allowImage && imagePaths.length > 0)) {
-    throw new Error(
-      allowImage
-        ? 'Image-to-image models accept a text prompt and an optional image.'
-        : 'Text-to-image models accept a text prompt only.'
-    );
+  const label = pipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG ? 'Image-to-image' : 'Text-to-image';
+  if (audioPaths.length > 0 || videoPaths.length > 0) {
+    throw new Error(`${label} models accept a text prompt and an optional image.`);
   }
   if (imagePaths.length > 1) {
-    throw new Error('Image-to-image models accept at most one image.');
+    throw new Error(`${label} models accept at most one image.`);
   }
   const prompt = typeof message === 'string' ? message.trim() : '';
   if (!prompt) {
@@ -207,7 +203,8 @@ async function runChat(modelId, _thinking, message, options = {}) {
       signal: abort.signal,
       modelRoot: activeModelRoot || undefined,
       modelsCacheDir,
-      initImage: imagePaths[0] || null,
+      initImage: pipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG ? imagePaths[0] || null : null,
+      referenceImage: pipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG ? null : imagePaths[0] || null,
     });
     cachedUsage.valid = false;
     if (!written) {
