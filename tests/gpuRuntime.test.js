@@ -8,7 +8,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { isForceCpu, withForceCpuTorchEnv, withVendorLibPath, withSharedCudaLibPath, withUnsupportedCudaHidden, selectCudaVisibleDevices, cudaComputeCapabilitySupported, isNoCudaKernelImage } = require('../engines/common/gpuRuntime');
 const { cudaGgmlArchitectureList, keepCudaFatbinImage } = require('../engines/common/cudaArch');
-const { expectedGpuBackends, findBackendModule, findNvcc, isCuda13RedistName, isDroppedCudaDepName, missingSharedCudaRedists, withCudaToolkitEnv, copyFile, collapseDuplicateLibs, collapseDuplicateLibsRecursive, cudaArchitectureCmakeArgs, GGML_CUDA_ARCHITECTURES, shareTorchCuda13WithVendor, shareGgmlCudaBackend, ggmlCudaBackendFileName, which, requirePatchelf, elfNeeded, removeDroppedElfNeeded } = require('../scripts/gpuBackends');
+const { expectedGpuBackends, findBackendModule, findNvcc, isCuda13RedistName, isDroppedCudaDepName, missingSharedCudaRedists, withCudaToolkitEnv, copyFile, collapseDuplicateLibs, collapseDuplicateLibsRecursive, cudaArchitectureCmakeArgs, GGML_CUDA_ARCHITECTURES, shareTorchCuda13WithVendor, shareGgmlCudaBackend, shareGgmlCudaBackends, ggmlCudaBackendFileName, which, requirePatchelf, elfNeeded, removeDroppedElfNeeded } = require('../scripts/gpuBackends');
 const { isStubbedCudaFamilyFile, readPeImportsAndExports, stubTorchUnusedCudaDeps } = require('../scripts/cudaStubs');
 
 describe('gpuRuntime', () => {
@@ -571,7 +571,7 @@ describe('cuda loader stubs', () => {
 });
 
 describe('shareGgmlCudaBackend', () => {
-  it('points transcribe at the llama.cpp CUDA module', () => {
+  it('points one engine at another engine CUDA module', () => {
     const name = ggmlCudaBackendFileName();
     if (!name) {
       return;
@@ -591,6 +591,65 @@ describe('shareGgmlCudaBackend', () => {
         assert.equal(fs.readlinkSync(path.join(transcribe, name)), path.join('..', 'llamacpp', name));
       }
       assert.equal(shareGgmlCudaBackend(llama, transcribe), true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('points llama and transcribe at the stable-diffusion CUDA module', () => {
+    const name = ggmlCudaBackendFileName();
+    if (!name) {
+      return;
+    }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-ggml-share-sd-'));
+    try {
+      const llama = path.join(root, 'llamacpp');
+      const transcribe = path.join(root, 'transcribe');
+      const sd = path.join(root, 'stablediffusion');
+      fs.mkdirSync(llama);
+      fs.mkdirSync(transcribe);
+      fs.mkdirSync(sd);
+      fs.writeFileSync(path.join(llama, name), 'llama-cuda');
+      fs.writeFileSync(path.join(transcribe, name), 'transcribe-cuda');
+      fs.writeFileSync(path.join(sd, name), 'sd-cuda');
+      assert.equal(
+        shareGgmlCudaBackends({ llamacpp: llama, transcribe, stablediffusion: sd }),
+        true
+      );
+      assert.equal(fs.readFileSync(path.join(sd, name), 'utf8'), 'sd-cuda');
+      assert.equal(fs.readFileSync(path.join(llama, name), 'utf8'), 'sd-cuda');
+      assert.equal(fs.readFileSync(path.join(transcribe, name), 'utf8'), 'sd-cuda');
+      if (process.platform !== 'win32') {
+        assert.equal(fs.lstatSync(path.join(llama, name)).isSymbolicLink(), true);
+        assert.equal(fs.readlinkSync(path.join(llama, name)), path.join('..', 'stablediffusion', name));
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('points transcribe at llama.cpp when stable-diffusion has not been built', () => {
+    const name = ggmlCudaBackendFileName();
+    if (!name) {
+      return;
+    }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-ggml-share-fallback-'));
+    try {
+      const llama = path.join(root, 'llamacpp');
+      const transcribe = path.join(root, 'transcribe');
+      fs.mkdirSync(llama);
+      fs.mkdirSync(transcribe);
+      fs.writeFileSync(path.join(llama, name), 'llama-cuda');
+      fs.writeFileSync(path.join(transcribe, name), 'transcribe-cuda');
+      assert.equal(
+        shareGgmlCudaBackends({
+          llamacpp: llama,
+          transcribe,
+          stablediffusion: path.join(root, 'stablediffusion'),
+        }),
+        true
+      );
+      assert.equal(fs.readFileSync(path.join(transcribe, name), 'utf8'), 'llama-cuda');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

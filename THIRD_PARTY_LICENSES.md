@@ -2,9 +2,9 @@
 
 Glaux source code is licensed under the MIT License — see [LICENSE](LICENSE).
 
-A **packaged** Glaux build (installer, zip, dmg, deb, rpm, tar.gz, or unpacked `dist/` tree) also redistributes independently licensed components. Those licenses apply to the corresponding files, not to Glaux source. This notice is shipped next to the app as `THIRD_PARTY_LICENSES.md` (under Electron `extraResources`).
+A **packaged** Glaux build (installer, zip, deb, rpm, tar.gz, dmg, or unpacked `dist/` tree) also redistributes independently licensed components. Those licenses apply to the corresponding files, not to Glaux source. This notice is shipped next to the app as `THIRD_PARTY_LICENSES.md` (under Electron `extraResources`).
 
-Staged third-party binaries are shipped unmodified. On Windows and Linux GPU builds, the NVIDIA NCCL, cuSPARSELt, NVSHMEM, and cuFile libraries are the exception: those binaries are not included. `npm run build:python` compiles tiny loader stubs that keep the original SONAME or DLL name so libtorch still loads. The stubs are Glaux build output, not NVIDIA code and not modified NVIDIA binaries. Hub **model weights** are downloaded by the user at runtime and are **not** part of Glaux; each model remains under its own Hub license (for example Google Gemma terms).
+Staged third-party binaries are shipped unmodified. On Windows and Linux GPU builds, the NVIDIA NCCL, cuSPARSELt, NVSHMEM, and cuFile libraries are the exception: those binaries are not included. `npm run build:python` compiles tiny loader stubs that keep the original SONAME or DLL name so libtorch still loads. The stubs are Glaux build output, not NVIDIA code and not modified NVIDIA binaries. Hub **model weights** are downloaded by the user at runtime and are **not** part of Glaux; each model remains under its own Hub license.
 
 Electron already writes Chromium and Electron license files into the install directory (`LICENSES.chromium.html`, `LICENSE.electron.txt`). Python wheels keep their license texts under `site-packages/*.dist-info`.
 
@@ -19,13 +19,13 @@ Electron already writes Chromium and Electron license files into the install dir
 
 ### transcribe.cpp
 
-- **What:** `transcribe-cli` and ggml backend modules under `vendor/transcribe` (packaged as `resources/transcribe`). The CUDA backend file is a link to llama.cpp’s `libggml-cuda` / `ggml-cuda.dll` in `vendor/llamacpp`. Vulkan and the other backends are the transcribe.cpp build.
-- **License:** MIT (the shared CUDA module is the llama.cpp binary, also MIT)
+- **What:** `transcribe-cli` and ggml backend modules under `vendor/transcribe` (packaged as `resources/transcribe`). The CUDA backend file is a link to stable-diffusion.cpp’s `libggml-cuda` / `ggml-cuda.dll` when that engine is packaged, otherwise to the llama.cpp copy. Vulkan and the other backends are the transcribe.cpp build.
+- **License:** MIT
 - **Upstream:** https://github.com/handy-computer/transcribe.cpp
 
 ### stable-diffusion.cpp
 
-- **What:** `sd-cli` and ggml backend modules under `vendor/stablediffusion` (packaged as `resources/stablediffusion`). CUDA runtime libraries are the shared copies in `vendor/cuda`. The ggml CUDA fatbin is this build’s own file, not a link to llama.cpp: stable-diffusion.cpp sets `GGML_MAX_NAME=160`, which changes the ggml tensor layout versus llama.cpp and transcribe.cpp (default 64).
+- **What:** `sd-cli` and ggml backend modules under `vendor/stablediffusion` (packaged as `resources/stablediffusion`). CUDA runtime libraries are the shared copies in `vendor/cuda`. This build’s ggml CUDA fatbin is the canonical module. llama.cpp and transcribe.cpp are compiled with the same `GGML_MAX_NAME=160` and link their CUDA file at this one.
 - **License:** MIT
 - **Upstream:** https://github.com/leejet/stable-diffusion.cpp (ggml submodule https://github.com/ggml-org/ggml, also MIT)
 
@@ -33,7 +33,7 @@ Electron already writes Chromium and Electron license files into the install dir
 ## FFmpeg / ffprobe / dav1d
 
 - **What:** shared `ffmpeg` and `ffprobe` plus `libav*` / `libdav1d` under `vendor/ffmpeg` (packaged as `resources/ffmpeg`), built by `npm run build:ffmpeg` from FFmpeg **7.1.1** and dav1d **1.5.1**
-- **How Glaux uses them:** as **separate processes** (not linked into the Glaux executable). llama.cpp, transcribe.cpp, and the Hugging Face worker all spawn these binaries. Text-to-image does not.
+- **How Glaux uses them:** as **separate processes** (not linked into the Glaux executable). llama.cpp, transcribe.cpp, and the Hugging Face worker all spawn these binaries.
 - **License:** FFmpeg is **LGPL 2.1 or later** in this decode-only shared build (no libx264/libx265 or other GPL-only encoders). dav1d is **BSD-2-Clause**. License texts are staged next to the binaries (`COPYING.LGPLv2.1`, `DAV1D.COPYING`).
 - **Upstream source:** https://ffmpeg.org (tag `n7.1.1`) and https://code.videolan.org/videolan/dav1d (tag `1.5.1`). Configure flags live in `scripts/build-ffmpeg.js`.
 
@@ -57,7 +57,7 @@ The NVIDIA NCCL, cuSPARSELt, NVSHMEM, and cuFile binaries are not shipped. On Wi
 
 - **CPython** from [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (PSF License for CPython; see that project for packaging terms)
 - **PyTorch** / **TorchVision** — BSD-style license (https://github.com/pytorch/pytorch)
-- **Hugging Face Transformers**, **Diffusers**, **huggingface_hub**, **Accelerate**, **safetensors**, and related Hub client libraries — Apache License 2.0. Diffusers is pinned to commit `c2798cc7859f258c6cfc5b2460e82b6cac71f235` (0.41.0.dev0) so safetensors text-to-image can load pipeline classes published after the last numbered release.
+- **Hugging Face Transformers**, **Diffusers**, **huggingface_hub**, **Accelerate**, **safetensors**, and related Hub client libraries — Apache License 2.0.
 - Other pinned packages from `engines/huggingface/requirements.txt` and their transitive dependencies — licenses are in each wheel’s `*.dist-info`
 
 The Hugging Face engine also uses **DOMPurify**, **marked**, and **pdf-parse** from the Electron `package.json` (Apache-2.0 / MPL-2.0, MIT, and MIT respectively) for renderer-side HTML sanitization, markdown, and PDF text extraction.
@@ -71,4 +71,4 @@ The Hugging Face engine also uses **DOMPurify**, **marked**, and **pdf-parse** f
 
 ## Vulkan / Metal / MPS
 
-Glaux does not ship the Vulkan or Metal drivers. ggml Vulkan/Metal backends come from llama.cpp / transcribe.cpp / stable-diffusion.cpp (MIT). PyTorch MPS uses Apple’s system frameworks. Diffusers text-to-image on Apple Silicon uses that same MPS path.
+Glaux does not ship the Vulkan or Metal drivers. ggml Vulkan/Metal backends come from llama.cpp / transcribe.cpp / stable-diffusion.cpp (MIT). PyTorch MPS uses Apple’s system frameworks. Diffusers on Apple Silicon uses that same MPS path.

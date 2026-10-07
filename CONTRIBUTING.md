@@ -27,8 +27,8 @@ These are on the roadmap. Please open an issue before starting a large implement
 Follow [Development setup](README.md#development-setup) in the README (`npm install`, Python or `npm run build:python`, optional native engines). Then:
 
 ```bash
-npm start
 npm test
+npm start
 ```
 
 Windows and Linux are tested platforms. macOS still needs validation. GPU backends are compiled into the vendor trees at build time; end users only need a driver.
@@ -49,8 +49,8 @@ There is no CLA. By contributing you agree the work is licensed under the projec
 
 ## Scope notes
 
-- Inference stays on the user’s machine. Do not add telemetry or cloud inference as a default path.
-- Packaged Windows NSIS installers and Linux DEB and RPM packages must stay under GitHub’s **2 GiB** per-file limit. Size-sensitive Python/native cuts belong in `build:python` / `build:ffmpeg` / `build:llamacpp` / `build:transcribe`, not extra shrink scripts or one-off copies in `dist/`.
-- llama.cpp and transcribe.cpp are **pinned clones** in `deps/` (gitignored). Prefer Glaux-side engine bridges and build scripts over vendoring a full fork unless the change truly belongs upstream.
+- Inference stays on the user’s machine. Do not add telemetry or cloud inference.
+- Packaged Windows NSIS installers and Linux DEB and RPM packages must stay under GitHub’s **2 GiB** per-file limit. Size-sensitive Python/native cuts belong in the existing build scripts, not extra shrink scripts or one-off copies in `dist/`.
+- GGUF engines are **pinned clones** in `deps/` (gitignored). Prefer Glaux-side engine bridges and build scripts over vendoring a full fork unless the change truly belongs upstream.
 
 Questions about a change are fine as an issue before you invest in a large PR.

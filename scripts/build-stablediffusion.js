@@ -5,13 +5,13 @@
  * Build sd-cli from deps/stable-diffusion.cpp into vendor/stablediffusion with
  * dynamic ggml backends (CPU + CUDA/Vulkan on Win/Linux, CPU + Metal on macOS).
  *
- * stable-diffusion.cpp 47e83d71 ("sync: update ggml"). Its ggml submodule is
- * 4e86b56f, eight commits ahead of and zero behind ggml 353b63b — the snapshot
- * vendored by llama.cpp b11256 (c85b92c) and transcribe.cpp 4807edaf. Same
- * lineage, not the identical commit. This tree defines GGML_MAX_NAME=160
- * (diffusion tensor names exceed ggml's default of 64), so libggml-cuda is not
- * ABI-compatible with llama/transcribe and is not shared. CUDA runtime
- * libraries (cudart/cublas) still go to vendor/cuda.
+ * stable-diffusion.cpp master-945 (a1ded76). Its ggml submodule is 89c4413.
+ * That commit keeps GGML_BACKEND_API_VERSION 2, the same loader header as
+ * llama.cpp b11349 and transcribe.cpp v0.3.1, and adds the diffusion ops
+ * those trees do not have. This build sets GGML_MAX_NAME=160. llama.cpp and
+ * transcribe.cpp are compiled with the same name size, and their ggml-cuda
+ * files link at the module staged here. CUDA runtime libraries (cudart/cublas)
+ * still go to vendor/cuda.
  *
  * One-shot CLI. One name-conversion patch maps a Hugging Face text encoder's
  * `embed_tokens` weight onto the tensor name sd-cli already expects.
@@ -36,6 +36,7 @@ const {
   cmakeBuildQuietArgs,
   cudaBuildJobs,
   stageNativeRuntime,
+  shareGgmlCudaBackends,
   stageSharedCudaRuntime,
   removeStagedCudaRedistributables,
   withCudaToolkitEnv,
@@ -49,9 +50,9 @@ const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SRC = path.join(ROOT, 'deps', 'stable-diffusion.cpp');
 const DEFAULT_OUT = path.join(ROOT, 'vendor', 'stablediffusion');
 const SD_CPP_REPO = 'https://github.com/leejet/stable-diffusion.cpp';
-const SD_CPP_REV = '47e83d713618cffcae4449d4fcc712e9005b8549';
+const SD_CPP_REV = 'a1ded76da5818803fca97a3b433669ef727d32cf';
 const GGML_REPO = 'https://github.com/ggml-org/ggml';
-const GGML_REV = '4e86b56f1658203d7f403a3ab8b5da852d7f6cd0';
+const GGML_REV = '89c4413f5da6fb20cc796f16033d37f129be81fd';
 
 function printHelp() {
   console.log(`Usage: node scripts/build-stablediffusion.js [options]
@@ -261,9 +262,15 @@ function main() {
     pruneCudaFatbinsInTree(opts.outDir);
   }
 
+  shareGgmlCudaBackends({
+    llamacpp: path.join(ROOT, 'vendor', 'llamacpp'),
+    transcribe: path.join(ROOT, 'vendor', 'transcribe'),
+    stablediffusion: opts.outDir,
+  });
+
   console.log('stable-diffusion.cpp build complete.');
   console.log(
-    'ggml-cuda is kept next to sd-cli (GGML_MAX_NAME=160). It is not linked to the llama.cpp CUDA backend.'
+    'ggml-cuda next to sd-cli is the shared CUDA module (GGML_MAX_NAME=160).'
   );
 }
 

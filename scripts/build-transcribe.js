@@ -5,6 +5,8 @@
  * Build transcribe-cli from deps/transcribe.cpp into vendor/transcribe with
  * dynamic ggml backends (CPU + CUDA/Vulkan on Win/Linux, CPU + Metal on macOS).
  * Clones handy-computer/transcribe.cpp at TRANSCRIBE_CPP_REV into deps/ if missing.
+ * GGML_MAX_NAME=160 matches stable-diffusion.cpp. The CUDA module links at
+ * vendor/stablediffusion when that build exists, otherwise at llama.cpp.
  *
  * Usage:
  *   node scripts/build-transcribe.js
@@ -27,7 +29,8 @@ const {
   cudaBuildJobs,
   stageNativeRuntime,
   stageSharedCudaRuntime,
-  shareGgmlCudaBackend,
+  shareGgmlCudaBackends,
+  ggmlMaxNameCmakeArgs,
   removeStagedCudaRedistributables,
   withCudaToolkitEnv,
   which,
@@ -40,8 +43,9 @@ const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SRC = path.join(ROOT, 'deps', 'transcribe.cpp');
 const DEFAULT_OUT = path.join(ROOT, 'vendor', 'transcribe');
 const TRANSCRIBE_CPP_REPO = 'https://github.com/handy-computer/transcribe.cpp';
-// Release v0.2.4. Same upstream ggml (353b63b) as llama.cpp, so the shared CUDA backend matches.
-const TRANSCRIBE_CPP_REV = '4807edaf210d0d7e8a6f7fb2a44b65966a2797f0';
+// Release v0.3.1. Same ggml backend ABI (API version 2) as llama.cpp b11349
+// and stable-diffusion.cpp's ggml 89c4413.
+const TRANSCRIBE_CPP_REV = '3f32fbcc7bb3246851a0234263438bc3c0fa1cac';
 
 function printHelp() {
   console.log(`Usage: node scripts/build-transcribe.js [options]
@@ -293,6 +297,7 @@ function main() {
     '-DTRANSCRIBE_BUILD_EXAMPLES=ON',
     '-DTRANSCRIBE_BUILD_TOOLS=OFF',
     ...cmakeGpuArgs('transcribe', backends),
+    ...ggmlMaxNameCmakeArgs(),
     ...cudaCompilerCmakeArgs(backends),
     ...cudaArchitectureCmakeArgs(backends),
     ...rpathCmakeArgs(),
@@ -339,7 +344,11 @@ function main() {
     stageSharedCudaRuntime({ required: true });
     pruneCudaFatbinsInTree(opts.outDir);
   }
-  shareGgmlCudaBackend(path.join(ROOT, 'vendor', 'llamacpp'), opts.outDir);
+  shareGgmlCudaBackends({
+    llamacpp: path.join(ROOT, 'vendor', 'llamacpp'),
+    transcribe: opts.outDir,
+    stablediffusion: path.join(ROOT, 'vendor', 'stablediffusion'),
+  });
 
   console.log('transcribe.cpp build complete.');
 }

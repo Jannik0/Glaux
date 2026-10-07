@@ -14,7 +14,7 @@ const pruneElectronLocales = require('./prune-electron-locales');
 const {
   collapseDuplicateLibsRecursive,
   finishStagedNativeDir,
-  shareGgmlCudaBackend,
+  shareGgmlCudaBackends,
   shareTorchCuda13WithVendor,
 } = require('./gpuBackends');
 
@@ -46,7 +46,11 @@ module.exports = async function afterPack(context) {
     finishStagedNativeDir(path.join(resources, name), { strip: false });
   }
   if (context.electronPlatformName !== 'darwin') {
-    shareGgmlCudaBackend(path.join(resources, 'llamacpp'), path.join(resources, 'transcribe'));
+    shareGgmlCudaBackends({
+      llamacpp: path.join(resources, 'llamacpp'),
+      transcribe: path.join(resources, 'transcribe'),
+      stablediffusion: path.join(resources, 'stablediffusion'),
+    });
   }
 
   const python = path.join(resources, 'python');

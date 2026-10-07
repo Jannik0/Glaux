@@ -805,6 +805,21 @@ function cmakeGpuArgs(kind, backends) {
 }
 
 /**
+ * Compile llama.cpp and transcribe.cpp with the same tensor-name size as
+ * stable-diffusion.cpp. CMAKE_PROJECT_INCLUDE runs at the end of project(),
+ * before ggml is added, so the definition covers the host library and the
+ * CUDA module. CMake 3.15 or newer is required for that hook.
+ * @returns {string[]}
+ */
+function ggmlMaxNameCmakeArgs() {
+  const file = path.join(__dirname, 'ggmlMaxName.cmake').replace(/\\/g, '/');
+  if (process.platform === 'win32') {
+    return [`-DCMAKE_PROJECT_INCLUDE="${file}"`];
+  }
+  return [`-DCMAKE_PROJECT_INCLUDE=${file}`];
+}
+
+/**
  * Point cmake at nvcc when it is not on PATH (typical Debian CUDA layout).
  * Skipped on Windows: spawnSync({shell:true}) concatenates unquoted args, and
  * "Program Files" in the nvcc path would split. PATH injection is enough there.
@@ -1459,24 +1474,23 @@ function ggmlCudaBackendFileName(platform = process.platform) {
 }
 
 /**
- * Keep one ggml CUDA fatbin. llama.cpp's module is the canonical copy;
- * transcribe.cpp's directory gets a relative symlink (hard link if Windows
- * cannot create a symlink) so both CLIs still load `ggml-cuda` from their
- * own folder. Vulkan modules stay per engine: they compress to a few MB.
- * No-op when either side has not been built yet.
+ * Point destDir's ggml-cuda at the real file in sourceDir. Each engine still
+ * loads `ggml-cuda` from its own folder. A relative symlink is used, or a
+ * hard link when Windows cannot create a symlink. No-op when the source is
+ * missing or is itself a link.
  *
- * @param {string} llamaDir vendor/llamacpp or resources/llamacpp
- * @param {string} transcribeDir vendor/transcribe or resources/transcribe
+ * @param {string} sourceDir directory that holds the canonical module
+ * @param {string} destDir directory whose copy is replaced
  * @returns {boolean}
  */
-function shareGgmlCudaBackend(llamaDir, transcribeDir) {
+function shareGgmlCudaBackend(sourceDir, destDir) {
   const name = ggmlCudaBackendFileName();
-  if (!name || !llamaDir || !transcribeDir) {
+  if (!name || !sourceDir || !destDir || path.resolve(sourceDir) === path.resolve(destDir)) {
     return false;
   }
-  const source = path.join(llamaDir, name);
-  const dest = path.join(transcribeDir, name);
-  if (!fs.existsSync(transcribeDir) || !fs.existsSync(source)) {
+  const source = path.join(sourceDir, name);
+  const dest = path.join(destDir, name);
+  if (!fs.existsSync(destDir) || !fs.existsSync(source)) {
     return false;
   }
   let sourceStat;
@@ -1489,7 +1503,7 @@ function shareGgmlCudaBackend(llamaDir, transcribeDir) {
     return false;
   }
 
-  const rel = path.relative(transcribeDir, source);
+  const rel = path.relative(destDir, source);
   try {
     if (fs.lstatSync(dest).isSymbolicLink() && fs.readlinkSync(dest) === rel) {
       return true;
@@ -1508,6 +1522,44 @@ function shareGgmlCudaBackend(llamaDir, transcribeDir) {
   }
   console.log(`Shared ggml CUDA backend ${name} -> ${rel}`);
   return true;
+}
+
+/**
+ * One ggml CUDA fatbin for llama.cpp, transcribe.cpp, and stable-diffusion.cpp.
+ * stable-diffusion.cpp's module is canonical when it is a real file: it is
+ * built with GGML_MAX_NAME=160 and includes the diffusion kernels. The other
+ * two engines are built with that same name size and link at this file.
+ * Until sd-cli has been built, transcribe.cpp links at llama.cpp's module.
+ * Vulkan stays per engine.
+ *
+ * @param {{ llamacpp?: string, transcribe?: string, stablediffusion?: string }} dirs
+ * @returns {boolean}
+ */
+function shareGgmlCudaBackends(dirs) {
+  const sdDir = dirs && dirs.stablediffusion;
+  const llamaDir = dirs && dirs.llamacpp;
+  const transcribeDir = dirs && dirs.transcribe;
+  const name = ggmlCudaBackendFileName();
+  if (!name) {
+    return false;
+  }
+  const sdFile = sdDir && path.join(sdDir, name);
+  let sdIsReal = false;
+  try {
+    const st = fs.lstatSync(sdFile);
+    sdIsReal = st.isFile() && !st.isSymbolicLink();
+  } catch {
+    sdIsReal = false;
+  }
+  if (sdIsReal) {
+    const llama = llamaDir ? shareGgmlCudaBackend(sdDir, llamaDir) : false;
+    const transcribe = transcribeDir ? shareGgmlCudaBackend(sdDir, transcribeDir) : false;
+    return llama || transcribe;
+  }
+  if (llamaDir && transcribeDir) {
+    return shareGgmlCudaBackend(llamaDir, transcribeDir);
+  }
+  return false;
 }
 
 module.exports = {
@@ -1537,6 +1589,7 @@ module.exports = {
   resolveBuildBackends,
   cmakeGpuArgs,
   cudaCompilerCmakeArgs,
+  ggmlMaxNameCmakeArgs,
   cudaArchitectureCmakeArgs,
   GGML_CUDA_ARCHITECTURES,
   rpathCmakeArgs,
@@ -1564,4 +1617,5 @@ module.exports = {
   findSharedCudaMatch,
   ggmlCudaBackendFileName,
   shareGgmlCudaBackend,
+  shareGgmlCudaBackends,
 };
