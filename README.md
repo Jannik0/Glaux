@@ -269,7 +269,7 @@ Packaging uses **electron-builder** plus:
 - shared **ffmpeg + ffprobe** (LGPL, plus dav1d) under `vendor/ffmpeg`
 - `llama-server` with **dynamic ggml backends** under `vendor/llamacpp` built from `deps/llama.cpp`
 - `transcribe-cli` with the same dynamic backends under `vendor/transcribe` built from `deps/transcribe.cpp`.
-- `sd-cli` with dynamic backends under `vendor/stablediffusion` built from `deps/stable-diffusion.cpp`. CUDA runtime libraries are shared via `vendor/cuda`. The ggml CUDA fatbin next to `sd-cli` is the canonical copy: all three engines compile ggml with `GGML_MAX_NAME=160`, and llama.cpp and transcribe.cpp link their CUDA module at this file. It includes the diffusion kernels. Vulkan and Metal stay next to each engine.
+- `sd-cli` with dynamic backends under `vendor/stablediffusion` built from `deps/stable-diffusion.cpp`. CUDA runtime libraries and the one shared `ggml-cuda` / `libggml-cuda` module live in `vendor/cuda`. All three engines compile ggml with `GGML_MAX_NAME=160` and load that module from the sibling `cuda` directory. It includes the diffusion kernels. Vulkan and Metal stay next to each engine.
 
 The packaged app is larger than a CPU-only build (CUDA Torch and CUDA redistributables). End users do not install the CUDA Toolkit or Vulkan SDK.
 
@@ -309,7 +309,7 @@ Requires **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Wi
 npm run build:llamacpp
 ```
 
-This clones [llama.cpp](https://github.com/ggml-org/llama.cpp) at the pinned revision in `scripts/build-llamacpp.js` into `deps/llama.cpp` if that directory is missing, configures CMake with `GGML_BACKEND_DL` and `GGML_MAX_NAME=160`, and enables CUDA+Vulkan (Windows/Linux) or Metal (macOS), builds `llama-server`, stages backend modules into `vendor/llamacpp/`, and stages CUDA 13 runtime libraries into the shared `vendor/cuda/` folder. CUDA kernels are compiled for Turing through Blackwell consumer GPUs (`75-real` … `120`) rather than the toolkit’s default fat arch list. The same list is applied to prebuilt CUDA libraries when they are staged. At runtime, NVIDIA GPUs outside that list are hidden from CUDA so Vulkan can run them, and a “no kernel image” launch failure retries once on Vulkan. Video decode uses `vendor/ffmpeg` (see above).
+This clones [llama.cpp](https://github.com/ggml-org/llama.cpp) at the pinned revision in `scripts/build-llamacpp.js` into `deps/llama.cpp` if that directory is missing, configures CMake with `GGML_BACKEND_DL` and `GGML_MAX_NAME=160`, and enables CUDA+Vulkan (Windows/Linux) or Metal (macOS), builds `llama-server`, stages backend modules into `vendor/llamacpp/`, and stages CUDA 13 runtime libraries into the shared `vendor/cuda/` folder. The ggml CUDA module is not left next to `llama-server`; the loader also scans `../cuda`. CUDA kernels are compiled for Turing through Blackwell consumer GPUs (`75-real` … `120`) rather than the toolkit’s default fat arch list. The same list is applied to prebuilt CUDA libraries when they are staged. At runtime, NVIDIA GPUs outside that list are hidden from CUDA so Vulkan can run them, and a “no kernel image” launch failure retries once on Vulkan. Video decode uses `vendor/ffmpeg` (see above).
 
 Local CPU-only iteration (not packagable):
 
@@ -323,7 +323,7 @@ node scripts/build-llamacpp.js --cpu-only
 npm run build:transcribe
 ```
 
-This clones [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) at the pinned revision in `scripts/build-transcribe.js` into `deps/transcribe.cpp` if that directory is missing, configures CMake with `TRANSCRIBE_GGML_BACKEND_DL`, `GGML_MAX_NAME=160`, and the same per-OS GPU backends and CUDA architecture list as llama.cpp, builds `transcribe-cli`, and stages it plus backend modules into `vendor/transcribe/` (CUDA runtime libraries go to `vendor/cuda/`). Its CUDA module is then linked at the stable-diffusion.cpp copy when that file exists, otherwise at the llama.cpp copy.
+This clones [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) at the pinned revision in `scripts/build-transcribe.js` into `deps/transcribe.cpp` if that directory is missing, configures CMake with `TRANSCRIBE_GGML_BACKEND_DL`, `GGML_MAX_NAME=160`, and the same per-OS GPU backends and CUDA architecture list as llama.cpp, builds `transcribe-cli`, and stages it plus backend modules into `vendor/transcribe/` (CUDA runtime libraries and the shared ggml CUDA module go to `vendor/cuda/`). That module is the stable-diffusion.cpp build when it exists, otherwise llama.cpp's. The loader scans `../cuda` in addition to the directory that contains `transcribe-cli`.
 
 Local CPU-only iteration (not packagable):
 
@@ -337,7 +337,7 @@ node scripts/build-transcribe.js --cpu-only
 npm run build:stablediffusion
 ```
 
-This clones [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) at the pinned revision in `scripts/build-stablediffusion.js` into `deps/stable-diffusion.cpp` if that directory is missing, then clones the matching [ggml](https://github.com/ggml-org/ggml) commit into `deps/stable-diffusion.cpp/ggml`. That ggml commit uses the same backend loader header as llama.cpp b11349 and transcribe.cpp v0.3.1 (`GGML_BACKEND_API_VERSION` 2) and adds the diffusion ops. CMake builds a shared `sd-cli` with dynamic backends (CUDA+Vulkan on Windows/Linux, Metal on macOS), `GGML_MAX_NAME=160`, the same CUDA architecture list as llama.cpp, and stages them into `vendor/stablediffusion/`. CUDA runtime libraries go to `vendor/cuda/`. The ggml CUDA fatbin next to `sd-cli` is the shared module, and the llama.cpp and transcribe.cpp copies are replaced with links to it. WebP and WebM output are off so those submodules are not required.
+This clones [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) at the pinned revision in `scripts/build-stablediffusion.js` into `deps/stable-diffusion.cpp` if that directory is missing, then clones the matching [ggml](https://github.com/ggml-org/ggml) commit into `deps/stable-diffusion.cpp/ggml`. That ggml commit uses the same backend loader header as llama.cpp b11349 and transcribe.cpp v0.3.1 (`GGML_BACKEND_API_VERSION` 2) and adds the diffusion ops. CMake builds a shared `sd-cli` with dynamic backends (CUDA+Vulkan on Windows/Linux, Metal on macOS), `GGML_MAX_NAME=160`, the same CUDA architecture list as llama.cpp, and stages them into `vendor/stablediffusion/`. CUDA runtime libraries go to `vendor/cuda/`. The ggml CUDA fatbin is then moved to `vendor/cuda`, and the copies next to llama.cpp, transcribe.cpp, and `sd-cli` are removed. Each engine loads it from `../cuda`. WebP and WebM output are off so those submodules are not required.
 
 Local CPU-only iteration (not packagable):
 
@@ -381,9 +381,9 @@ Target a specific platform from a matching host (cross-compilation of `vendor/py
 - `engines/huggingface/*.py` plus `worker/**/*.py` and the full `vendor/python` tree as `extraResources`
 - `vendor/cuda` (shared CUDA 13 runtime libraries) as `extraResources` on Windows and Linux; overlapping Torch `nvidia/cu13` copies are links into this folder
 - `vendor/ffmpeg` (`ffmpeg` + `ffprobe` + shared libav/dav1d) as `extraResources`
-- `vendor/llamacpp` (`llama-server` + ggml backend modules) as `extraResources`; its CUDA backend file is a link to the shared ggml-cuda module
-- `vendor/transcribe` (`transcribe-cli` + ggml backend modules) as `extraResources`; its CUDA backend file is a link to the shared ggml-cuda module
-- `vendor/stablediffusion` (`sd-cli` + ggml backend modules) as `extraResources`; its ggml CUDA fatbin is the shared copy (`GGML_MAX_NAME=160`)
+- `vendor/llamacpp` (`llama-server` + ggml backend modules) as `extraResources`; its CUDA backend is the shared module in `vendor/cuda`
+- `vendor/transcribe` (`transcribe-cli` + ggml backend modules) as `extraResources`; its CUDA backend is the shared module in `vendor/cuda`
+- `vendor/stablediffusion` (`sd-cli` + ggml backend modules) as `extraResources`; the ggml CUDA fatbin (`GGML_MAX_NAME=160`) is the shared module in `vendor/cuda`
 - Models are **not** bundled; users download them at runtime into `<appData>/Glaux/Models`
 - `LICENSE` and `THIRD_PARTY_LICENSES.md` (ffmpeg, CUDA redistributables, Electron/Chromium, llama.cpp, transcribe.cpp, stable-diffusion.cpp, PyTorch / Transformers / Diffusers)
 
@@ -417,11 +417,11 @@ Glaux/
     stable-diffusion.cpp/         # Pinned source for sd-cli (ggml submodule cloned beside it)
   vendor/                         # Generated (gitignored)
     python/                       # Bundled CPython + PyTorch / Transformers + Diffusers
-    cuda/                         # Shared CUDA 13 runtime (Win/Linux)
+    cuda/                         # Shared CUDA 13 runtime and ggml-cuda (Win/Linux)
     ffmpeg/                       # Shared ffmpeg + ffprobe + libav/dav1d
     llamacpp/                     # llama-server + GPU backends
     transcribe/                   # transcribe-cli + GPU backends
-    stablediffusion/              # sd-cli + GPU backends (canonical ggml-cuda)
+    stablediffusion/              # sd-cli + GPU backends (ggml-cuda lives in cuda/)
   dist/                           # Generated (gitignored) — installers / archives
 ```
 
@@ -439,7 +439,7 @@ Glaux/
 | `npm run build:ffmpeg`                         | Build shared ffmpeg + ffprobe + dav1d into `vendor/ffmpeg` |
 | `npm run build:llamacpp`                       | Build `llama-server` + GPU backends into `vendor/llamacpp` (CUDA redists → `vendor/cuda`) |
 | `npm run build:transcribe`                     | Build `transcribe-cli` + GPU backends into `vendor/transcribe` (CUDA redists → `vendor/cuda`) |
-| `npm run build:stablediffusion`                | Build `sd-cli` + GPU backends into `vendor/stablediffusion` (CUDA redists → `vendor/cuda`; ggml-cuda is the shared copy) |
+| `npm run build:stablediffusion`                | Build `sd-cli` + GPU backends into `vendor/stablediffusion` (CUDA redists and ggml-cuda → `vendor/cuda`) |
 | `npm run dist`                                 | Package for the current OS                           |
 | `npm run dist:dir`                             | Unpacked app only (current OS)                       |
 | `npm run dist:win` / `dist:linux` / `dist:mac` | Package for a specific OS                            |

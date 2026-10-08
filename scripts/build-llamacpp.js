@@ -10,9 +10,9 @@
  * CUDA kernels use a pinned architecture list (Turing–Blackwell) from
  * gpuBackends.cudaArchitectureCmakeArgs rather than the toolkit default.
  * GGML_MAX_NAME=160 matches stable-diffusion.cpp so the three engines can
- * share one ggml-cuda module. That module is stable-diffusion.cpp's copy
- * when vendor/stablediffusion has been built; otherwise transcribe.cpp
- * links at this build.
+ * load one ggml-cuda module from vendor/cuda. That module is
+ * stable-diffusion.cpp's copy when it has been built; otherwise llama.cpp's.
+ * The loader also scans ../cuda. Vulkan stays next to this binary.
  *
  * Usage:
  *   node scripts/build-llamacpp.js
@@ -35,7 +35,8 @@ const {
   cudaBuildJobs,
   stageNativeRuntime,
   stageSharedCudaRuntime,
-  shareGgmlCudaBackends,
+  stageSharedGgmlCudaBackend,
+  patchGlauxCudaBackendSearch,
   ggmlMaxNameCmakeArgs,
   removeStagedCudaRedistributables,
   withCudaToolkitEnv,
@@ -148,6 +149,7 @@ function main() {
     throw new Error('cmake not found on PATH. Install CMake to build llama.cpp.');
   }
   requirePatchelf();
+  patchGlauxCudaBackendSearch(path.join(opts.srcDir, 'ggml', 'src', 'ggml-backend-reg.cpp'));
 
   const buildDir = path.join(opts.srcDir, 'build-glaux');
   fs.mkdirSync(opts.outDir, { recursive: true });
@@ -217,7 +219,7 @@ function main() {
     stageSharedCudaRuntime({ required: true });
     pruneCudaFatbinsInTree(opts.outDir);
   }
-  shareGgmlCudaBackends({
+  stageSharedGgmlCudaBackend({
     llamacpp: opts.outDir,
     transcribe: path.join(ROOT, 'vendor', 'transcribe'),
     stablediffusion: path.join(ROOT, 'vendor', 'stablediffusion'),

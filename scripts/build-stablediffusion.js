@@ -8,10 +8,11 @@
  * stable-diffusion.cpp master-945 (a1ded76). Its ggml submodule is 89c4413.
  * That commit keeps GGML_BACKEND_API_VERSION 2, the same loader header as
  * llama.cpp b11349 and transcribe.cpp v0.3.1, and adds the diffusion ops
- * those trees do not have. This build sets GGML_MAX_NAME=160. llama.cpp and
- * transcribe.cpp are compiled with the same name size, and their ggml-cuda
- * files link at the module staged here. CUDA runtime libraries (cudart/cublas)
- * still go to vendor/cuda.
+ * those trees do not have. This build sets GGML_MAX_NAME=160. The ggml-cuda
+ * module staged here is copied to vendor/cuda, and the copies next to each
+ * engine are removed. llama.cpp and transcribe.cpp load that file from
+ * ../cuda. CUDA runtime libraries (cudart/cublas) live in the same folder.
+ * Vulkan stays next to this binary.
  *
  * One-shot CLI. One name-conversion patch maps a Hugging Face text encoder's
  * `embed_tokens` weight onto the tensor name sd-cli already expects.
@@ -36,7 +37,8 @@ const {
   cmakeBuildQuietArgs,
   cudaBuildJobs,
   stageNativeRuntime,
-  shareGgmlCudaBackends,
+  stageSharedGgmlCudaBackend,
+  patchGlauxCudaBackendSearch,
   stageSharedCudaRuntime,
   removeStagedCudaRedistributables,
   withCudaToolkitEnv,
@@ -183,6 +185,7 @@ function main() {
 
   ensureSources(opts.srcDir);
   patchLlmEmbedTokens(opts.srcDir);
+  patchGlauxCudaBackendSearch(path.join(opts.srcDir, 'ggml', 'src', 'ggml-backend-reg.cpp'));
   if (!which('cmake')) {
     throw new Error('cmake not found on PATH. Install CMake to build stable-diffusion.cpp.');
   }
@@ -262,16 +265,14 @@ function main() {
     pruneCudaFatbinsInTree(opts.outDir);
   }
 
-  shareGgmlCudaBackends({
+  stageSharedGgmlCudaBackend({
     llamacpp: path.join(ROOT, 'vendor', 'llamacpp'),
     transcribe: path.join(ROOT, 'vendor', 'transcribe'),
     stablediffusion: opts.outDir,
   });
 
   console.log('stable-diffusion.cpp build complete.');
-  console.log(
-    'ggml-cuda next to sd-cli is the shared CUDA module (GGML_MAX_NAME=160).'
-  );
+  console.log('ggml-cuda is staged in vendor/cuda (GGML_MAX_NAME=160).');
 }
 
 try {

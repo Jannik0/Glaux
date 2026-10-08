@@ -5,8 +5,10 @@
  * Build transcribe-cli from deps/transcribe.cpp into vendor/transcribe with
  * dynamic ggml backends (CPU + CUDA/Vulkan on Win/Linux, CPU + Metal on macOS).
  * Clones handy-computer/transcribe.cpp at TRANSCRIBE_CPP_REV into deps/ if missing.
- * GGML_MAX_NAME=160 matches stable-diffusion.cpp. The CUDA module links at
- * vendor/stablediffusion when that build exists, otherwise at llama.cpp.
+ * GGML_MAX_NAME=160 matches stable-diffusion.cpp. The CUDA module is staged
+ * into vendor/cuda (stable-diffusion.cpp's build when that exists, otherwise
+ * this one or llama.cpp's). The loader also scans ../cuda. Vulkan stays
+ * next to this binary.
  *
  * Usage:
  *   node scripts/build-transcribe.js
@@ -29,7 +31,8 @@ const {
   cudaBuildJobs,
   stageNativeRuntime,
   stageSharedCudaRuntime,
-  shareGgmlCudaBackends,
+  stageSharedGgmlCudaBackend,
+  patchGlauxCudaBackendSearch,
   ggmlMaxNameCmakeArgs,
   removeStagedCudaRedistributables,
   withCudaToolkitEnv,
@@ -276,6 +279,7 @@ function main() {
   requirePatchelf();
 
   applyGlauxCliPatches(opts.srcDir);
+  patchGlauxCudaBackendSearch(path.join(opts.srcDir, 'ggml', 'src', 'ggml-backend-reg.cpp'));
 
   const buildDir = path.join(opts.srcDir, 'build-glaux');
   fs.mkdirSync(opts.outDir, { recursive: true });
@@ -344,7 +348,7 @@ function main() {
     stageSharedCudaRuntime({ required: true });
     pruneCudaFatbinsInTree(opts.outDir);
   }
-  shareGgmlCudaBackends({
+  stageSharedGgmlCudaBackend({
     llamacpp: path.join(ROOT, 'vendor', 'llamacpp'),
     transcribe: opts.outDir,
     stablediffusion: path.join(ROOT, 'vendor', 'stablediffusion'),

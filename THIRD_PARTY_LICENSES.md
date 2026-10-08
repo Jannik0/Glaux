@@ -19,13 +19,13 @@ Electron already writes Chromium and Electron license files into the install dir
 
 ### transcribe.cpp
 
-- **What:** `transcribe-cli` and ggml backend modules under `vendor/transcribe` (packaged as `resources/transcribe`). The CUDA backend file is a link to stable-diffusion.cpp’s `libggml-cuda` / `ggml-cuda.dll` when that engine is packaged, otherwise to the llama.cpp copy. Vulkan and the other backends are the transcribe.cpp build.
+- **What:** `transcribe-cli` and ggml backend modules under `vendor/transcribe` (packaged as `resources/transcribe`). The CUDA backend file is the shared `libggml-cuda` / `ggml-cuda.dll` in `vendor/cuda` (stable-diffusion.cpp’s build when that engine is packaged, otherwise the llama.cpp copy). Vulkan and the other backends are the transcribe.cpp build.
 - **License:** MIT
 - **Upstream:** https://github.com/handy-computer/transcribe.cpp
 
 ### stable-diffusion.cpp
 
-- **What:** `sd-cli` and ggml backend modules under `vendor/stablediffusion` (packaged as `resources/stablediffusion`). CUDA runtime libraries are the shared copies in `vendor/cuda`. This build’s ggml CUDA fatbin is the canonical module. llama.cpp and transcribe.cpp are compiled with the same `GGML_MAX_NAME=160` and link their CUDA file at this one.
+- **What:** `sd-cli` and ggml backend modules under `vendor/stablediffusion` (packaged as `resources/stablediffusion`). CUDA runtime libraries and this build’s ggml CUDA fatbin are the shared copies in `vendor/cuda`. llama.cpp and transcribe.cpp are compiled with the same `GGML_MAX_NAME=160` and load that fatbin from the sibling `cuda` directory.
 - **License:** MIT
 - **Upstream:** https://github.com/leejet/stable-diffusion.cpp (ggml submodule https://github.com/ggml-org/ggml, also MIT)
 
@@ -45,6 +45,8 @@ If you redistribute Glaux installers that include these binaries, you must prese
 On Windows and Linux GPU builds, Glaux copies CUDA **runtime** libraries (not the driver) once into `vendor/cuda` (packaged as `resources/cuda`). PyTorch, `llama-server`, `transcribe-cli`, and `sd-cli` all load that shared CUDA 13 folder:
 
 - `cudart`, `cublas`, `cublasLt`, `nvJitLink` (`.dll` on Windows, `.so` on Linux)
+
+The same folder also holds one ggml CUDA backend module (`ggml-cuda.dll` / `libggml-cuda.so`). That file is the stable-diffusion.cpp build (MIT), not an NVIDIA redistributable. The three GGUF engines load it from this directory.
 
 These files are NVIDIA proprietary software, redistributed under the [NVIDIA CUDA Toolkit EULA](https://docs.nvidia.com/cuda/eula/index.html) (redistributable subset). They are not licensed under MIT. End users still need a current NVIDIA **driver** for CUDA inference; the Toolkit itself is not required on the end-user machine.
 
