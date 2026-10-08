@@ -25,7 +25,7 @@ describe('buildSdCliArgs', () => {
     outputPath: '/sessions/chat-1.png',
   };
 
-  it('passes the prompt and output and leaves sampling flags off', () => {
+  it('passes a random seed and leaves the other sampling flags off', () => {
     const args = buildSdCliArgs({ ...base, forceCpu: false });
     assert.deepEqual(args, [
       '-m',
@@ -36,8 +36,10 @@ describe('buildSdCliArgs', () => {
       base.prompt,
       '-o',
       base.outputPath,
+      '--seed',
+      '-1',
     ]);
-    for (const flag of ['--steps', '--cfg-scale', '--width', '--height', '--seed', '--init-img', '--vae-tiling', '--batch-count']) {
+    for (const flag of ['--steps', '--cfg-scale', '--width', '--height', '--init-img', '--vae-tiling', '--batch-count']) {
       assert.equal(args.includes(flag), false, flag);
     }
   });

@@ -834,6 +834,14 @@ async function ejectModel() {
   emitProgress({ phase: 'unload', status: 'complete' });
 }
 
+async function unloadHuggingFacePipeline() {
+  try {
+    await engines.huggingface.chatbotDestroyIfRunning();
+  } catch {
+    /* worker may already be gone */
+  }
+}
+
 async function shutdown() {
   for (const engine of Object.values(engines)) {
     try {
@@ -842,6 +850,9 @@ async function shutdown() {
       /* ignore */
     }
   }
+  // chatbot_destroy removes the disk-offload folder. close() kills the worker
+  // and would leave those files behind.
+  await unloadHuggingFacePipeline();
   await Promise.all(
     Object.values(engines).map((engine) => engine.close({ final: true }).catch(() => {}))
   );
@@ -860,6 +871,7 @@ async function resetInferenceWorker() {
       /* ignore */
     }
   }
+  await unloadHuggingFacePipeline();
   await Promise.all(
     Object.values(engines).map((engine) => engine.close({ final: false }).catch(() => {}))
   );

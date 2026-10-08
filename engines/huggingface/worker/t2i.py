@@ -13,14 +13,19 @@ each denoising step and aborts before the remaining steps and the VAE decode.
 
 import inspect
 import json
+import os
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 _REJECTED_CLASS_MARKERS = ("inpaint", "unconditional")
 # A component this large is offloaded to disk instead of staged in RAM.
 _DISK_OFFLOAD_MIN_BYTES = 1536 * 1024 * 1024
+# Hidden folder under the model cache. Not the system temp dir: on Linux that
+# is often a size-capped tmpfs, and a full tmpfs kills the worker with SIGBUS.
+_OFFLOAD_DIRNAME = ".glaux-t2i-offload"
+_RAM_FILESYSTEMS = frozenset({"tmpfs", "ramfs", "devtmpfs"})
+_active_offload_root: Path | None = None
 
 
 def _class_name_rejected(class_name: str, *, allow_img2img: bool = False) -> bool:
@@ -88,24 +93,239 @@ def _import_component_class(library: str, class_name: str):
     raise RuntimeError(f"Cannot load a {library}.{class_name} component.")
 
 
-def _disk_offload_budgets(large_count: int) -> dict:
+def _unescape_mount(value: str) -> str:
+    """Undo the octal escapes ``/proc/mounts`` uses for spaces and other bytes."""
+    chars: list[str] = []
+    index = 0
+    while index < len(value):
+        escaped = value[index : index + 4]
+        if (
+            value[index] == "\\"
+            and len(escaped) == 4
+            and all(char in "01234567" for char in escaped[1:])
+        ):
+            chars.append(chr(int(escaped[1:], 8)))
+            index += 4
+            continue
+        chars.append(value[index])
+        index += 1
+    return "".join(chars)
+
+
+def _filesystem_type(path: Path) -> str | None:
+    """Linux filesystem type for *path*, or None when ``/proc/mounts`` is absent."""
+    try:
+        mounts = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    best_type = None
+    best_len = -1
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount = Path(_unescape_mount(parts[1]))
+        try:
+            if resolved != mount:
+                resolved.relative_to(mount)
+        except ValueError:
+            continue
+        length = len(mount.parts)
+        if length > best_len:
+            best_type = parts[2]
+            best_len = length
+    return best_type
+
+
+def _is_ram_disk(path: Path) -> bool:
+    """True when *path* is tmpfs, ramfs, or devtmpfs."""
+    return _filesystem_type(path) in _RAM_FILESYSTEMS
+
+
+def _existing_anchor(path: Path) -> Path:
+    current = path
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return path
+        current = parent
+    return current
+
+
+def _same_device(left: Path, right: Path) -> bool:
+    try:
+        return os.stat(_existing_anchor(left)).st_dev == os.stat(_existing_anchor(right)).st_dev
+    except OSError:
+        return False
+
+
+def _offload_candidates(model_path: str) -> list[Path]:
+    """Places that share a disk with the weights, then ``/var/tmp``.
+
+    ``/var/tmp`` is the fallback when the model cache itself is a RAM disk.
+    It is persistent temp space and, unlike ``/tmp``, is not tmpfs on systemd.
+    """
+    model_dir = Path(model_path).resolve()
+    candidates: list[Path] = []
+    try:
+        from .download import models_cache_dir
+
+        cache = models_cache_dir()
+        if _same_device(cache, model_dir):
+            candidates.append(cache)
+    except (RuntimeError, OSError):
+        pass
+    parent = model_dir.parent
+    if parent not in candidates:
+        candidates.append(parent)
+    var_tmp = Path("/var/tmp")
+    if var_tmp.is_dir() and var_tmp not in candidates:
+        candidates.append(var_tmp)
+    return candidates
+
+
+def _disk_offload_root(model_path: str) -> Path:
+    """Folder for Accelerate weight files on a real disk.
+
+    The system temp directory is often a size-capped tmpfs. Writing the
+    offload files there still consumes RAM, and ``numpy.memmap`` raises
+    SIGBUS when that tmpfs cannot allocate the pages.
+    """
+    for directory in _offload_candidates(model_path):
+        if _is_ram_disk(directory):
+            continue
+        return directory / _OFFLOAD_DIRNAME
+    raise RuntimeError(
+        "Text-to-image disk offload needs a real disk. "
+        "The model cache is on a RAM disk (tmpfs), which cannot hold the offloaded weights."
+    )
+
+
+def _require_offload_space(anchor: Path, nbytes: int) -> None:
+    """Reject the offload before ``numpy.memmap`` can die with SIGBUS."""
+    if nbytes <= 0:
+        return
+    try:
+        free = shutil.disk_usage(_existing_anchor(anchor)).free
+    except OSError:
+        return
+    if free >= nbytes:
+        return
+    raise RuntimeError(
+        "Not enough free disk space to offload text-to-image weights "
+        f"({nbytes / 1024**3:.1f} GiB needed, {free / 1024**3:.1f} GiB free on {anchor})."
+    )
+
+
+def release_disk_offload() -> None:
+    """Delete offload files after the pipeline that reads them is gone."""
+    global _active_offload_root
+    root = _active_offload_root
+    _active_offload_root = None
+    if root is not None:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _prepare_disk_offload(model_path: str, nbytes: int) -> Path:
+    """Create a fresh offload folder on a real disk with room for *nbytes*."""
+    global _active_offload_root
+    root = _disk_offload_root(model_path)
+    # Drop a leftover copy first so its bytes count as free space. A live
+    # pipeline is released before the next load, and an unlinked mmap stays
+    # readable until that process drops it.
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+    _require_offload_space(root.parent, nbytes)
+    root.mkdir(parents=True, exist_ok=True)
+    _active_offload_root = root
+    return root
+
+
+def _offload_disk_bytes(weight_bytes: int, dtype) -> int:
+    """Size of the offload copy after the checkpoint is cast to *dtype*.
+
+    Safetensors diffusion weights are stored at 2 bytes per value. A float32
+    CPU load writes twice that.
+    """
+    itemsize = int(getattr(dtype, "itemsize", 2) or 2)
+    return max(weight_bytes, weight_bytes * itemsize // 2)
+
+
+def _weights_need_disk_offload(device: str, available: int | None, weights: int, dtype) -> bool:
+    """True when keeping the cast weights resident would exceed about 55% of free RAM."""
+    if device not in ("cuda", "cpu") or available is None:
+        return False
+    resident = _offload_disk_bytes(weights, dtype) if device == "cpu" else weights
+    return resident > int(available * 0.55)
+
+
+def _cuda_is_visible() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+def _disk_offload_budgets(large_count: int, device: str) -> dict:
     """Cap how much of each large component stays resident.
 
     The rest is written to disk and loaded for the forward pass. Budgets are
-    split across every large component so they can be resident together.
+    split across every large component so they can be resident together. A CPU
+    load leaves the GPU budget at zero even when CUDA is still visible, so a
+    fallback after an out-of-memory error does not place weights on the GPU.
     """
-    import torch
-
     available = _available_ram_bytes() or (6 * 1024**3)
     cpu_bytes = max(1024**3, int(available * 0.28 / max(large_count, 1)))
+    if device != "cuda":
+        budgets: dict = {"cpu": cpu_bytes}
+        if _cuda_is_visible():
+            budgets[0] = 0
+        return budgets
     gpu_bytes = 1024**3
-    if torch.cuda.is_available():
+    if _cuda_is_visible():
+        import torch
+
         free_vram, _total = torch.cuda.mem_get_info()
         gpu_bytes = max(512 * 1024**2, min(2 * 1024**3, int(free_vram * 0.35)))
     return {0: gpu_bytes, "cpu": cpu_bytes}
 
 
-def _load_disk_offloaded(model_path: str, dtype):
+def _place_unmapped_modules(pipe, device: str) -> None:
+    """Move components that Accelerate did not assign.
+
+    Disk-offloaded modules move themselves during the forward pass. On CUDA the
+    VAE stays on the GPU because the latents it decodes are already there. On
+    CPU every unmapped component stays on CPU.
+    """
+    import torch
+
+    target = "cuda" if device == "cuda" else "cpu"
+    for component in pipe.components.values():
+        if not isinstance(component, torch.nn.Module):
+            continue
+        if getattr(component, "hf_device_map", None):
+            continue
+        component.to(target)
+
+
+def _enable_vae_tiling(pipe) -> bool:
+    """Decode in tiles so one full-frame activation does not have to fit at once."""
+    enable = getattr(pipe, "enable_vae_tiling", None)
+    if not callable(enable):
+        vae = getattr(pipe, "vae", None)
+        enable = getattr(vae, "enable_tiling", None)
+    if not callable(enable):
+        return False
+    enable()
+    return True
+
+
+def _load_disk_offloaded(model_path: str, dtype, device: str):
     """Load components that do not fit in RAM with Accelerate disk offload."""
     from diffusers import DiffusionPipeline
 
@@ -117,48 +337,43 @@ def _load_disk_offloaded(model_path: str, dtype):
             continue
         if _safetensors_bytes(root / name) >= _DISK_OFFLOAD_MIN_BYTES:
             large.append(name)
-    budgets = _disk_offload_budgets(len(large))
-    offload_root = Path(tempfile.gettempdir()) / "glaux-t2i-offload"
-    if offload_root.exists():
-        shutil.rmtree(offload_root, ignore_errors=True)
-    offload_root.mkdir(parents=True, exist_ok=True)
+    budgets = _disk_offload_budgets(len(large), device)
+    offload_bytes = sum(
+        _offload_disk_bytes(_safetensors_bytes(root / name), dtype) for name in large
+    )
+    offload_root = _prepare_disk_offload(model_path, offload_bytes)
     print(
-        "Text-to-image weights are larger than available RAM; offloading them to disk.",
+        "Text-to-image weights are larger than available RAM; "
+        f"offloading them to {offload_root}.",
         file=sys.stderr,
         flush=True,
     )
     preloaded = {}
-    for name in large:
-        library, class_name = index[name]
-        component_cls = _import_component_class(library, class_name)
-        preloaded[name] = component_cls.from_pretrained(
-            root / name,
+    try:
+        for name in large:
+            library, class_name = index[name]
+            component_cls = _import_component_class(library, class_name)
+            preloaded[name] = component_cls.from_pretrained(
+                root / name,
+                torch_dtype=dtype,
+                local_files_only=True,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                max_memory=budgets,
+                offload_folder=str(offload_root / name),
+                offload_state_dict=True,
+            )
+        pipe = DiffusionPipeline.from_pretrained(
+            model_path,
             torch_dtype=dtype,
             local_files_only=True,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            max_memory=budgets,
-            offload_folder=str(offload_root / name),
-            offload_state_dict=True,
+            **preloaded,
         )
-    pipe = DiffusionPipeline.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        local_files_only=True,
-        **preloaded,
-    )
-    # Disk-offloaded modules move themselves during the forward pass. Smaller
-    # ones (the VAE) stay on CPU unless they are placed on the GPU explicitly,
-    # and the latents arriving from the transformer are already CUDA.
-    import torch
-
-    for component in pipe.components.values():
-        if not isinstance(component, torch.nn.Module):
-            continue
-        if getattr(component, "hf_device_map", None):
-            continue
-        component.to("cuda")
-    return pipe
+        _place_unmapped_modules(pipe, device)
+        return pipe
+    except Exception:
+        release_disk_offload()
+        raise
 
 
 def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: bool = False):
@@ -169,7 +384,9 @@ def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: 
     by name. Img2img classes load only for image-to-image.
 
     Weights that fit in RAM stay there and stream to the GPU one layer at a
-    time. Larger checkpoints are offloaded to disk.
+    time. Larger checkpoints, on CUDA or CPU, are offloaded to a real disk
+    next to the model cache. The VAE decodes in tiles so the full frame does
+    not have to fit in memory at once.
     """
     assert_text_to_image_repo(model_path, allow_img2img=allow_img2img)
     try:
@@ -191,8 +408,10 @@ def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: 
 
     available = _available_ram_bytes()
     weights = _safetensors_bytes(Path(model_path))
-    if device == "cuda" and available is not None and weights > int(available * 0.55):
-        pipe = _load_disk_offloaded(model_path, dtype)
+    offloaded = False
+    if _weights_need_disk_offload(device, available, weights, dtype):
+        pipe = _load_disk_offloaded(model_path, dtype, device)
+        offloaded = True
     else:
         pipe = DiffusionPipeline.from_pretrained(
             model_path,
@@ -211,7 +430,11 @@ def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: 
             pipe = pipe.to(device)
     loaded_name = type(pipe).__name__
     if _class_name_rejected(loaded_name, allow_img2img=allow_img2img):
+        if offloaded:
+            release_disk_offload()
         raise RuntimeError(f"This diffusion class is not supported (loaded {loaded_name}).")
+    if _enable_vae_tiling(pipe):
+        print("Text-to-image VAE tiling is enabled.", file=sys.stderr, flush=True)
     return pipe
 
 

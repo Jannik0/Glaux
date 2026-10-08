@@ -2,7 +2,9 @@
 
 /**
  * Text-to-image via a one-shot bundled sd-cli process.
- * Steps, CFG, and seed are omitted so the CLI / model defaults apply.
+ * Steps and CFG are omitted so the CLI / model defaults apply.
+ * --seed -1 asks sd-cli to draw a seed. The CLI default of 42 would
+ * otherwise repeat the same image for the same prompt.
  * An attached image would otherwise adopt the file's pixel size. That canvas is
  * fit back to the CLI default (512 on the long side) so the denoiser matches a
  * prompt-only run. Text-to-image passes the file as a reference image. FLUX and
@@ -30,6 +32,8 @@ const Z_IMAGE_NOISE_LEVEL = '0.4';
 /** Header plus tensor names. The weight blob starts after this. */
 const Z_IMAGE_SCAN_BYTES = 16 * 1024 * 1024;
 
+/** sd-cli draws a seed when the value is negative. 42 is its fixed default. */
+const RANDOM_SEED = '-1';
 /** sd-cli's default canvas when -W/-H are omitted. */
 const INIT_CANVAS = 512;
 /** Shared by SD (8), SDXL (8), and FLUX (16). */
@@ -275,6 +279,8 @@ function buildSdCliArgs(opts) {
     opts.prompt,
     '-o',
     opts.outputPath,
+    '--seed',
+    RANDOM_SEED,
   );
   const attached = attachedImage(opts);
   if (attached) {

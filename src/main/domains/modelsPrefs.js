@@ -46,6 +46,10 @@ async function listCachedHfModels(cacheRoot) {
     for (const ent of entries) {
       const full = path.join(currentDir, ent.name);
       if (ent.isDirectory()) {
+        // Accelerate offload files live here and are not a Hub repo.
+        if (ent.name === '.glaux-t2i-offload') {
+          continue;
+        }
         await walk(full);
       } else if (ent.name === 'config.json' || /\.gguf$/i.test(ent.name)) {
         if (/^mmproj/i.test(ent.name)) {

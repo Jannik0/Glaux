@@ -38,13 +38,11 @@ Other Hub models may work as well; safetensors chat and ASR support depends on t
 
 > **Note:** Glaux reads `pipeline_tag` from the model card. When that field is missing, it uses the first of `automatic-speech-recognition`, `text-to-image`, or `image-to-image` in the card's `tags` list. A safetensors model with none of those defaults to text-generation. A GGUF model with none of those is treated as chat. Other Hugging Face tasks (`summarization`, `image-text-to-text`, `any-to-any`, etc.) are recognized only from `pipeline_tag`.
 
-### Image generation
+### Image generation models
 
-Text-to-image and image-to-image use Diffusers for safetensors and stable-diffusion.cpp for GGUF. Width, height, steps, CFG, and seed stay at the pipeline or CLI defaults. Image-to-image also leaves strength at that default.
+A diffusion GGUF is often the denoiser only. When its card names a base repo, Glaux keeps the VAE and text encoder in that repo's cache folder — the same place a download of the base model would use. If that folder does not already contain both files, they are downloaded along with the GGUF. Selecting the GGUF checks again and downloads them when they are missing. Quants of the same base model share the folder. While the folder holds only those files, it is not listed as its own model. If the base model is downloaded in full, it will be listed as a separate model. Deleting the base model also deletes the VAE and text encoder with it.
 
-A prompt is required. Safetensors text-to-image accepts the prompt alone. GGUF text-to-image and image-to-image accept the prompt and one optional reference image. The reference image is fit within the CLI's 512-pixel canvas, on a 64-pixel grid, and VAE tiling is enabled so the encode fits.
-
-A diffusion GGUF is often the denoiser only. When its card names a base repo, Glaux keeps the VAE and text encoder in that repo's cache folder — the same place a download of the base model would use. If that folder does not already contain both files, they are downloaded along with the GGUF. Selecting the GGUF checks again and downloads them when they are missing. Quants of the same base model share the folder. While the folder holds only those files, it is not listed as its own model. If the base model is downloaded in full, deleting it also deletes the VAE and text encoder with it.
+Safetensors text-to-image models only accept a prompt. GGUF text-to-image and image-to-image models accept a prompt and one optional reference image. The reference image is fit within the CLI's 512-pixel canvas, on a 64-pixel grid, and VAE tiling is enabled so the encode fits.
 
 ### Gated models (`HF_TOKEN`)
 

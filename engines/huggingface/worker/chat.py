@@ -24,7 +24,12 @@ from transformers.generation.stopping_criteria import StoppingCriteria, Stopping
 from . import context
 from . import download as _download
 from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_local_dir, read_model_pipeline_tag
-from .t2i import DiffusionStopped, generate_text_to_image, load_text_to_image_pipeline
+from .t2i import (
+    DiffusionStopped,
+    generate_text_to_image,
+    load_text_to_image_pipeline,
+    release_disk_offload,
+)
 from .thinking import (
     _iter_stripped_non_thinking_markup,
     _parse_tags_and_answer,
@@ -201,6 +206,7 @@ def _fallback_pipeline_to_cpu(exc: BaseException) -> None:
         _release_torch_cache()
     except Exception:
         pass
+    release_disk_offload()
     if model_id:
         chatbot_create(model_id)
 
@@ -352,6 +358,7 @@ def chatbot_destroy():
         del chatbot
     gc.collect()
     _release_torch_cache()
+    release_disk_offload()
 
 
 _THINKING_TEMPLATE_PARAMS = ("enable_thinking",)

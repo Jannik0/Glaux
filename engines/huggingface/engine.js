@@ -592,6 +592,14 @@ module.exports = {
 
   chatbotDestroy: () => rpcVoid('chatbot_destroy', {}),
 
+  /**
+   * Unload a pipeline that is already loaded. Does not start a worker.
+   * Quit and worker reset call this so disk-offload files are removed
+   * before the process is killed.
+   */
+  chatbotDestroyIfRunning: () =>
+    isChildAlive(child) ? rpcVoid('chatbot_destroy', {}) : Promise.resolve(),
+
   contextClear: () => rpcVoid('context_clear', {}),
 
   contextSnapshot: () => rpc('context_snapshot', {}),
