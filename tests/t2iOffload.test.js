@@ -171,7 +171,40 @@ download = types.ModuleType("worker.download")
 download.models_cache_dir = lambda path=None: repo
 sys.modules["worker.download"] = download
 
-import torch
+# _keep_sampling_off_meta only reads device.type and calls torch.device().
+class _Device:
+    def __init__(self, kind):
+        self.type = kind
+
+class _Tensor:
+    def __init__(self, device):
+        self.device = device if isinstance(device, _Device) else _Device(device)
+
+    @property
+    def is_meta(self):
+        return self.device.type == "meta"
+
+class _Parameter(_Tensor):
+    def __init__(self, data):
+        super().__init__(data.device)
+
+class _Module:
+    def __init__(self):
+        super().__init__()
+
+def _empty(*_shape, device="cpu"):
+    return _Tensor(device)
+
+torch = types.ModuleType("torch")
+torch.device = _Device
+torch.empty = _empty
+nn = types.ModuleType("torch.nn")
+nn.Module = _Module
+nn.Parameter = _Parameter
+torch.nn = nn
+sys.modules["torch"] = torch
+sys.modules["torch.nn"] = nn
+
 import worker.t2i as t2i
 
 class Text(torch.nn.Module):
@@ -231,8 +264,7 @@ describe('text-to-image disk offload', () => {
   });
 
   it('keeps sampling tensors off the meta device', () => {
-    const python = path.join(REPO, 'vendor', 'python', 'bin', 'python3');
-    const result = spawnSync(python, ['-', REPO], {
+    const result = spawnSync('python3', ['-', REPO], {
       input: SAMPLING_SCRIPT,
       encoding: 'utf8',
     });
