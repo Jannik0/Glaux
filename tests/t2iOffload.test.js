@@ -4,8 +4,39 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('child_process');
 const path = require('path');
+const { pickPython } = require('../engines/common/runtimePaths');
 
 const REPO = path.resolve(__dirname, '..');
+
+/**
+ * Same lookup as the Hugging Face engine: PYTHON, bundled vendor/python, then
+ * python on Windows or python3 elsewhere. A missing command and the Windows
+ * Store app-execution alias (exit 9009) are both "not found".
+ * @param {string} command
+ * @returns {string | false}
+ */
+function pythonSkipReason(command) {
+  const result = spawnSync(command, ['-c', 'import sys'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 15000,
+  });
+  if (result.status === 0) return false;
+  const pathName = process.platform === 'win32' ? 'python' : 'python3';
+  const output = `${result.stderr || ''}\n${result.stdout || ''}`;
+  const notFound =
+    result.error?.code === 'ENOENT' ||
+    result.status === 9009 ||
+    /Python was not found/i.test(output);
+  if (notFound) {
+    return `No Python interpreter found (${command}). Lookup order: PYTHON, then vendor/python, then ${pathName} on PATH.`;
+  }
+  const detail = (result.stderr || result.stdout || result.error?.message || `exit ${result.status}`).trim();
+  return `Python interpreter failed to start (${command}): ${detail}`;
+}
+
+const PYTHON = pickPython();
+const PYTHON_SKIP = pythonSkipReason(PYTHON);
 
 // Imports worker/t2i.py without worker/__init__.py, which pulls in torch.
 const SCRIPT = String.raw`
@@ -104,20 +135,43 @@ if t2i._is_ram_disk(Path("/tmp")):
     assert chosen.name == ".glaux-t2i-offload"
     assert not t2i._is_ram_disk(chosen.parent), chosen
 
-def only_tmp_is_ram(path):
+def path_is_under(path, root):
     resolved = Path(path).resolve()
-    tmp = Path("/tmp").resolve()
-    return resolved == tmp or tmp in resolved.parents
+    root = Path(root).resolve()
+    return resolved == root or root in resolved.parents
 
+# /var/tmp is the real Linux fallback. Path("/var/tmp") is not a directory on
+# Windows (it resolves onto the current drive), so there the same skip-RAM
+# rule is checked with a directory this host actually has.
+var_tmp = Path("/var/tmp")
 real_is_ram = t2i._is_ram_disk
-t2i._is_ram_disk = only_tmp_is_ram
+original_candidates = t2i._offload_candidates
+fallback = var_tmp if var_tmp.is_dir() else Path(tempfile.mkdtemp(prefix="glaux-vartmp-"))
+ram_root = Path("/tmp") if var_tmp.is_dir() else Path(tempfile.mkdtemp(prefix="glaux-ram-"))
+if not var_tmp.is_dir():
+    def candidates_with_fallback(model_path):
+        found = original_candidates(model_path)
+        if fallback not in found:
+            found.append(fallback)
+        return found
+
+    t2i._offload_candidates = candidates_with_fallback
+
+def only_ram_root_is_ram(path):
+    return path_is_under(path, ram_root)
+
+t2i._is_ram_disk = only_ram_root_is_ram
 try:
-    state["cache"] = Path("/tmp")
-    chosen = t2i._disk_offload_root("/tmp/org/repo")
-    assert not only_tmp_is_ram(chosen.parent), chosen
-    assert chosen == Path("/var/tmp") / ".glaux-t2i-offload", chosen
+    state["cache"] = ram_root
+    chosen = t2i._disk_offload_root(str(ram_root / "org" / "repo"))
+    assert not only_ram_root_is_ram(chosen.parent), chosen
+    assert chosen == fallback / ".glaux-t2i-offload", chosen
 finally:
     t2i._is_ram_disk = real_is_ram
+    t2i._offload_candidates = original_candidates
+    if not var_tmp.is_dir():
+        shutil.rmtree(fallback, ignore_errors=True)
+        shutil.rmtree(ram_root, ignore_errors=True)
 
 class Usage:
     def __init__(self, free):
@@ -251,27 +305,29 @@ assert cuda._execution_device.type == "cuda"
 `;
 
 describe('text-to-image disk offload', () => {
-  it('offloads CUDA and CPU loads to a real disk and tiles the VAE', () => {
-    const result = spawnSync('python3', ['-', REPO], {
+  it('offloads CUDA and CPU loads to a real disk and tiles the VAE', { skip: PYTHON_SKIP }, () => {
+    const result = spawnSync(PYTHON, ['-', REPO], {
       input: SCRIPT,
       encoding: 'utf8',
+      windowsHide: true,
     });
     assert.equal(
       result.status,
       0,
-      result.stderr || result.stdout || result.error?.message || 'python3 failed'
+      result.stderr || result.stdout || result.error?.message || `${PYTHON} failed`
     );
   });
 
-  it('keeps sampling tensors off the meta device', () => {
-    const result = spawnSync('python3', ['-', REPO], {
+  it('keeps sampling tensors off the meta device', { skip: PYTHON_SKIP }, () => {
+    const result = spawnSync(PYTHON, ['-', REPO], {
       input: SAMPLING_SCRIPT,
       encoding: 'utf8',
+      windowsHide: true,
     });
     assert.equal(
       result.status,
       0,
-      result.stderr || result.stdout || result.error?.message || 'python3 failed'
+      result.stderr || result.stdout || result.error?.message || `${PYTHON} failed`
     );
   });
 });
