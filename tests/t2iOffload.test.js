@@ -53,6 +53,12 @@ assert t2i._weights_need_disk_offload("cpu", 1000, 500, DType(2)) is False
 assert t2i._weights_need_disk_offload("mps", 1000, 900, DType(2)) is False
 assert t2i._weights_need_disk_offload("cuda", None, 900, DType(2)) is False
 
+load_kwargs = t2i._large_component_load_kwargs(DType(4), {"cpu": 1024, 0: 0}, "/var/tmp/offload")
+assert load_kwargs["low_cpu_mem_usage"] is True
+assert load_kwargs["device_map"] == "auto"
+assert load_kwargs["max_memory"] == {"cpu": 1024, 0: 0}
+assert "offload_state_dict" not in load_kwargs
+
 class TilingPipe:
     def __init__(self):
         self.calls = 0
@@ -147,10 +153,87 @@ if not t2i._is_ram_disk(repo):
         shutil.rmtree(base, ignore_errors=True)
 `;
 
+const SAMPLING_SCRIPT = String.raw`
+import sys
+import types
+from pathlib import Path
+
+repo = Path(sys.argv[1]).resolve()
+hf = repo / "engines" / "huggingface"
+sys.path.insert(0, str(hf))
+
+worker = types.ModuleType("worker")
+worker.__path__ = [str(hf / "worker")]
+worker.__package__ = "worker"
+sys.modules["worker"] = worker
+
+download = types.ModuleType("worker.download")
+download.models_cache_dir = lambda path=None: repo
+sys.modules["worker.download"] = download
+
+import torch
+import worker.t2i as t2i
+
+class Text(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(2, 2, device="meta"))
+
+class Pipe:
+    def __init__(self):
+        self.text_encoder = Text()
+
+    @property
+    def device(self):
+        return self.text_encoder.weight.device
+
+    @property
+    def _execution_device(self):
+        return self.device
+
+pipe = Pipe()
+assert pipe.device.type == "meta"
+assert pipe._execution_device.type == "meta"
+t2i._keep_sampling_off_meta(pipe)
+assert type(pipe).__name__ == "Pipe"
+assert pipe.device.type == "cpu"
+assert pipe._execution_device.type == "cpu"
+assert pipe.text_encoder.weight.is_meta
+t2i._keep_sampling_off_meta(pipe)
+assert pipe.device.type == "cpu"
+
+class CudaPipe:
+    @property
+    def device(self):
+        return torch.device("cuda")
+
+    @property
+    def _execution_device(self):
+        return self.device
+
+cuda = CudaPipe()
+t2i._keep_sampling_off_meta(cuda)
+assert cuda.device.type == "cuda"
+assert cuda._execution_device.type == "cuda"
+`;
+
 describe('text-to-image disk offload', () => {
   it('offloads CUDA and CPU loads to a real disk and tiles the VAE', () => {
     const result = spawnSync('python3', ['-', REPO], {
       input: SCRIPT,
+      encoding: 'utf8',
+    });
+    assert.equal(
+      result.status,
+      0,
+      result.stderr || result.stdout || result.error?.message || 'python3 failed'
+    );
+  });
+
+  it('keeps sampling tensors off the meta device', () => {
+    const python = path.join(REPO, 'vendor', 'python', 'bin', 'python3');
+    const result = spawnSync(python, ['-', REPO], {
+      input: SAMPLING_SCRIPT,
       encoding: 'utf8',
     });
     assert.equal(

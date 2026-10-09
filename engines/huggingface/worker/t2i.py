@@ -313,6 +313,44 @@ def _place_unmapped_modules(pipe, device: str) -> None:
         component.to(target)
 
 
+def _keep_sampling_off_meta(pipe) -> None:
+    """Allocate latents on the CPU when disk offload reports the meta device.
+
+    A component whose weights all live on disk keeps its parameters on the meta
+    device. Diffusers reports that as the pipeline device, the denoising loop
+    allocates latents there, and Accelerate cannot copy those latents onto the
+    CPU for the forward pass.
+    """
+    if getattr(pipe.__class__, "_glaux_sampling_off_meta", False):
+        return
+    import torch
+
+    base = pipe.__class__
+
+    def device(self):
+        found = super(pinned, self).device
+        if getattr(found, "type", None) == "meta":
+            return torch.device("cpu")
+        return found
+
+    def _execution_device(self):
+        found = super(pinned, self)._execution_device
+        if getattr(found, "type", None) == "meta":
+            return torch.device("cpu")
+        return found
+
+    pinned = type(
+        base.__name__,
+        (base,),
+        {
+            "device": property(device),
+            "_execution_device": property(_execution_device),
+            "_glaux_sampling_off_meta": True,
+        },
+    )
+    pipe.__class__ = pinned
+
+
 def _enable_vae_tiling(pipe) -> bool:
     """Decode in tiles so one full-frame activation does not have to fit at once."""
     enable = getattr(pipe, "enable_vae_tiling", None)
@@ -323,6 +361,25 @@ def _enable_vae_tiling(pipe) -> bool:
         return False
     enable()
     return True
+
+
+def _large_component_load_kwargs(dtype, budgets: dict, offload_folder: str) -> dict:
+    """Keyword arguments for one component loaded through Accelerate.
+
+    ``offload_state_dict`` is omitted on purpose. Diffusers enables it only when
+    the device map contains ``"disk"``, which is also when it copies the parked
+    CPU weights back onto the module. Forcing it on for a component that fits in
+    the resident budget leaves every parameter on the meta device, and the
+    following ``model.to("cpu")`` raises "Cannot copy out of meta tensor; no data!".
+    """
+    return {
+        "torch_dtype": dtype,
+        "local_files_only": True,
+        "low_cpu_mem_usage": True,
+        "device_map": "auto",
+        "max_memory": budgets,
+        "offload_folder": offload_folder,
+    }
 
 
 def _load_disk_offloaded(model_path: str, dtype, device: str):
@@ -355,13 +412,7 @@ def _load_disk_offloaded(model_path: str, dtype, device: str):
             component_cls = _import_component_class(library, class_name)
             preloaded[name] = component_cls.from_pretrained(
                 root / name,
-                torch_dtype=dtype,
-                local_files_only=True,
-                low_cpu_mem_usage=True,
-                device_map="auto",
-                max_memory=budgets,
-                offload_folder=str(offload_root / name),
-                offload_state_dict=True,
+                **_large_component_load_kwargs(dtype, budgets, str(offload_root / name)),
             )
         pipe = DiffusionPipeline.from_pretrained(
             model_path,
@@ -370,6 +421,8 @@ def _load_disk_offloaded(model_path: str, dtype, device: str):
             **preloaded,
         )
         _place_unmapped_modules(pipe, device)
+        if device != "cuda":
+            _keep_sampling_off_meta(pipe)
         return pipe
     except Exception:
         release_disk_offload()
