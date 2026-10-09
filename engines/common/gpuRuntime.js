@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Runtime GPU policy shared by llama.cpp, transcribe.cpp, and Hugging Face bridges.
+ * Runtime GPU policy shared by llama.cpp, transcribe.cpp, stable-diffusion.cpp, and Hugging Face bridges.
  * GLAUX_FORCE_CPU=1|true|yes disables GPU even when backends are shipped.
  */
 

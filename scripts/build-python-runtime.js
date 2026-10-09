@@ -12,7 +12,7 @@
  *
  * Default torch variant is cu130 on Windows/Linux (CUDA wheels still run on CPU
  * when no NVIDIA GPU is present). Overlapping CUDA 13 redistributables are
- * moved into vendor/cuda so Torch shares one runtime with llama.cpp / transcribe.cpp.
+ * moved into vendor/cuda so Torch shares one runtime with llama.cpp, transcribe.cpp, and stable-diffusion.cpp.
  * macOS always installs the default PyPI wheels (MPS-capable when hardware supports it).
  *
  * After wheels are installed, the same leftover cuts run on Windows and Linux:

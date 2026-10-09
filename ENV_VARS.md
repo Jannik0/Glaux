@@ -51,7 +51,7 @@ Used only by `npm run build:*`, `npm run dist*` / `scripts/*.js` on a developer 
 
 | Variable | Values | Effect |
 | -------- | ------ | ------ |
-| `CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT` | CUDA Toolkit install directory (checked in that order). | Locate `nvcc` / CUDA headers when compiling llama.cpp and transcribe.cpp GPU backends. If unset, the scripts look for `nvcc` on `PATH`, then common install locations (`/usr/local/cuda` on Linux). The toolkit `bin` directory is added to `PATH` for cmake even when Debian/Ubuntu did not put `nvcc` on `PATH`. |
+| `CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT` | CUDA Toolkit install directory (checked in that order). | Locate `nvcc` / CUDA headers when compiling llama.cpp, transcribe.cpp, and stable-diffusion.cpp GPU backends. If unset, the scripts look for `nvcc` on `PATH`, then common install locations (`/usr/local/cuda` on Linux). The toolkit `bin` directory is added to `PATH` for cmake even when Debian/Ubuntu did not put `nvcc` on `PATH`. |
 | `VULKAN_SDK` | Vulkan SDK root directory. | Locate Vulkan headers/libs for those same native builds. If unset, the scripts search `C:\VulkanSDK\<version>` on Windows and system include paths on Linux. |
 | `MSYS2_BASH` | Absolute path to MSYS2 `bash.exe`. | Windows-only: which bash runs the ffmpeg configure/build (`npm run build:ffmpeg`). |
 | `MSYS2_PATH` | MSYS2 install root (e.g. `C:\msys64`). | Windows-only: fallback if `MSYS2_BASH` is unset; the script uses `%MSYS2_PATH%\usr\bin\bash.exe`. Otherwise it tries `C:\msys64`, `D:\msys64`, `C:\msys32`, then `bash` on `PATH`. |

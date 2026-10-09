@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Shared GPU backend helpers for native llama.cpp / transcribe.cpp builds
+ * Shared GPU backend helpers for native llama.cpp / transcribe.cpp / stable-diffusion.cpp builds
  * and packaging checks. One installer per OS ships every backend that OS
  * supports; missing NVIDIA/Vulkan drivers at runtime skip those modules.
  */
@@ -1264,7 +1264,7 @@ function copyCudaRedistributables(outDir = sharedCudaDir(), cudaRoot = findCudaT
     throw new Error(
       `Staged CUDA redistributables from ${cudaRoot} are not CUDA 13 ` +
         `(found: ${copied.join(', ')}). Install CUDA Toolkit 13.x so Torch cu130, ` +
-        `llama.cpp, and transcribe.cpp can share one runtime.`
+        `llama.cpp, transcribe.cpp, and stable-diffusion.cpp can share one runtime.`
     );
   }
   const collapsed = collapseDuplicateLibs(outDir);

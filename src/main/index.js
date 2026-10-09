@@ -20,7 +20,7 @@ registerIpc();
 
 if (isForceCpu()) {
   process.stderr.write(
-    'GLAUX_FORCE_CPU is set; Hugging Face, llama.cpp, and transcribe.cpp will pin CPU.\n'
+    'GLAUX_FORCE_CPU is set; Hugging Face, llama.cpp, transcribe.cpp, and stable-diffusion.cpp will pin CPU.\n'
   );
 }
 

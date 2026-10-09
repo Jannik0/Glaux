@@ -457,4 +457,4 @@ See [SECURITY.md](SECURITY.md) for how to report vulnerabilities privately.
 
 MIT, Copyright (c) 2026 Jannik Lehmkuhl — see [LICENSE](LICENSE).
 
-Packaged installers also redistribute third-party components (ffmpeg, NVIDIA CUDA libraries, Electron/Chromium, llama.cpp, transcribe.cpp, the bundled Python/PyTorch stack). Those licenses are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Hub model weights are not part of Glaux and keep their own terms.
+Packaged installers also redistribute third-party components (ffmpeg, NVIDIA CUDA libraries, Electron/Chromium, llama.cpp, transcribe.cpp, stable-diffusion.cpp, the bundled Python/PyTorch stack). Those licenses are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Hub model weights are not part of Glaux and keep their own terms.
