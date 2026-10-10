@@ -9,7 +9,11 @@ const {
   getSessionsRoot,
   getModelsRoot,
 } = require('../paths');
-const { persistActiveSession, reserveActiveSessionFilename } = require('./sessions');
+const {
+  persistActiveSession,
+  reserveActiveSessionFilename,
+  clearPendingSessionFilename,
+} = require('./sessions');
 const { allocateSessionImagePath } = require('../sessionImages');
 const { isDiffusionPipelineTag } = require('../../../engines/common/resolveEngineId');
 const { clearPersistedModelIfNotCached, modelIdHasCachedWeights } = require('./modelsPrefs');
@@ -53,8 +57,15 @@ async function textToImageOutputPath() {
     return undefined;
   }
   const filename = reserveActiveSessionFilename();
-  const allocated = await allocateSessionImagePath(getSessionsRoot(), filename);
-  return allocated.absolutePath;
+  try {
+    const allocated = await allocateSessionImagePath(getSessionsRoot(), filename);
+    return allocated.absolutePath;
+  } catch (err) {
+    if (!state.activeSessionFilename) {
+      clearPendingSessionFilename();
+    }
+    throw err;
+  }
 }
 
 /**
@@ -84,6 +95,17 @@ function normalizeFilesPayload(rawFiles) {
     normalized.push({ source, relativePath: entry.relativePath });
   }
   return normalized;
+}
+
+async function persistStreamSession(logLabel) {
+  try {
+    await persistActiveSession();
+  } catch (persistErr) {
+    console.error(logLabel, persistErr);
+    if (!state.activeSessionFilename) {
+      clearPendingSessionFilename();
+    }
+  }
 }
 
 function parseInferenceRequest(payload) {
@@ -176,6 +198,9 @@ function registerEngineBridgeIpc() {
       const split = splitPromptResult(response);
       return ok({ response: split.text, images: split.images });
     } catch (err) {
+      if (!state.activeSessionFilename) {
+        clearPendingSessionFilename();
+      }
       return fail(err, 'E_INFERENCE');
     }
   });
@@ -388,11 +413,7 @@ function registerEngineBridgeIpc() {
 
         if (streamState.canceled) {
           emitStreamEvent(sender, { requestId, type: 'canceled' });
-          try {
-            await persistActiveSession();
-          } catch (persistErr) {
-            console.error('Failed to persist session after canceled chat turn:', persistErr);
-          }
+          await persistStreamSession('Failed to persist session after canceled chat turn:');
           return;
         }
 
@@ -406,22 +427,14 @@ function registerEngineBridgeIpc() {
           response: split.text,
           images: split.images,
         });
-        try {
-          await persistActiveSession();
-        } catch (persistErr) {
-          console.error('Failed to persist session after chat turn:', persistErr);
-        }
+        await persistStreamSession('Failed to persist session after chat turn:');
       } catch (err) {
         if (sendPromptPromise) {
           sendPromptPromise.catch(() => {});
         }
         if (streamState.canceled) {
           emitStreamEvent(sender, { requestId, type: 'canceled' });
-          try {
-            await persistActiveSession();
-          } catch (persistErr) {
-            console.error('Failed to persist session after canceled chat turn:', persistErr);
-          }
+          await persistStreamSession('Failed to persist session after canceled chat turn:');
           return;
         }
         const isStreamIdleTimeout =
@@ -452,6 +465,9 @@ function registerEngineBridgeIpc() {
           }
         } else {
           engineManager.cancelGeneration();
+        }
+        if (!state.activeSessionFilename) {
+          clearPendingSessionFilename();
         }
         const errorInfo = toStructuredError(err, 'E_INFERENCE');
         emitStreamEvent(sender, { requestId, type: 'error', errorInfo });

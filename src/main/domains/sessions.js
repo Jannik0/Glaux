@@ -110,16 +110,57 @@ async function renameSessionFile(oldName, newName) {
   return destName;
 }
 
-async function trashSessionFile(filename) {
-  const abs = resolveSessionsPath(filename);
+/**
+ * Name reserved for a session that does not have a JSON file yet.
+ * Assigned to state.activeSessionFilename only after persist succeeds.
+ * @type {string | null}
+ */
+let pendingSessionFilename = null;
+
+function warnSession(message, err) {
+  console.warn(message, err);
+}
+
+/**
+ * Move the session JSON to the recycle bin, then delete its sidecar images.
+ * A sidecar delete failure is logged and does not fail the trash. Outputs
+ * copies are never removed. An unreadable JSON is still trashed.
+ *
+ * @param {string} filename
+ * @param {{
+ *   resolveSessionsPath?: (filename: string) => string,
+ *   readSessionFile?: (filename: string) => Promise<Array<object>>,
+ *   moveEntryToRecycleBin?: (abs: string) => Promise<void>,
+ *   deleteSessionSidecarImages?: (messages: Array<object>, sessionsRoot: string) => Promise<unknown>,
+ *   sessionsRoot?: string,
+ *   warn?: (message: string, err: unknown) => void,
+ * }} [deps]
+ */
+async function trashSessionFile(filename, deps = {}) {
+  const resolve = deps.resolveSessionsPath || resolveSessionsPath;
+  const read = deps.readSessionFile || readSessionFile;
+  const move = deps.moveEntryToRecycleBin || moveEntryToRecycleBin;
+  const sessionsRoot = deps.sessionsRoot || getSessionsRoot();
+  const removeSidecars =
+    deps.deleteSessionSidecarImages ||
+    ((messages, root) => deleteSessionSidecarImages(messages, root));
+  const warn = deps.warn || warnSession;
+  const abs = resolve(filename);
+  let messages = null;
   try {
-    const messages = await readSessionFile(filename);
-    await deleteSessionSidecarImages(messages, getSessionsRoot());
-  } catch {
-    // Unreadable session JSON still goes to the recycle bin. Sidecars that
-    // cannot be resolved from the file are left in place.
+    messages = await read(filename);
+  } catch (err) {
+    warn('Unreadable session JSON; moving it to the recycle bin without deleting sidecars:', err);
   }
-  await moveEntryToRecycleBin(abs);
+  await move(abs);
+  if (!messages) {
+    return;
+  }
+  try {
+    await removeSidecars(messages, sessionsRoot);
+  } catch (err) {
+    warn('Failed to delete session sidecar images:', err);
+  }
 }
 
 function extractSessionMessageText(msg) {
@@ -183,16 +224,89 @@ function getSessionExportBaseName() {
 }
 
 function reserveActiveSessionFilename() {
-  if (!state.activeSessionFilename) {
-    state.activeSessionFilename = `${formatSessionTimestamp()}.json`;
+  if (state.activeSessionFilename) {
+    return state.activeSessionFilename;
   }
-  return state.activeSessionFilename;
+  if (!pendingSessionFilename) {
+    pendingSessionFilename = `${formatSessionTimestamp()}.json`;
+  }
+  return pendingSessionFilename;
 }
 
-async function persistActiveSession() {
-  const messages = await engineManager.contextSnapshot();
-  reserveActiveSessionFilename();
-  await writeSessionFile(state.activeSessionFilename, messages);
+function clearPendingSessionFilename() {
+  pendingSessionFilename = null;
+}
+
+/**
+ * @param {{
+ *   contextSnapshot?: () => Promise<Array<object>>,
+ *   writeSessionFile?: (filename: string, messages: Array<object>) => Promise<void>,
+ * }} [deps]
+ * @returns {Promise<string>}
+ */
+async function persistActiveSession(deps = {}) {
+  const snapshot = deps.contextSnapshot || (() => engineManager.contextSnapshot());
+  const write = deps.writeSessionFile || writeSessionFile;
+  const messages = await snapshot();
+  const filename = reserveActiveSessionFilename();
+  await write(filename, messages);
+  state.activeSessionFilename = filename;
+  pendingSessionFilename = null;
+  return filename;
+}
+
+/**
+ * Drop one context message, then the session file, and only then its sidecars.
+ * A sidecar delete failure is logged and does not fail the operation.
+ *
+ * @param {number} messageIndex
+ * @param {{
+ *   contextSnapshot?: () => Promise<Array<object>>,
+ *   contextReplace?: (messages: Array<object>) => Promise<void>,
+ *   writeSessionFile?: (filename: string, messages: Array<object>) => Promise<void>,
+ *   persistActiveSession?: () => Promise<unknown>,
+ *   deleteSessionSidecarImages?: (messages: Array<object>, sessionsRoot: string) => Promise<unknown>,
+ *   sessionsRoot?: string,
+ *   getActiveSessionFilename?: () => string | null,
+ *   warn?: (message: string, err: unknown) => void,
+ * }} [deps]
+ * @returns {Promise<Array<object>>}
+ */
+async function deleteSessionMessage(messageIndex, deps = {}) {
+  if (!Number.isInteger(messageIndex) || messageIndex < 0) {
+    throw new Error(t('errors.sessions.messageIndexRequired'));
+  }
+  const snapshot = deps.contextSnapshot || (() => engineManager.contextSnapshot());
+  const replace = deps.contextReplace || ((messages) => engineManager.contextReplace(messages));
+  const write = deps.writeSessionFile || writeSessionFile;
+  const persist = deps.persistActiveSession || (() => persistActiveSession());
+  const sessionsRoot = deps.sessionsRoot || getSessionsRoot();
+  const removeSidecars =
+    deps.deleteSessionSidecarImages ||
+    ((messages, root) => deleteSessionSidecarImages(messages, root));
+  const activeName = deps.getActiveSessionFilename || (() => state.activeSessionFilename);
+  const warn = deps.warn || warnSession;
+
+  const messages = await snapshot();
+  if (messageIndex >= messages.length) {
+    throw new Error(t('errors.sessions.messageDoesNotExist'));
+  }
+  const removed = messages[messageIndex];
+  const next = messages.slice();
+  next.splice(messageIndex, 1);
+  await replace(next);
+  const active = activeName();
+  if (active) {
+    await write(active, next);
+  } else if (next.length > 0) {
+    await persist();
+  }
+  try {
+    await removeSidecars([removed], sessionsRoot);
+  } catch (err) {
+    warn('Failed to delete session sidecar images:', err);
+  }
+  return next;
 }
 
 function registerSessionsIpc() {
@@ -217,6 +331,7 @@ function registerSessionsIpc() {
     try {
       await engineManager.contextClear();
       state.activeSessionFilename = null;
+      clearPendingSessionFilename();
       return ok({});
     } catch (err) {
       return fail(err, 'E_SESSIONS');
@@ -233,6 +348,7 @@ function registerSessionsIpc() {
       const messages = await readSessionFile(sessionName);
       await engineManager.contextReplace(messages);
       state.activeSessionFilename = sessionName;
+      clearPendingSessionFilename();
       return ok({ sessionName, messages });
     } catch (err) {
       return fail(err, 'E_SESSIONS');
@@ -272,6 +388,7 @@ function registerSessionsIpc() {
       await trashSessionFile(sessionName);
       if (wasActive) {
         state.activeSessionFilename = null;
+        clearPendingSessionFilename();
         try {
           await engineManager.contextClear();
         } catch {
@@ -291,19 +408,7 @@ function registerSessionsIpc() {
       if (!Number.isInteger(messageIndex) || messageIndex < 0) {
         throw new Error(t('errors.sessions.messageIndexRequired'));
       }
-      const messages = await engineManager.contextSnapshot();
-      if (messageIndex >= messages.length) {
-        throw new Error(t('errors.sessions.messageDoesNotExist'));
-      }
-      const removed = messages[messageIndex];
-      await deleteSessionSidecarImages([removed], getSessionsRoot());
-      messages.splice(messageIndex, 1);
-      await engineManager.contextReplace(messages);
-      if (state.activeSessionFilename) {
-        await writeSessionFile(state.activeSessionFilename, messages);
-      } else if (messages.length > 0) {
-        await persistActiveSession();
-      }
+      const messages = await deleteSessionMessage(messageIndex);
       return ok({ messages });
     } catch (err) {
       return fail(err, 'E_SESSIONS');
@@ -354,4 +459,7 @@ module.exports = {
   registerSessionsIpc,
   persistActiveSession,
   reserveActiveSessionFilename,
+  clearPendingSessionFilename,
+  deleteSessionMessage,
+  trashSessionFile,
 };

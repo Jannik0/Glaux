@@ -21,6 +21,7 @@ const {
   pathExists,
 } = require('../paths');
 const { getPreferences, updatePreferences } = require('./preferences');
+const { clearPendingSessionFilename } = require('./sessions');
 const { t } = require('../../i18n');
 
 const DEFAULT_WORKSPACE_NAME = 'Default';
@@ -114,6 +115,7 @@ async function activateWorkspace(name) {
   await ensureWorkspaceDirectories(safeName);
   state.activeWorkspaceName = safeName;
   state.activeSessionFilename = null;
+  clearPendingSessionFilename();
   closeWorkspaceDependentWindows();
   await persistActiveWorkspaceName(safeName);
   await reconfigureEnginePathsIfReady();

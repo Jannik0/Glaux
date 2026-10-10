@@ -82,6 +82,79 @@ describe('session image sidecars', () => {
     assert.equal(await fs.readFile(path.join(outputs, 'chat-1-2.png'), 'utf8'), 'one');
   });
 
+  it('rejects sidecar names that are not a single non-json file in Sessions', async () => {
+    const outside = path.join(root, 'outside.png');
+    await fs.writeFile(outside, 'out');
+    await fs.writeFile(path.join(sessions, 'other.json'), '{"no":true}');
+    await fs.mkdir(path.join(sessions, 'nested'), { recursive: true });
+    await fs.writeFile(path.join(sessions, 'nested', 'a.png'), 'nest');
+    await fs.mkdir(path.join(sessions, 'dir.png'));
+    const messages = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'image', source: 'sessions', relativePath: 'other.json' },
+          { type: 'image', source: 'sessions', relativePath: '../x' },
+          { type: 'image', source: 'sessions', relativePath: 'nested/a.png' },
+          { type: 'image', source: 'sessions', path: outside },
+          { type: 'image', source: 'sessions', relativePath: outside },
+          { type: 'image', source: 'sessions', relativePath: 'dir.png' },
+          { type: 'image', source: 'sessions', relativePath: 'missing.png' },
+          { type: 'image', source: 'resources', relativePath: 'chat-1.png' },
+        ],
+      },
+    ];
+    await deleteSessionSidecarImages(messages, sessions);
+    assert.equal(await fs.readFile(path.join(sessions, 'other.json'), 'utf8'), '{"no":true}');
+    assert.equal(await fs.readFile(path.join(sessions, 'nested', 'a.png'), 'utf8'), 'nest');
+    assert.equal((await fs.stat(path.join(sessions, 'dir.png'))).isDirectory(), true);
+    assert.equal(await fs.readFile(outside, 'utf8'), 'out');
+    await assert.rejects(
+      () =>
+        copyAssistantImagesToOutputs(messages[0], { sessionsRoot: sessions, outputsRoot: outputs }),
+      /missing/
+    );
+  });
+
+  it('still resolves a sidecar whose stem is not the current session name', async () => {
+    const renamed = await allocateSessionImagePath(sessions, 'renamed.json');
+    assert.equal(renamed.relativePath, 'renamed-1.png');
+    await fs.writeFile(path.join(sessions, 'original-1.png'), 'kept-name');
+    const msg = {
+      role: 'assistant',
+      content: [{ type: 'image', source: 'sessions', relativePath: 'original-1.png' }],
+    };
+    const copied = await copyAssistantImagesToOutputs(msg, {
+      sessionsRoot: sessions,
+      outputsRoot: outputs,
+    });
+    assert.equal(copied[0], 'original-1.png');
+    await deleteSessionSidecarImages([msg], sessions);
+    await assert.rejects(fs.stat(path.join(sessions, 'original-1.png')));
+    assert.equal(await fs.readFile(path.join(outputs, 'original-1.png'), 'utf8'), 'kept-name');
+  });
+
+  it('does not follow a symlink inside Sessions that points outside', async () => {
+    const outside = path.join(root, 'secret.png');
+    await fs.writeFile(outside, 'secret');
+    const link = path.join(sessions, 'link.png');
+    try {
+      await fs.symlink(outside, link);
+    } catch (err) {
+      if (err && (err.code === 'EPERM' || err.code === 'ENOTSUP')) {
+        return;
+      }
+      throw err;
+    }
+    await deleteSessionSidecarImages(
+      [{ role: 'assistant', content: [{ type: 'image', source: 'sessions', relativePath: 'link.png' }] }],
+      sessions
+    );
+    assert.equal(await fs.readFile(outside, 'utf8'), 'secret');
+    const stat = await fs.lstat(link);
+    assert.equal(stat.isSymbolicLink(), true);
+  });
+
   it('does not copy user attachments', async () => {
     const names = await copyAssistantImagesToOutputs(
       { role: 'user', content: [{ type: 'image', path: path.join(outputs, 'keep.png'), source: 'outputs', relativePath: 'keep.png' }] },

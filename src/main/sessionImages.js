@@ -2,8 +2,10 @@
 
 /**
  * Generated text-to-image files live next to the session JSON
- * (`<sessions>/<session>-N.png`). Export copies them into Outputs.
- * Deleting a session removes those sidecars and leaves Outputs copies alone.
+ * (`<sessions>/<stem>-N.png`). A session rename does not rename those files;
+ * the image part keeps the original single-segment relative path.
+ * Export copies them into Outputs. Deleting a session removes those sidecars
+ * and leaves Outputs copies alone.
  */
 
 const fs = require('fs/promises');
@@ -49,28 +51,44 @@ function imagePartsOf(msg) {
 }
 
 /**
- * Resolve an image part to an absolute path. Session sidecars use
- * `source: 'sessions'` plus `relativePath`. A stored absolute `path` is used
- * when it still points at a file.
+ * A session sidecar name is one path segment. It is not tied to the current
+ * session filename: renaming the JSON leaves `<stem>-N.png` in place.
+ * @param {unknown} relativePath
+ * @returns {boolean}
+ */
+function isSessionSidecarName(relativePath) {
+  if (typeof relativePath !== 'string' || !relativePath) {
+    return false;
+  }
+  if (relativePath === '.' || relativePath === '..') {
+    return false;
+  }
+  if (path.isAbsolute(relativePath)) {
+    return false;
+  }
+  if (relativePath.includes('/') || relativePath.includes('\\') || relativePath.includes('\0')) {
+    return false;
+  }
+  return path.extname(relativePath).toLowerCase() !== '.json';
+}
+
+/**
+ * Resolve a non-session image part from its relative path. An absolute
+ * `part.path` stored in the session JSON is not trusted.
  *
  * @param {object} part
  * @param {{ sessionsRoot?: string, resourcesRoot?: string, outputsRoot?: string }} roots
  * @returns {string | null}
  */
 function resolveImagePartPath(part, roots) {
-  if (!isImagePart(part)) {
+  if (!isImagePart(part) || part.source === 'sessions') {
     return null;
   }
-  const sessionsRoot = roots && roots.sessionsRoot;
   const resourcesRoot = roots && roots.resourcesRoot;
   const outputsRoot = roots && roots.outputsRoot;
   const relativePath = typeof part.relativePath === 'string' ? part.relativePath : '';
   const source = part.source;
 
-  if (relativePath && source === 'sessions' && sessionsRoot) {
-    const abs = path.resolve(sessionsRoot, relativePath);
-    return isFileInside(sessionsRoot, abs) ? abs : null;
-  }
   if (relativePath && source === 'resources' && resourcesRoot) {
     const abs = path.resolve(resourcesRoot, relativePath);
     return isFileInside(resourcesRoot, abs) ? abs : null;
@@ -79,10 +97,48 @@ function resolveImagePartPath(part, roots) {
     const abs = path.resolve(outputsRoot, relativePath);
     return isFileInside(outputsRoot, abs) ? abs : null;
   }
-  if (typeof part.path === 'string' && part.path.trim()) {
-    return path.resolve(part.path);
-  }
   return null;
+}
+
+/**
+ * Session sidecar after symlink resolution. The real file must be a regular
+ * file directly inside the real Sessions directory.
+ *
+ * @param {object} part
+ * @param {string} sessionsRoot
+ * @returns {Promise<string | null>}
+ */
+async function resolveSessionSidecarFile(part, sessionsRoot) {
+  if (!isImagePart(part) || part.source !== 'sessions' || !sessionsRoot) {
+    return null;
+  }
+  if (!isSessionSidecarName(part.relativePath)) {
+    return null;
+  }
+  const candidate = path.resolve(sessionsRoot, part.relativePath);
+  if (!isFileInside(sessionsRoot, candidate)) {
+    return null;
+  }
+  let realRoot;
+  let realFile;
+  try {
+    realRoot = await fs.realpath(sessionsRoot);
+    realFile = await fs.realpath(candidate);
+  } catch {
+    return null;
+  }
+  if (path.dirname(realFile) !== realRoot) {
+    return null;
+  }
+  try {
+    const stats = await fs.stat(realFile);
+    if (!stats.isFile()) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return realFile;
 }
 
 /**
@@ -112,13 +168,13 @@ async function allocateSessionImagePath(sessionsRoot, sessionFilename) {
 }
 
 /**
- * Image files referenced by messages that live inside the sessions directory.
+ * Image files referenced by messages that live directly inside the sessions directory.
  *
  * @param {Array<object>} messages
  * @param {string} sessionsRoot
- * @returns {string[]}
+ * @returns {Promise<string[]>}
  */
-function sessionSidecarPaths(messages, sessionsRoot) {
+async function sessionSidecarPaths(messages, sessionsRoot) {
   if (!sessionsRoot) {
     return [];
   }
@@ -126,8 +182,8 @@ function sessionSidecarPaths(messages, sessionsRoot) {
   const seen = new Set();
   for (const msg of messages || []) {
     for (const part of imagePartsOf(msg)) {
-      const abs = resolveImagePartPath(part, { sessionsRoot });
-      if (!abs || !isFileInside(sessionsRoot, abs) || seen.has(abs)) {
+      const abs = await resolveSessionSidecarFile(part, sessionsRoot);
+      if (!abs || seen.has(abs)) {
         continue;
       }
       seen.add(abs);
@@ -140,14 +196,27 @@ function sessionSidecarPaths(messages, sessionsRoot) {
 /**
  * @param {Array<object>} messages
  * @param {string} sessionsRoot
+ * @param {{ warn?: (err: Error, filePath: string) => void }} [opts]
  * @returns {Promise<string[]>}
  */
-async function deleteSessionSidecarImages(messages, sessionsRoot) {
-  const paths = sessionSidecarPaths(messages, sessionsRoot);
+async function deleteSessionSidecarImages(messages, sessionsRoot, opts = {}) {
+  const warn =
+    opts && typeof opts.warn === 'function'
+      ? opts.warn
+      : (err, filePath) => {
+          console.warn(`Failed to delete session sidecar image ${filePath}:`, err);
+        };
+  const paths = await sessionSidecarPaths(messages, sessionsRoot);
+  const removed = [];
   for (const filePath of paths) {
-    await fs.rm(filePath, { force: true });
+    try {
+      await fs.rm(filePath, { force: true });
+      removed.push(filePath);
+    } catch (err) {
+      warn(err, filePath);
+    }
   }
-  return paths;
+  return removed;
 }
 
 /**
@@ -176,6 +245,18 @@ async function uniqueOutputFileName(outputsRoot, preferredName) {
 }
 
 /**
+ * @param {object} part
+ * @param {{ sessionsRoot?: string, resourcesRoot?: string, outputsRoot?: string }} roots
+ * @returns {Promise<string | null>}
+ */
+async function resolveExportImagePath(part, roots) {
+  if (part && part.source === 'sessions') {
+    return resolveSessionSidecarFile(part, roots && roots.sessionsRoot);
+  }
+  return resolveImagePartPath(part, roots);
+}
+
+/**
  * Copy assistant image parts into the Outputs library. Session sidecars stay
  * in place. Files that already live in Outputs are left as they are.
  *
@@ -194,7 +275,7 @@ async function copyAssistantImagesToOutputs(msg, roots) {
   await fs.mkdir(outputsRoot, { recursive: true });
   const copied = [];
   for (const part of imagePartsOf(msg)) {
-    const src = resolveImagePartPath(part, roots);
+    const src = await resolveExportImagePath(part, roots);
     if (!src) {
       throw new Error('Generated image path is missing.');
     }
@@ -228,7 +309,9 @@ module.exports = {
   deleteSessionSidecarImages,
   imagePartsOf,
   isFileInside,
+  isSessionSidecarName,
   resolveImagePartPath,
+  resolveSessionSidecarFile,
   sessionSidecarPaths,
   uniqueOutputFileName,
 };
