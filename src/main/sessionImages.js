@@ -11,6 +11,10 @@
 const fs = require('fs/promises');
 const path = require('path');
 const { isFileInside } = require('../../engines/common/fileInside');
+const {
+  releaseSessionImagePath,
+  reserveSessionImagePath,
+} = require('../../engines/common/imagePathReservation');
 
 const IMAGE_PART_TYPES = new Set(['image']);
 
@@ -153,11 +157,17 @@ async function allocateSessionImagePath(sessionsRoot, sessionFilename) {
   for (let n = 1; n < 100000; n += 1) {
     const relativePath = `${base}-${n}.png`;
     const absolutePath = path.join(sessionsRoot, relativePath);
+    if (!reserveSessionImagePath(absolutePath)) {
+      continue;
+    }
+    // Claim before the existence check so two overlapping calls cannot both
+    // observe the same free name.
     try {
       await fs.access(absolutePath);
     } catch {
       return { absolutePath, relativePath, source: 'sessions' };
     }
+    releaseSessionImagePath(absolutePath);
   }
   throw new Error('Could not allocate a session image path.');
 }
@@ -300,6 +310,7 @@ async function copyAssistantImagesToOutputs(msg, roots) {
 
 module.exports = {
   allocateSessionImagePath,
+  releaseSessionImagePath,
   copyAssistantImagesToOutputs,
   deleteSessionSidecarImages,
   imagePartsOf,

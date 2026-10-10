@@ -9,6 +9,7 @@ const {
   allocateSessionImagePath,
   copyAssistantImagesToOutputs,
   deleteSessionSidecarImages,
+  releaseSessionImagePath,
 } = require('../src/main/sessionImages');
 
 describe('session image sidecars', () => {
@@ -185,6 +186,41 @@ describe('session image sidecars', () => {
     assert.equal(await fs.readFile(outside, 'utf8'), 'secret');
     const stat = await fs.lstat(link);
     assert.equal(stat.isSymbolicLink(), true);
+  });
+
+  it('reserves a free name so a second allocation takes the next number', async () => {
+    const first = await allocateSessionImagePath(sessions, 'reserve.json');
+    const second = await allocateSessionImagePath(sessions, 'reserve.json');
+    assert.equal(first.relativePath, 'reserve-1.png');
+    assert.equal(second.relativePath, 'reserve-2.png');
+    assert.notEqual(first.absolutePath, second.absolutePath);
+    releaseSessionImagePath(first.absolutePath);
+    const reused = await allocateSessionImagePath(sessions, 'reserve.json');
+    assert.equal(reused.relativePath, 'reserve-1.png');
+    releaseSessionImagePath(second.absolutePath);
+    releaseSessionImagePath(reused.absolutePath);
+  });
+
+  it('does not hand overlapping allocations the same path', async () => {
+    const [left, right] = await Promise.all([
+      allocateSessionImagePath(sessions, 'race.json'),
+      allocateSessionImagePath(sessions, 'race.json'),
+    ]);
+    assert.equal(left.relativePath, 'race-1.png');
+    assert.equal(right.relativePath, 'race-2.png');
+    assert.notEqual(left.absolutePath, right.absolutePath);
+    releaseSessionImagePath(left.absolutePath);
+    releaseSessionImagePath(right.absolutePath);
+    await fs.writeFile(path.join(sessions, 'skip-1.png'), 'x');
+    const reserved = await allocateSessionImagePath(sessions, 'skip.json');
+    const next = await allocateSessionImagePath(sessions, 'skip.json');
+    assert.equal(reserved.relativePath, 'skip-2.png');
+    assert.equal(next.relativePath, 'skip-3.png');
+    releaseSessionImagePath(reserved.absolutePath);
+    const freed = await allocateSessionImagePath(sessions, 'skip.json');
+    assert.equal(freed.relativePath, 'skip-2.png');
+    releaseSessionImagePath(next.absolutePath);
+    releaseSessionImagePath(freed.absolutePath);
   });
 
   it('does not copy user attachments', async () => {
