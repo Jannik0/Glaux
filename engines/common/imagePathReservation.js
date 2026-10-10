@@ -50,7 +50,11 @@ function reserveSessionImagePath(absolutePath) {
  * @param {number | undefined | null} owner
  */
 function releaseSessionImagePath(absolutePath, owner) {
-  if (typeof absolutePath !== 'string' || !absolutePath || owner == null) {
+  if (typeof absolutePath !== 'string' || !absolutePath) {
+    return;
+  }
+  if (owner == null) {
+    console.warn('releaseSessionImagePath called without an owner token:', absolutePath);
     return;
   }
   const key = reservationKey(absolutePath);

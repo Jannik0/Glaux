@@ -201,6 +201,32 @@ describe('session image sidecars', () => {
     releaseSessionImagePath(reused.absolutePath, reused.reservationId);
   });
 
+  it('warns when a reservation is released without an owner token', async () => {
+    const allocated = await allocateSessionImagePath(sessions, 'warn.json');
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => {
+      warnings.push(args.map((part) => String(part)).join(' '));
+    };
+    try {
+      releaseSessionImagePath(undefined);
+      releaseSessionImagePath('');
+      releaseSessionImagePath(allocated.absolutePath);
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /owner token/);
+    assert.match(warnings[0], /warn-1\.png/);
+    const blocked = await allocateSessionImagePath(sessions, 'warn.json');
+    assert.equal(blocked.relativePath, 'warn-2.png');
+    releaseSessionImagePath(allocated.absolutePath, allocated.reservationId);
+    const again = await allocateSessionImagePath(sessions, 'warn.json');
+    assert.equal(again.relativePath, 'warn-1.png');
+    releaseSessionImagePath(blocked.absolutePath, blocked.reservationId);
+    releaseSessionImagePath(again.absolutePath, again.reservationId);
+  });
+
   it('keeps a newer claim when the previous owner releases again', async () => {
     const first = await allocateSessionImagePath(sessions, 'owner.json');
     releaseSessionImagePath(first.absolutePath, first.reservationId);

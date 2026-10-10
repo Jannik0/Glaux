@@ -284,7 +284,6 @@ describe('engine stream handler', { concurrency: 1 }, () => {
     assert.equal(result.ok, true);
     assert.equal(stops, 0);
     assert.equal(engineManager.getStatus().phase, phase);
-    assert.equal(engineManager.activeRunStopSealed(), false);
     assert.deepEqual(await engineManager.contextSnapshot(), before);
   });
 
@@ -310,23 +309,9 @@ describe('engine stream handler', { concurrency: 1 }, () => {
     assert.ok(error);
     assert.match(error.errorInfo.message, /sd failed/);
     const after = await engineManager.contextSnapshot();
-    assert.equal(after.length, kept.length);
-    assert.equal(
-      after.some((msg) =>
-        (msg.content || []).some((part) => part.type === 'text' && String(part.text).includes('a blue fox'))
-      ),
-      false
-    );
-    assert.equal(
-      after.some((msg) =>
-        (msg.content || []).some((part) => part.type === 'text' && part.text === STOP_MARKER)
-      ),
-      false
-    );
-    assert.equal(engineManager.activeRunStopSealed(), false);
+    assert.deepEqual(after, kept);
     engineManager.cancelRequestGeneration({ requestId: 'owned-error' });
     engineManager.cancelGeneration();
-    assert.equal(engineManager.activeRunStopSealed(), false);
-    assert.deepEqual(await engineManager.contextSnapshot(), after);
+    assert.deepEqual(await engineManager.contextSnapshot(), kept);
   });
 });

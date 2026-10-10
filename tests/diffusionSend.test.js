@@ -92,6 +92,44 @@ describe('sendPrompt diffusion', { concurrency: 1 }, () => {
     assert.deepEqual(await engineManager.contextSnapshot(), []);
   });
 
+  it('does not leave a stop marker when Stop arrives during an owned error discard', async () => {
+    contextManager.clear();
+    const keptPath = path.join(sessions, 'kept-fox.png');
+    await fs.writeFile(keptPath, 'png');
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'painted', imagePaths: [opts.outputPath] };
+    };
+    await engineManager.sendPrompt('a fox', { outputPath: keptPath });
+    const before = await engineManager.contextSnapshot();
+
+    const failPath = path.join(sessions, 'fail-fox.png');
+    await fs.writeFile(failPath, 'png');
+    stableDiffusion.runChat = async () => {
+      throw new Error('sd failed');
+    };
+    const fsPromises = require('fs').promises;
+    const originalStat = fsPromises.stat;
+    const resolvedFail = path.resolve(failPath);
+    fsPromises.stat = async function statDuringDiscard(file, opts) {
+      if (path.resolve(String(file)) === resolvedFail) {
+        fsPromises.stat = originalStat;
+        engineManager.cancelGeneration();
+      }
+      return originalStat.call(fsPromises, file, opts);
+    };
+    try {
+      await assert.rejects(
+        () => engineManager.sendPrompt('a blue fox', { outputPath: failPath }),
+        /sd failed/
+      );
+    } finally {
+      fsPromises.stat = originalStat;
+    }
+    assert.deepEqual(await engineManager.contextSnapshot(), before);
+    await assert.rejects(fs.stat(failPath));
+  });
+
   it('discards the image on cancel', async () => {
     contextManager.clear();
     const outputPath = path.join(sessions, 'run-1.png');

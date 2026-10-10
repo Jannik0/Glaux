@@ -1208,8 +1208,11 @@ async function sendPrompt(message, options = {}) {
       if (!generationOwns(run) || run.cancelled) {
         return await stopThisRun();
       }
-      await discardGeneratedOutput(outputPath, reservationId);
+      // Drop this turn and settle before the await. A Stop during the discard
+      // must not seal a run whose user message is about to be removed.
       contextManager.removeMessageById(userId);
+      settleOwnedRun(run);
+      await discardGeneratedOutput(outputPath, reservationId);
       throw err;
     } finally {
       releaseSessionImagePath(outputPath, reservationId);
