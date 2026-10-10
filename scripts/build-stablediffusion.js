@@ -18,6 +18,8 @@
  * `embed_tokens` weight onto the tensor name sd-cli already expects.
  * WebP decoding uses the libwebp submodule pinned by this revision, linked
  * statically so the package does not gain another shared library. WebM stays off.
+ * BSD and Unicode notices for code linked into sd-cli are copied into the
+ * stage directory. extraResources ships that directory with no file filter.
  *
  * Usage:
  *   node scripts/build-stablediffusion.js
@@ -193,6 +195,31 @@ function patchStaticLibwebp(srcDir) {
   console.log('Patched libwebp to link statically into sd-cli.');
 }
 
+/**
+ * Copy notice files that binary redistribution has to reproduce. They land
+ * next to sd-cli. package.json extraResources copies vendor/stablediffusion
+ * onto resources/stablediffusion with no filter, and afterPack does not
+ * delete these names.
+ * @param {string} srcDir
+ * @param {string} outDir
+ */
+function stageThirdPartyLicenses(srcDir, outDir) {
+  const notices = [
+    [path.join(srcDir, 'thirdparty', 'libwebp', 'COPYING'), 'LIBWEBP.COPYING'],
+    [path.join(srcDir, 'thirdparty', 'libwebp', 'PATENTS'), 'LIBWEBP.PATENTS'],
+    [path.join(srcDir, 'thirdparty', 'oniguruma', 'COPYING'), 'ONIGURUMA.COPYING'],
+    [path.join(srcDir, 'thirdparty', 'LICENSE.darts_clone.txt'), 'DARTS.LICENSE'],
+    [path.join(srcDir, 'thirdparty', 'utf8proc', 'LICENSE.md'), 'UTF8PROC.LICENSE.md'],
+  ];
+  for (const [src, name] of notices) {
+    if (!fs.existsSync(src)) {
+      throw new Error(`Missing third-party license text: ${src}`);
+    }
+    fs.copyFileSync(src, path.join(outDir, name));
+    console.log(`Staged ${name}`);
+  }
+}
+
 function ensureSources(srcDir) {
   if (srcDir === DEFAULT_SRC) {
     ensureGitDep({
@@ -313,6 +340,7 @@ function main() {
     transcribe: path.join(ROOT, 'vendor', 'transcribe'),
     stablediffusion: opts.outDir,
   });
+  stageThirdPartyLicenses(opts.srcDir, opts.outDir);
 
   console.log('stable-diffusion.cpp build complete.');
   console.log('ggml-cuda is staged in vendor/cuda (GGML_MAX_NAME=160).');

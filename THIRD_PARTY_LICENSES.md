@@ -27,7 +27,122 @@ Electron already writes Chromium and Electron license files into the install dir
 
 - **What:** `sd-cli` and ggml backend modules under `vendor/stablediffusion` (packaged as `resources/stablediffusion`). CUDA runtime libraries and this build’s ggml CUDA fatbin are the shared copies in `vendor/cuda`. llama.cpp and transcribe.cpp are compiled with the same `GGML_MAX_NAME=160` and load that fatbin from the sibling `cuda` directory.
 - **License:** MIT
-- **Upstream:** https://github.com/leejet/stable-diffusion.cpp (ggml submodule https://github.com/ggml-org/ggml, also MIT)
+- **Upstream:** https://github.com/leejet/stable-diffusion.cpp at `a1ded76` (ggml submodule https://github.com/ggml-org/ggml at `89c4413`, also MIT; that ggml tree vendors no further libraries)
+
+`npm run build:stablediffusion` copies the notice files named below into `vendor/stablediffusion`, next to `sd-cli`. `package.json` `extraResources` copies that directory to `resources/stablediffusion` with no filter, and `afterPack` does not remove them. The pieces below are compiled into `sd-cli` or the shared `stable-diffusion` library staged beside it. No separate library file ships for them.
+
+**libwebp** is statically linked into `sd-cli` (libwebp, libwebpmux, and libsharpyuv).
+
+- **License:** BSD-3-Clause. The upstream text is staged as `LIBWEBP.COPYING`. The WebM additional patent grant is staged as `LIBWEBP.PATENTS`.
+- **Copyright:** Copyright (c) 2010, Google Inc. All rights reserved.
+- **Upstream:** https://github.com/webmproject/libwebp at `0c9546f7efc61eac7f79ae115c3f99c91c21c443` (`LIBWEBP_REV` in `scripts/build-stablediffusion.js`)
+
+```
+Copyright (c) 2010, Google Inc. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+  * Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in
+    the documentation and/or other materials provided with the
+    distribution.
+
+  * Neither the name of Google nor the names of its contributors may
+    be used to endorse or promote products derived from this software
+    without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+**Oniguruma** 6.9.10 is linked into the shared `stable-diffusion` library.
+
+- **License:** BSD-2-Clause. Staged as `ONIGURUMA.COPYING`.
+- **Copyright:** Copyright (c) 2002-2021 K.Kosako
+- **Upstream:** https://github.com/kkos/oniguruma at `4ef89209a239c1aea328cf13c05a2807e5c146d1`
+
+```
+Copyright (c) 2002-2021  K.Kosako  <kkosako0@gmail.com>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+```
+
+**darts-clone** is compiled into the T5 unigram tokenizer in that same library.
+
+- **License:** BSD-3-Clause. Staged as `DARTS.LICENSE` (upstream `thirdparty/LICENSE.darts_clone.txt`, including its `<ORGANIZATION>` placeholder).
+- **Copyright:** Copyright (c) 2008-2011, Susumu Yata
+- **Upstream:** https://github.com/google/sentencepiece (`third_party/darts_clone`)
+
+```
+Copyright (c) 2008-2011, Susumu Yata
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+- Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+- Neither the name of the <ORGANIZATION> nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+**utf8proc** 2.10.0 is linked into the shared library. Its MIT terms and the Unicode data license for `utf8proc_data.c` (Copyright (c) 1991-2007 Unicode, Inc.) are staged as `UTF8PROC.LICENSE.md`.
+
+- **License:** MIT, plus the Unicode data license
+- **Upstream:** https://github.com/JuliaStrings/utf8proc at `a1b99daa2a3393884220264c927a48ba1251a9c6` (Unicode 16.0.0)
+
+**nlohmann/json** 3.11.2 is compiled into `sd-cli` and the shared library.
+
+- **License:** MIT. Copyright (c) 2013-2022 Niels Lohmann.
+- **Upstream:** https://github.com/nlohmann/json
+
+**zip** (https://github.com/kuba--/zip) is compiled into `sd-cli` and the shared library.
+
+- **License:** MIT
+
+**stb_image** 2.28, **stb_image_write** 1.16, and **stb_image_resize** 0.90 are compiled into `sd-cli`.
+
+- **License:** public domain
+- **Upstream:** https://github.com/nothings/stb
+
+**miniz** 2.2.0 is compiled into that zip reader.
+
+- **License:** The Unlicense (public domain)
+- **Upstream:** https://github.com/richgel999/miniz
 
 
 ## FFmpeg / ffprobe / dav1d
