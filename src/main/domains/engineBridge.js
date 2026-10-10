@@ -14,7 +14,7 @@ const {
   reserveActiveSessionFilename,
   clearPendingSessionFilename,
 } = require('./sessions');
-const { allocateSessionImagePath } = require('../sessionImages');
+const { allocateSessionImagePath, releaseSessionImagePath } = require('../sessionImages');
 const { isDiffusionPipelineTag } = require('../../../engines/common/resolveEngineId');
 const { clearPersistedModelIfNotCached, modelIdHasCachedWeights } = require('./modelsPrefs');
 const {
@@ -57,8 +57,9 @@ async function textToImageOutputPath() {
     return undefined;
   }
   const filename = reserveActiveSessionFilename();
+  const sessionsRoot = getSessionsRoot() || engineManager.configuredSessionsRoot();
   try {
-    const allocated = await allocateSessionImagePath(getSessionsRoot(), filename);
+    const allocated = await allocateSessionImagePath(sessionsRoot, filename);
     return allocated.absolutePath;
   } catch (err) {
     if (!state.activeSessionFilename) {
@@ -97,7 +98,7 @@ function normalizeFilesPayload(rawFiles) {
   return normalized;
 }
 
-async function persistTurnSession(logLabel, deps) {
+async function persistTurnSession(logLabel, deps, outputPath) {
   try {
     await persistActiveSession(deps);
   } catch (persistErr) {
@@ -105,6 +106,7 @@ async function persistTurnSession(logLabel, deps) {
     if (!state.activeSessionFilename) {
       clearPendingSessionFilename();
     }
+    await engineManager.discardSessionOutput(outputPath);
   }
 }
 
@@ -128,15 +130,55 @@ async function deliverSendMessage(payload, deps = {}) {
       resubmit,
       files,
       outputPath,
+      requestId: deps.requestId,
+      senderId: deps.senderId,
     });
     const split = splitPromptResult(response);
-    await persistTurnSession('Failed to persist session after chat turn:', deps.persist);
+    await persistTurnSession('Failed to persist session after chat turn:', deps.persist, outputPath);
     return { response: split.text, images: split.images };
   } catch (err) {
+    releaseSessionImagePath(outputPath);
     if (!state.activeSessionFilename) {
       clearPendingSessionFilename();
     }
     throw err;
+  }
+}
+
+/**
+ * @param {unknown} payload
+ * @returns {Promise<{ ok: boolean, response?: string, images?: Array<object>, error?: string, errorInfo?: object }>}
+ */
+async function handleEngineSendMessage(payload) {
+  if (!state.engineBootstrapped) {
+    return fail(new Error(t('errors.engineBridge.engineNotInitialized')), 'E_NOT_READY');
+  }
+  try {
+    return ok(await deliverSendMessage(payload));
+  } catch (err) {
+    return fail(err, 'E_INFERENCE');
+  }
+}
+
+/**
+ * Cancel the run bound to this stream request. A missing request cancels the
+ * active run only when that run was started by the same sender.
+ *
+ * @param {string} requestId
+ * @param {{ id?: unknown } | null | undefined} sender
+ */
+function cancelStreamRequest(requestId, sender) {
+  const id = requestId ? String(requestId) : '';
+  engineManager.cancelRequestGeneration({
+    requestId: id,
+    senderId: sender && sender.id != null ? sender.id : undefined,
+  });
+  if (!id) {
+    return;
+  }
+  const streamState = state.activeStreamRequests.get(id);
+  if (streamState) {
+    streamState.canceled = true;
   }
 }
 
@@ -214,16 +256,7 @@ function registerEngineBridgeIpc() {
     }
   });
 
-  ipcMain.handle('engine:sendMessage', async (_event, payload) => {
-    if (!state.engineBootstrapped) {
-      return fail(new Error(t('errors.engineBridge.engineNotInitialized')), 'E_NOT_READY');
-    }
-    try {
-      return ok(await deliverSendMessage(payload));
-    } catch (err) {
-      return fail(err, 'E_INFERENCE');
-    }
-  });
+  ipcMain.handle('engine:sendMessage', async (_event, payload) => handleEngineSendMessage(payload));
 
   ipcMain.handle('engine:getStatus', async () => {
     try {
@@ -334,7 +367,7 @@ function registerEngineBridgeIpc() {
       if (activeState) {
         activeState.canceled = true;
         cleanupStream();
-        engineManager.cancelGeneration();
+        cancelStreamRequest(requestId, sender);
       }
     }
 
@@ -390,13 +423,16 @@ function registerEngineBridgeIpc() {
         );
       };
       let sendPromptPromise;
+      let outputPath;
       try {
-        const outputPath = await textToImageOutputPath();
+        outputPath = await textToImageOutputPath();
         sendPromptPromise = engineManager.sendPrompt(message, {
           enableThinking,
           resubmit,
           files,
           outputPath,
+          requestId,
+          senderId: sender && sender.id != null ? sender.id : undefined,
           onToken: (chunk) => {
             if (streamState.canceled) {
               return;
@@ -433,7 +469,7 @@ function registerEngineBridgeIpc() {
 
         if (streamState.canceled) {
           emitStreamEvent(sender, { requestId, type: 'canceled' });
-          await persistTurnSession('Failed to persist session after canceled chat turn:');
+          await persistTurnSession('Failed to persist session after canceled chat turn:', undefined, outputPath);
           return;
         }
 
@@ -447,14 +483,14 @@ function registerEngineBridgeIpc() {
           response: split.text,
           images: split.images,
         });
-        await persistTurnSession('Failed to persist session after chat turn:');
+        await persistTurnSession('Failed to persist session after chat turn:', undefined, outputPath);
       } catch (err) {
         if (sendPromptPromise) {
           sendPromptPromise.catch(() => {});
         }
         if (streamState.canceled) {
           emitStreamEvent(sender, { requestId, type: 'canceled' });
-          await persistTurnSession('Failed to persist session after canceled chat turn:');
+          await persistTurnSession('Failed to persist session after canceled chat turn:', undefined, outputPath);
           return;
         }
         const isStreamIdleTimeout =
@@ -484,7 +520,10 @@ function registerEngineBridgeIpc() {
             }
           }
         } else {
-          engineManager.cancelGeneration();
+          engineManager.cancelRequestGeneration({
+            requestId,
+            senderId: sender && sender.id != null ? sender.id : undefined,
+          });
         }
         if (!state.activeSessionFilename) {
           clearPendingSessionFilename();
@@ -497,16 +536,9 @@ function registerEngineBridgeIpc() {
     });
   });
 
-  ipcMain.on('engine:streamCancel', (_event, payload) => {
-    engineManager.cancelGeneration();
+  ipcMain.on('engine:streamCancel', (event, payload) => {
     const requestId = payload && payload.requestId ? String(payload.requestId) : '';
-    if (!requestId) {
-      return;
-    }
-    const streamState = state.activeStreamRequests.get(requestId);
-    if (streamState) {
-      streamState.canceled = true;
-    }
+    cancelStreamRequest(requestId, event && event.sender);
   });
 
   ipcMain.handle('engine:cancel', async () => {
@@ -522,4 +554,6 @@ function registerEngineBridgeIpc() {
 module.exports = {
   registerEngineBridgeIpc,
   deliverSendMessage,
+  handleEngineSendMessage,
+  cancelStreamRequest,
 };

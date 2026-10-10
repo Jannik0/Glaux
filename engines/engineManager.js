@@ -41,6 +41,7 @@ const {
   assertTextToImagePrompt,
 } = require('./common/textToImage');
 const { isFileInside } = require('./common/fileInside');
+const { releaseSessionImagePath } = require('./common/imagePathReservation');
 
 /** How long shutdown waits for the Hugging Face pipeline to drop its offload files. */
 const HF_DESTROY_TIMEOUT_MS = 5000;
@@ -66,20 +67,43 @@ let generationInFlight = false;
  * Identifies the sendPrompt call that owns generationInFlight.
  * cancelGeneration clears the flag immediately; a newer run must not have it
  * reset by the older run's finally. Each run keeps its own cancelled flag.
- * @type {{ token: number, cancelled: boolean } | null}
+ * @type {{ token: number, cancelled: boolean, requestId: string, senderId: unknown } | null}
  */
 let activeGeneration = null;
 let generationRun = 0;
 
 /**
- * @returns {{ token: number, cancelled: boolean }}
+ * request id → run token. Kept after the run settles so a late cancel for that
+ * request cannot fall through and cancel a newer run from the same sender.
+ * @type {Map<string, number>}
  */
-function startGenerationRun() {
-  const run = { token: ++generationRun, cancelled: false };
+const requestRunTokens = new Map();
+
+/**
+ * @param {{ requestId?: string, senderId?: unknown }} [meta]
+ * @returns {{ token: number, cancelled: boolean, requestId: string, senderId: unknown }}
+ */
+function startGenerationRun(meta = {}) {
+  const requestId = meta && meta.requestId ? String(meta.requestId) : '';
+  const senderId = meta && meta.senderId != null ? meta.senderId : undefined;
+  const run = { token: ++generationRun, cancelled: false, requestId, senderId };
   activeGeneration = run;
   generationInFlight = true;
   phase = 'generating';
+  if (requestId) {
+    requestRunTokens.set(requestId, run.token);
+  }
   return run;
+}
+
+/**
+ * @param {{ requestId?: string, senderId?: unknown }} [options]
+ * @returns {{ requestId: string, senderId: unknown }}
+ */
+function generationMeta(options) {
+  const requestId = options && options.requestId ? String(options.requestId) : '';
+  const senderId = options && options.senderId != null ? options.senderId : undefined;
+  return { requestId, senderId };
 }
 
 /**
@@ -481,22 +505,40 @@ async function configurePaths(opts) {
  * @param {string | undefined} outputPath
  */
 async function discardGeneratedOutput(outputPath) {
-  const sessionsRoot = initOptions && initOptions.sessionsRoot;
-  if (typeof outputPath !== 'string' || !outputPath || !sessionsRoot) {
-    return;
-  }
-  if (!isFileInside(sessionsRoot, outputPath)) {
-    return;
-  }
-  const file = path.resolve(outputPath);
   try {
-    const stats = await fs.stat(file);
-    if (stats.isFile()) {
-      await fs.unlink(file);
+    const sessionsRoot = initOptions && initOptions.sessionsRoot;
+    if (typeof outputPath !== 'string' || !outputPath || !sessionsRoot) {
+      return;
     }
-  } catch {
-    /* already gone */
+    if (!isFileInside(sessionsRoot, outputPath)) {
+      return;
+    }
+    const file = path.resolve(outputPath);
+    try {
+      const stats = await fs.stat(file);
+      if (stats.isFile()) {
+        await fs.unlink(file);
+      }
+    } catch {
+      /* already gone */
+    }
+  } finally {
+    releaseSessionImagePath(outputPath);
   }
+}
+
+/**
+ * Place the stop-marker assistant immediately after this run's own user turn.
+ * A missing id is left alone so the marker cannot land on a newer turn.
+ *
+ * @param {number | null | undefined} userId
+ * @param {string} text
+ * @returns {string}
+ */
+function recordStoppedAssistant(userId, text) {
+  const stopped = withStopMarker(text);
+  contextManager.insertAssistantAfter(userId, stopped);
+  return stopped;
 }
 
 /**
@@ -929,7 +971,7 @@ async function resetInferenceWorker(options = {}) {
   }
 }
 
-function cancelGeneration() {
+function cancelActiveGeneration() {
   if (activeGeneration) {
     activeGeneration.cancelled = true;
   }
@@ -943,6 +985,42 @@ function cancelGeneration() {
   if (phase === 'generating') {
     phase = 'idle';
   }
+}
+
+function cancelGeneration() {
+  cancelActiveGeneration();
+}
+
+/**
+ * Cancel only the run bound to this request. A request that already settled
+ * does not cancel whatever is running now. With no matching request, cancel
+ * the active run only when it belongs to the same sender.
+ *
+ * @param {{ requestId?: string, senderId?: unknown }} [scope]
+ */
+function cancelRequestGeneration(scope = {}) {
+  const requestId = scope && scope.requestId ? String(scope.requestId) : '';
+  if (requestId && requestRunTokens.has(requestId)) {
+    const token = requestRunTokens.get(requestId);
+    if (activeGeneration && activeGeneration.token === token) {
+      cancelActiveGeneration();
+    }
+    return;
+  }
+  const senderId = scope && scope.senderId;
+  if (
+    activeGeneration &&
+    senderId != null &&
+    activeGeneration.senderId != null &&
+    activeGeneration.senderId === senderId
+  ) {
+    cancelActiveGeneration();
+  }
+}
+
+function configuredSessionsRoot() {
+  const root = initOptions && initOptions.sessionsRoot;
+  return typeof root === 'string' ? root : '';
 }
 
 /**
@@ -973,27 +1051,22 @@ async function sendPrompt(message, options = {}) {
       throw new Error('Image generation output path is not configured.');
     }
     const outputPath = options.outputPath;
-    contextManager.appendUser(prompt, {
+    const userId = contextManager.appendUser(prompt, {
       imagePaths,
       files: checked.imageFile ? describeAttachments([checked.imageFile]) : [],
     });
-    const run = startGenerationRun();
+    const run = startGenerationRun(generationMeta(options));
     const pendingCompanions = companionJobs.get(activeModelId)?.promise;
-    const stopOwned = async () => {
+    const stopThisRun = async () => {
       await discardGeneratedOutput(outputPath);
-      const stopped = withStopMarker('');
-      contextManager.appendAssistant(stopped);
-      return stopped;
+      return recordStoppedAssistant(userId, '');
     };
     try {
       if (pendingCompanions) {
         await pendingCompanions;
       }
-      if (!generationOwns(run)) {
-        return withStopMarker('');
-      }
-      if (run.cancelled) {
-        return stopOwned();
+      if (!generationOwns(run) || run.cancelled) {
+        return await stopThisRun();
       }
       const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
         onToken: options.onToken,
@@ -1004,11 +1077,8 @@ async function sendPrompt(message, options = {}) {
         audioPaths: [],
         videoPaths: [],
       });
-      if (!generationOwns(run)) {
-        return withStopMarker('');
-      }
-      if (run.cancelled) {
-        return stopOwned();
+      if (!generationOwns(run) || run.cancelled) {
+        return await stopThisRun();
       }
       const rawPaths =
         response && typeof response === 'object' && Array.isArray(response.imagePaths)
@@ -1027,16 +1097,14 @@ async function sendPrompt(message, options = {}) {
       contextManager.appendAssistant(packed.text, { imageParts: packed.imageParts });
       return { text: packed.text, imagePaths: packed.imagePaths, images: packed.images };
     } catch (err) {
-      if (!generationOwns(run)) {
-        return withStopMarker('');
-      }
-      if (run.cancelled) {
-        return stopOwned();
+      if (!generationOwns(run) || run.cancelled) {
+        return await stopThisRun();
       }
       await discardGeneratedOutput(outputPath);
-      contextManager.rollbackLastUser();
+      contextManager.removeMessageById(userId);
       throw err;
     } finally {
+      releaseSessionImagePath(outputPath);
       if (generationOwns(run)) {
         generationInFlight = false;
         phase = 'idle';
@@ -1046,64 +1114,69 @@ async function sendPrompt(message, options = {}) {
 
   const enableThinking = options.enableThinking === true;
   const resubmit = options.resubmit !== false;
-  const { message: enrichedMessage, imagePaths, audioPaths, videoPaths, attachmentFiles } =
-    await prepareInferenceRequest(message, options.files);
-
-  contextManager.appendUser(enrichedMessage, {
-    imagePaths,
-    audioPaths,
-    videoPaths,
-    files: attachmentFiles,
-  });
-
-  const run = startGenerationRun();
-  let accumulated = '';
+  const run = startGenerationRun(generationMeta(options));
   try {
-    const messages = stripThinkingFromMessages(contextManager.snapshot());
-    const response = await engines[activeEngineId].runChat(activeModelId, enableThinking, enrichedMessage, {
-      onToken: (chunk) => {
-        if (typeof chunk === 'string' && chunk) {
-          accumulated += chunk;
-        }
-        if (typeof options.onToken === 'function') {
-          options.onToken(chunk);
-        }
-      },
-      onReplace: (text) => {
-        accumulated = typeof text === 'string' ? text : '';
-        if (typeof options.onReplace === 'function') {
-          options.onReplace(text);
-        }
-      },
+    const prepared = await prepareInferenceRequest(message, options.files);
+    if (!generationOwns(run)) {
+      return withStopMarker('');
+    }
+    const { message: enrichedMessage, imagePaths, audioPaths, videoPaths, attachmentFiles } = prepared;
+    const userId = contextManager.appendUser(enrichedMessage, {
       imagePaths,
       audioPaths,
       videoPaths,
-      resubmit,
-      messages,
+      files: attachmentFiles,
     });
-    if (!generationOwns(run)) {
-      return withStopMarker(accumulated);
-    }
     if (run.cancelled) {
-      const partial =
-        typeof response === 'string' && response.length > 0 ? response : accumulated;
-      const stopped = withStopMarker(partial);
-      contextManager.appendAssistant(stopped);
-      return stopped;
+      return recordStoppedAssistant(userId, '');
     }
-    contextManager.appendAssistant(typeof response === 'string' ? response : '');
-    return typeof response === 'string' ? response : '';
-  } catch (err) {
-    if (!generationOwns(run)) {
-      return withStopMarker(accumulated);
+    let accumulated = '';
+    try {
+      const messages = stripThinkingFromMessages(contextManager.snapshot());
+      const response = await engines[activeEngineId].runChat(
+        activeModelId,
+        enableThinking,
+        enrichedMessage,
+        {
+          onToken: (chunk) => {
+            if (typeof chunk === 'string' && chunk) {
+              accumulated += chunk;
+            }
+            if (typeof options.onToken === 'function') {
+              options.onToken(chunk);
+            }
+          },
+          onReplace: (text) => {
+            accumulated = typeof text === 'string' ? text : '';
+            if (typeof options.onReplace === 'function') {
+              options.onReplace(text);
+            }
+          },
+          imagePaths,
+          audioPaths,
+          videoPaths,
+          resubmit,
+          messages,
+        }
+      );
+      if (!generationOwns(run)) {
+        return recordStoppedAssistant(userId, accumulated);
+      }
+      if (run.cancelled) {
+        const partial =
+          typeof response === 'string' && response.length > 0 ? response : accumulated;
+        return recordStoppedAssistant(userId, partial);
+      }
+      const text = typeof response === 'string' ? response : '';
+      contextManager.appendAssistant(text);
+      return text;
+    } catch (err) {
+      if (!generationOwns(run) || run.cancelled) {
+        return recordStoppedAssistant(userId, accumulated);
+      }
+      contextManager.removeMessageById(userId);
+      throw err;
     }
-    if (run.cancelled) {
-      const stopped = withStopMarker(accumulated);
-      contextManager.appendAssistant(stopped);
-      return stopped;
-    }
-    contextManager.rollbackLastUser();
-    throw err;
   } finally {
     if (generationOwns(run)) {
       generationInFlight = false;
@@ -1219,6 +1292,9 @@ module.exports = {
   resetInferenceWorker,
   sendPrompt,
   cancelGeneration,
+  cancelRequestGeneration,
+  configuredSessionsRoot,
+  discardSessionOutput: discardGeneratedOutput,
   getStatus,
   chatbotSupportsThinking,
   chatbotHasChatTemplate,

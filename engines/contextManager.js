@@ -10,6 +10,15 @@
 let messages = [];
 
 /**
+ * Identity of stored message objects. Not copied onto the message, so snapshots
+ * and saved sessions stay free of it. A superseded run uses the id captured
+ * when its user turn was appended.
+ * @type {WeakMap<object, number>}
+ */
+const messageIds = new WeakMap();
+let nextMessageId = 1;
+
+/**
  * @param {unknown} value
  * @returns {Array}
  */
@@ -173,7 +182,12 @@ function append(msg) {
   if (msg.role !== 'user' && msg.role !== 'assistant') {
     throw new Error('Context message has an invalid role.');
   }
-  messages.push(cloneJson(msg));
+  const stored = cloneJson(msg);
+  messages.push(stored);
+  const id = nextMessageId;
+  nextMessageId += 1;
+  messageIds.set(stored, id);
+  return id;
 }
 
 /**
@@ -181,7 +195,7 @@ function append(msg) {
  * @param {{ imagePaths?: string[], audioPaths?: string[], videoPaths?: string[], files?: Array<{ path?: string, source?: string, relativePath?: string, kind?: string }> }} [media]
  */
 function appendUser(text, media) {
-  append(buildUserMessage(text, media));
+  return append(buildUserMessage(text, media));
 }
 
 /**
@@ -190,7 +204,61 @@ function appendUser(text, media) {
  */
 function appendAssistant(text, extras) {
   const imageParts = extras && Array.isArray(extras.imageParts) ? extras.imageParts : undefined;
-  append(buildAssistantMessage(text, imageParts));
+  return append(buildAssistantMessage(text, imageParts));
+}
+
+/**
+ * @param {number | null | undefined} id
+ * @returns {number}
+ */
+function messageIndex(id) {
+  if (id == null) {
+    return -1;
+  }
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messageIds.get(messages[i]) === id) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Insert an assistant turn immediately after the user message identified at
+ * append time. Does nothing when that message is already gone, so a newer
+ * turn is never used as the anchor.
+ *
+ * @param {number | null | undefined} userId
+ * @param {string} text
+ * @param {{ imageParts?: Array<object> }} [extras]
+ * @returns {number | null}
+ */
+function insertAssistantAfter(userId, text, extras) {
+  const index = messageIndex(userId);
+  if (index < 0) {
+    return null;
+  }
+  const imageParts = extras && Array.isArray(extras.imageParts) ? extras.imageParts : undefined;
+  const stored = cloneJson(buildAssistantMessage(text, imageParts));
+  const id = nextMessageId;
+  nextMessageId += 1;
+  messageIds.set(stored, id);
+  messages.splice(index + 1, 0, stored);
+  return id;
+}
+
+/**
+ * Remove one message by the id captured when it was stored.
+ * @param {number | null | undefined} id
+ * @returns {boolean}
+ */
+function removeMessageById(id) {
+  const index = messageIndex(id);
+  if (index < 0) {
+    return false;
+  }
+  messages.splice(index, 1);
+  return true;
 }
 
 /**
@@ -221,6 +289,8 @@ module.exports = {
   append,
   appendUser,
   appendAssistant,
+  insertAssistantAfter,
+  removeMessageById,
   rollbackLastUser,
   buildUserMessage,
   buildAssistantMessage,

@@ -9,8 +9,8 @@ const engineManager = require('../engines/engineManager');
 const contextManager = require('../engines/contextManager');
 const stableDiffusion = require('../engines/stablediffusioncpp/engine');
 const state = require('../src/main/state');
-const { deliverSendMessage } = require('../src/main/domains/engineBridge');
-const { allocateSessionImagePath } = require('../src/main/sessionImages');
+const { deliverSendMessage, handleEngineSendMessage } = require('../src/main/domains/engineBridge');
+const { allocateSessionImagePath, releaseSessionImagePath } = require('../src/main/sessionImages');
 const {
   clearPendingSessionFilename,
   getPendingSessionFilename,
@@ -120,11 +120,102 @@ describe('engine:sendMessage session persist', { concurrency: 1 }, () => {
     assert.equal(state.activeSessionFilename, null);
     assert.equal(getPendingSessionFilename(), null);
     await assert.rejects(fs.stat(allocated.absolutePath));
+    const reused = await allocateSessionImagePath(sessions, filename);
+    assert.equal(reused.relativePath, allocated.relativePath);
+    releaseSessionImagePath(reused.absolutePath);
     if (jsonBefore) {
       const jsonAfter = await fs.stat(jsonPath);
       assert.equal(jsonAfter.mtimeMs, jsonBefore.mtimeMs);
     } else {
       await assert.rejects(fs.stat(jsonPath));
     }
+  });
+
+  it('allocates the sidecar through textToImageOutputPath', async () => {
+    contextManager.clear();
+    state.activeSessionFilename = null;
+    clearPendingSessionFilename();
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      assert.equal(opts.outputPath.startsWith(sessions), true);
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'allocated', imagePaths: [opts.outputPath] };
+    };
+
+    const result = await deliverSendMessage('a painted fox', { persist: persistDeps() });
+    assert.equal(result.response, 'allocated');
+    assert.equal(result.images.length, 1);
+    assert.match(result.images[0].relativePath, /-\d+\.png$/);
+    assert.equal(await fs.readFile(path.join(sessions, result.images[0].relativePath), 'utf8'), 'png');
+    assert.equal(state.activeSessionFilename.endsWith('.json'), true);
+    assert.equal(getPendingSessionFilename(), null);
+  });
+
+  it('deletes only that turn sidecar when persisting the session fails', async () => {
+    contextManager.clear();
+    state.activeSessionFilename = null;
+    clearPendingSessionFilename();
+    const outputs = path.join(root, 'Outputs');
+    await fs.mkdir(outputs, { recursive: true });
+    const keep = path.join(outputs, 'keep.png');
+    await fs.writeFile(keep, 'keep');
+    let sidecar;
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      sidecar = opts.outputPath;
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'done', imagePaths: [opts.outputPath] };
+    };
+
+    const result = await deliverSendMessage('a red fox', {
+      persist: {
+        contextSnapshot: () => engineManager.contextSnapshot(),
+        writeSessionFile: async () => {
+          throw new Error('disk full');
+        },
+      },
+    });
+
+    assert.equal(result.response, 'done');
+    assert.equal(state.activeSessionFilename, null);
+    assert.equal(getPendingSessionFilename(), null);
+    await assert.rejects(fs.stat(sidecar));
+    assert.equal(await fs.readFile(keep, 'utf8'), 'keep');
+
+    await fs.writeFile(keep, 'orig');
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'done', imagePaths: [opts.outputPath] };
+    };
+    await deliverSendMessage('a red fox', {
+      outputPath: keep,
+      persist: {
+        contextSnapshot: () => engineManager.contextSnapshot(),
+        writeSessionFile: async () => {
+          throw new Error('disk full');
+        },
+      },
+    });
+    assert.equal(await fs.readFile(keep, 'utf8'), 'png');
+  });
+
+  it('wraps engine:sendMessage and refuses to run before bootstrap', async () => {
+    contextManager.clear();
+    state.engineBootstrapped = false;
+    const denied = await handleEngineSendMessage('a red fox');
+    assert.equal(denied.ok, false);
+    assert.equal(denied.errorInfo.code, 'E_NOT_READY');
+    assert.deepEqual(await engineManager.contextSnapshot(), []);
+
+    state.engineBootstrapped = true;
+    state.activeSessionFilename = null;
+    clearPendingSessionFilename();
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'from-ipc', imagePaths: [opts.outputPath] };
+    };
+    const allowed = await handleEngineSendMessage('a painted fox');
+    assert.equal(allowed.ok, true);
+    assert.equal(allowed.response, 'from-ipc');
+    assert.equal(allowed.images.length, 1);
+    state.engineBootstrapped = false;
   });
 });

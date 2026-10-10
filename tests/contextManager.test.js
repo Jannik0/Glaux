@@ -84,4 +84,28 @@ describe('contextManager message parts', () => {
       },
     ]);
   });
+
+  it('inserts an assistant turn after one user message and can remove that user', () => {
+    const first = contextManager.appendUser('one');
+    const second = contextManager.appendUser('two');
+    const inserted = contextManager.insertAssistantAfter(first, '[STOP]');
+    assert.equal(typeof inserted, 'number');
+    assert.equal(contextManager.insertAssistantAfter(999999, 'nope'), null);
+    const snap = contextManager.snapshot();
+    assert.deepEqual(
+      snap.map((msg) => ({ role: msg.role, text: msg.content[0].text })),
+      [
+        { role: 'user', text: 'one' },
+        { role: 'assistant', text: '[STOP]' },
+        { role: 'user', text: 'two' },
+      ]
+    );
+    assert.equal(JSON.stringify(snap).includes('messageId'), false);
+    assert.equal(contextManager.removeMessageById(second), true);
+    assert.equal(contextManager.removeMessageById(second), false);
+    assert.deepEqual(
+      contextManager.snapshot().map((msg) => msg.content[0].text),
+      ['one', '[STOP]']
+    );
+  });
 });
