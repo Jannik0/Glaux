@@ -16,6 +16,8 @@
  *
  * One-shot CLI. One name-conversion patch maps a Hugging Face text encoder's
  * `embed_tokens` weight onto the tensor name sd-cli already expects.
+ * WebP decoding uses the libwebp submodule pinned by this revision, linked
+ * statically so the package does not gain another shared library. WebM stays off.
  *
  * Usage:
  *   node scripts/build-stablediffusion.js
@@ -55,6 +57,9 @@ const SD_CPP_REPO = 'https://github.com/leejet/stable-diffusion.cpp';
 const SD_CPP_REV = 'a1ded76da5818803fca97a3b433669ef727d32cf';
 const GGML_REPO = 'https://github.com/ggml-org/ggml';
 const GGML_REV = '89c4413f5da6fb20cc796f16033d37f129be81fd';
+/** Gitlink of thirdparty/libwebp at SD_CPP_REV. No system libwebp. */
+const LIBWEBP_REPO = 'https://github.com/webmproject/libwebp.git';
+const LIBWEBP_REV = '0c9546f7efc61eac7f79ae115c3f99c91c21c443';
 
 function printHelp() {
   console.log(`Usage: node scripts/build-stablediffusion.js [options]
@@ -157,6 +162,37 @@ function patchLlmEmbedTokens(srcDir) {
   console.log('Patched LLM embed_tokens name conversion.');
 }
 
+/**
+ * The parent build sets BUILD_SHARED_LIBS=ON for ggml. libwebp would then be
+ * a shared library that stageNativeRuntime does not copy (its name is not a
+ * ggml/stable-diffusion module). Force a static libwebp so sd-cli links it in.
+ * @param {string} srcDir
+ */
+function patchStaticLibwebp(srcDir) {
+  const file = path.join(srcDir, 'thirdparty', 'CMakeLists.txt');
+  const marker = 'GLAUX_STATIC_LIBWEBP';
+  let src = fs.readFileSync(file, 'utf8');
+  if (src.includes(marker)) {
+    return;
+  }
+  const needle = 'add_subdirectory(libwebp EXCLUDE_FROM_ALL)';
+  if (!src.includes(needle)) {
+    throw new Error('Could not locate the libwebp subdirectory in thirdparty/CMakeLists.txt.');
+  }
+  const replacement = [
+    `# ${marker}: link libwebp into sd-cli. A shared build would be an extra`,
+    '# runtime library the packager does not stage next to the binary.',
+    'set(_GLAUX_BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS}")',
+    'set(BUILD_SHARED_LIBS OFF)',
+    'set(WEBP_LINK_STATIC ON CACHE BOOL "" FORCE)',
+    needle,
+    'set(BUILD_SHARED_LIBS "${_GLAUX_BUILD_SHARED_LIBS}")',
+  ].join('\n');
+  src = src.replace(needle, replacement);
+  fs.writeFileSync(file, src);
+  console.log('Patched libwebp to link statically into sd-cli.');
+}
+
 function ensureSources(srcDir) {
   if (srcDir === DEFAULT_SRC) {
     ensureGitDep({
@@ -174,6 +210,12 @@ function ensureSources(srcDir) {
     rev: GGML_REV,
     name: 'ggml (stable-diffusion.cpp)',
   });
+  ensureGitDep({
+    dest: path.join(srcDir, 'thirdparty', 'libwebp'),
+    url: LIBWEBP_REPO,
+    rev: LIBWEBP_REV,
+    name: 'libwebp',
+  });
 }
 
 function main() {
@@ -185,6 +227,7 @@ function main() {
 
   ensureSources(opts.srcDir);
   patchLlmEmbedTokens(opts.srcDir);
+  patchStaticLibwebp(opts.srcDir);
   patchGlauxCudaBackendSearch(path.join(opts.srcDir, 'ggml', 'src', 'ggml-backend-reg.cpp'));
   if (!which('cmake')) {
     throw new Error('cmake not found on PATH. Install CMake to build stable-diffusion.cpp.');
@@ -211,7 +254,7 @@ function main() {
     '-DBUILD_SHARED_LIBS=ON',
     '-DGGML_BACKEND_DL=ON',
     '-DGGML_NATIVE=OFF',
-    '-DSD_WEBP=OFF',
+    '-DSD_WEBP=ON',
     '-DSD_WEBM=OFF',
     '-DSD_HIPBLAS=OFF',
     '-DSD_OPENCL=OFF',
