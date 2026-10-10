@@ -185,7 +185,7 @@ describe('imageSizeFromBuffer', () => {
     assert.deepEqual(imageSizeFromBuffer(buf), { width: 1920, height: 1080 });
   });
 
-  it('reads a progressive JPEG frame and swaps axes for Exif orientation 6', () => {
+  it('reads a progressive JPEG frame and keeps stored size when Exif orientation is 6', () => {
     const progressive = Buffer.from([
       0xff, 0xd8,
       0xff, 0xc2, 0x00, 0x0b, 0x08,
@@ -207,7 +207,7 @@ describe('imageSizeFromBuffer', () => {
       0x00, 0x10,
       0x00, 0x20,
     ]);
-    assert.deepEqual(imageSizeFromBuffer(exif), { width: 16, height: 32 });
+    assert.deepEqual(imageSizeFromBuffer(exif), { width: 32, height: 16 });
   });
 });
 
