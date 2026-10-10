@@ -49,18 +49,17 @@ function validateMessagePayload(message, { allowEmpty = false } = {}) {
  * Reserve a session JSON name and a sibling PNG before a diffusion run.
  * The session file itself is written after the turn, next to that image.
  *
- * @returns {Promise<string | undefined>}
+ * @returns {Promise<{ absolutePath: string, relativePath: string, source: 'sessions', reservationId: number } | null>}
  */
 async function textToImageOutputPath() {
   const status = engineManager.getStatus();
   if (!status || !isDiffusionPipelineTag(status.pipelineTag)) {
-    return undefined;
+    return null;
   }
   const filename = reserveActiveSessionFilename();
   const sessionsRoot = getSessionsRoot() || engineManager.configuredSessionsRoot();
   try {
-    const allocated = await allocateSessionImagePath(sessionsRoot, filename);
-    return allocated.absolutePath;
+    return await allocateSessionImagePath(sessionsRoot, filename);
   } catch (err) {
     if (!state.activeSessionFilename) {
       clearPendingSessionFilename();
@@ -117,20 +116,28 @@ async function persistTurnSession(logLabel, deps) {
  * discarded inside sendPrompt.
  *
  * @param {unknown} payload
- * @param {{ outputPath?: string, persist?: object }} [deps]
+ * @param {{ outputPath?: string, reservationId?: number, persist?: object, requestId?: string, senderId?: unknown }} [deps]
  * @returns {Promise<{ response: string, images: Array<object> }>}
  */
 async function deliverSendMessage(payload, deps = {}) {
   const { message, enableThinking, resubmit, files } = parseInferenceRequest(payload);
-  const outputPath = Object.prototype.hasOwnProperty.call(deps, 'outputPath')
-    ? deps.outputPath
-    : await textToImageOutputPath();
+  let outputPath;
+  let reservationId;
+  if (Object.prototype.hasOwnProperty.call(deps, 'outputPath')) {
+    outputPath = deps.outputPath;
+    reservationId = deps.reservationId;
+  } else {
+    const allocated = await textToImageOutputPath();
+    outputPath = allocated ? allocated.absolutePath : undefined;
+    reservationId = allocated ? allocated.reservationId : undefined;
+  }
   try {
     const response = await engineManager.sendPrompt(message, {
       enableThinking,
       resubmit,
       files,
       outputPath,
+      reservationId,
       requestId: deps.requestId,
       senderId: deps.senderId,
     });
@@ -138,7 +145,7 @@ async function deliverSendMessage(payload, deps = {}) {
     await persistTurnSession('Failed to persist session after chat turn:', deps.persist);
     return { response: split.text, images: split.images };
   } catch (err) {
-    releaseSessionImagePath(outputPath);
+    releaseSessionImagePath(outputPath, reservationId);
     if (!state.activeSessionFilename) {
       clearPendingSessionFilename();
     }
@@ -325,13 +332,17 @@ function handleEngineStreamStart(event, payload) {
     };
     let sendPromptPromise;
     let outputPath;
+    let reservationId;
     try {
-      outputPath = await textToImageOutputPath();
+      const allocated = await textToImageOutputPath();
+      outputPath = allocated ? allocated.absolutePath : undefined;
+      reservationId = allocated ? allocated.reservationId : undefined;
       sendPromptPromise = engineManager.sendPrompt(message, {
         enableThinking,
         resubmit,
         files,
         outputPath,
+        reservationId,
         requestId,
         senderId,
         onToken: (chunk) => {
@@ -429,7 +440,7 @@ function handleEngineStreamStart(event, payload) {
       const errorInfo = toStructuredError(err, 'E_INFERENCE');
       emitStreamEvent(sender, { requestId, type: 'error', errorInfo });
     } finally {
-      releaseSessionImagePath(outputPath);
+      releaseSessionImagePath(outputPath, reservationId);
       cleanupStream();
     }
     });

@@ -76,6 +76,7 @@ describe('engine:sendMessage session persist', { concurrency: 1 }, () => {
 
     const result = await deliverSendMessage('a red fox', {
       outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
       persist: persistDeps(),
     });
 
@@ -113,6 +114,7 @@ describe('engine:sendMessage session persist', { concurrency: 1 }, () => {
       () =>
         deliverSendMessage('a red fox', {
           outputPath: allocated.absolutePath,
+          reservationId: allocated.reservationId,
           persist: persistDeps(),
         }),
       /sd failed/
@@ -123,7 +125,7 @@ describe('engine:sendMessage session persist', { concurrency: 1 }, () => {
     await assert.rejects(fs.stat(allocated.absolutePath));
     const reused = await allocateSessionImagePath(sessions, filename);
     assert.equal(reused.relativePath, allocated.relativePath);
-    releaseSessionImagePath(reused.absolutePath);
+    releaseSessionImagePath(reused.absolutePath, reused.reservationId);
     if (jsonBefore) {
       const jsonAfter = await fs.stat(jsonPath);
       assert.equal(jsonAfter.mtimeMs, jsonBefore.mtimeMs);

@@ -8,6 +8,7 @@ const path = require('path');
 const engineManager = require('../engines/engineManager');
 const contextManager = require('../engines/contextManager');
 const stableDiffusion = require('../engines/stablediffusioncpp/engine');
+const { STOP_MARKER } = require('../engines/common/stopMarker');
 const state = require('../src/main/state');
 const { allocateSessionImagePath } = require('../src/main/sessionImages');
 const {
@@ -115,7 +116,7 @@ describe('engine stream handler', { concurrency: 1 }, () => {
     const again = await allocateSessionImagePath(sessions, filename);
     assert.equal(again.relativePath, `${filename.replace(/\.json$/i, '')}-1.png`);
     const { releaseSessionImagePath } = require('../src/main/sessionImages');
-    releaseSessionImagePath(again.absolutePath);
+    releaseSessionImagePath(again.absolutePath, again.reservationId);
     assert.equal(getPendingSessionFilename(), null);
   });
 
@@ -139,6 +140,7 @@ describe('engine stream handler', { concurrency: 1 }, () => {
       });
     const running = engineManager.sendPrompt('a red fox', {
       outputPath: blocker.absolutePath,
+      reservationId: blocker.reservationId,
       requestId: 'running',
       senderId: 4,
     });
@@ -153,7 +155,7 @@ describe('engine stream handler', { concurrency: 1 }, () => {
     const freed = await allocateSessionImagePath(sessions, filename);
     assert.equal(freed.relativePath, `${filename.replace(/\.json$/i, '')}-1.png`);
     const { releaseSessionImagePath } = require('../src/main/sessionImages');
-    releaseSessionImagePath(freed.absolutePath);
+    releaseSessionImagePath(freed.absolutePath, freed.reservationId);
 
     await release();
     const done = await running;
@@ -232,14 +234,99 @@ describe('engine stream handler', { concurrency: 1 }, () => {
     assert.equal(engineManager.getStatus().phase, 'idle');
     release();
     await turn;
+    const done = sender.events.find((event) => event.type === 'done');
+    assert.deepEqual(
+      {
+        requestId: done.requestId,
+        type: done.type,
+        response: done.response,
+        images: done.images,
+      },
+      {
+        requestId: 'stop-button',
+        type: 'done',
+        response: STOP_MARKER,
+        images: [],
+      }
+    );
     const snap = await engineManager.contextSnapshot();
     assert.equal(
       snap.some(
         (msg) =>
           msg.role === 'assistant' &&
-          msg.content.some((part) => part.type === 'text' && part.text === '[STOP]')
+          msg.content.some((part) => part.type === 'text' && part.text === STOP_MARKER)
       ),
       true
     );
+  });
+
+  it('engine:cancel while idle leaves the finished turn unchanged', async () => {
+    contextManager.clear();
+    state.activeSessionFilename = null;
+    clearPendingSessionFilename();
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'kept', imagePaths: [opts.outputPath] };
+    };
+    const sender = fakeSender(8);
+    await handleEngineStreamStart({ sender }, { requestId: 'idle-after', message: 'a red fox' });
+    const before = await engineManager.contextSnapshot();
+    assert.equal(before.length, 2);
+    const phase = engineManager.getStatus().phase;
+    let stops = 0;
+    const originalStop = stableDiffusion.chatStop;
+    stableDiffusion.chatStop = () => {
+      stops += 1;
+      return Promise.resolve();
+    };
+    const result = await handleEngineCancel();
+    stableDiffusion.chatStop = originalStop;
+    assert.equal(result.ok, true);
+    assert.equal(stops, 0);
+    assert.equal(engineManager.getStatus().phase, phase);
+    assert.equal(engineManager.activeRunStopSealed(), false);
+    assert.deepEqual(await engineManager.contextSnapshot(), before);
+  });
+
+  it('an owned generation error removes only its user turn and does not seal a stop', async () => {
+    contextManager.clear();
+    state.activeSessionFilename = null;
+    clearPendingSessionFilename();
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'kept', imagePaths: [opts.outputPath] };
+    };
+    const keptSender = fakeSender(4);
+    await handleEngineStreamStart({ sender: keptSender }, { requestId: 'kept-turn', message: 'a red fox' });
+    const kept = await engineManager.contextSnapshot();
+    assert.equal(kept.length, 2);
+
+    stableDiffusion.runChat = async () => {
+      throw new Error('sd failed');
+    };
+    const sender = fakeSender(4);
+    await handleEngineStreamStart({ sender }, { requestId: 'owned-error', message: 'a blue fox' });
+    const error = sender.events.find((event) => event.type === 'error');
+    assert.ok(error);
+    assert.match(error.errorInfo.message, /sd failed/);
+    const after = await engineManager.contextSnapshot();
+    assert.equal(after.length, kept.length);
+    assert.equal(
+      after.some((msg) =>
+        (msg.content || []).some((part) => part.type === 'text' && String(part.text).includes('a blue fox'))
+      ),
+      false
+    );
+    assert.equal(
+      after.some((msg) =>
+        (msg.content || []).some((part) => part.type === 'text' && part.text === STOP_MARKER)
+      ),
+      false
+    );
+    assert.equal(engineManager.activeRunStopSealed(), false);
+    engineManager.cancelRequestGeneration({ requestId: 'owned-error' });
+    engineManager.cancelGeneration();
+    assert.equal(engineManager.activeRunStopSealed(), false);
+    assert.deepEqual(await engineManager.contextSnapshot(), after);
   });
 });

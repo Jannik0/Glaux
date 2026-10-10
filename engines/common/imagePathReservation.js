@@ -5,12 +5,16 @@
  * a name before the file exists; the run releases it when the file is written,
  * discarded, or the run ends. fs.access alone cannot see a claim that has not
  * been created on disk yet.
+ *
+ * Each claim has an owner token. A later release from the previous owner does
+ * not free a name that a newer run has claimed.
  */
 
 const path = require('path');
 
-/** @type {Set<string>} */
-const reservedSessionImagePaths = new Set();
+/** @type {Map<string, number>} */
+const reservedSessionImagePaths = new Map();
+let nextReservationId = 1;
 
 /**
  * @param {string} absolutePath
@@ -22,25 +26,38 @@ function reservationKey(absolutePath) {
 
 /**
  * @param {string} absolutePath
- * @returns {boolean} false when that path is already reserved
+ * @returns {number | null} owner token, or null when that path is already reserved
  */
 function reserveSessionImagePath(absolutePath) {
+  if (typeof absolutePath !== 'string' || !absolutePath) {
+    return null;
+  }
   const key = reservationKey(absolutePath);
   if (reservedSessionImagePaths.has(key)) {
-    return false;
+    return null;
   }
-  reservedSessionImagePaths.add(key);
-  return true;
+  const owner = nextReservationId;
+  nextReservationId += 1;
+  reservedSessionImagePaths.set(key, owner);
+  return owner;
 }
 
 /**
+ * Drop this owner's claim. A second release by the same owner is a no-op, and
+ * a release by an owner who no longer holds the path leaves the current claim.
+ *
  * @param {string | undefined | null} absolutePath
+ * @param {number | undefined | null} owner
  */
-function releaseSessionImagePath(absolutePath) {
-  if (typeof absolutePath !== 'string' || !absolutePath) {
+function releaseSessionImagePath(absolutePath, owner) {
+  if (typeof absolutePath !== 'string' || !absolutePath || owner == null) {
     return;
   }
-  reservedSessionImagePaths.delete(reservationKey(absolutePath));
+  const key = reservationKey(absolutePath);
+  if (reservedSessionImagePaths.get(key) !== owner) {
+    return;
+  }
+  reservedSessionImagePaths.delete(key);
 }
 
 module.exports = {

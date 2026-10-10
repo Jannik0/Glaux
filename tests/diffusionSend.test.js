@@ -416,6 +416,43 @@ describe('sendPrompt diffusion', { concurrency: 1 }, () => {
     await assert.rejects(fs.stat(outputPath));
   });
 
+  it('does not rewrite a finished diffusion turn when that request is cancelled', async () => {
+    contextManager.clear();
+    const allocated = await allocateSessionImagePath(sessions, 'finished-turn.json');
+    stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {
+      await fs.writeFile(opts.outputPath, 'png');
+      return { text: 'painted', imagePaths: [opts.outputPath] };
+    };
+    const done = await engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+      requestId: 'req-img',
+      senderId: 4,
+    });
+    assert.deepEqual(done.imagePaths, [allocated.absolutePath]);
+    const before = await engineManager.contextSnapshot().then(contextShape);
+    assert.deepEqual(before, [
+      { role: 'user', text: 'a red fox', image: null },
+      { role: 'assistant', text: 'painted', image: allocated.relativePath },
+    ]);
+    let stops = 0;
+    const originalStop = stableDiffusion.chatStop;
+    stableDiffusion.chatStop = () => {
+      stops += 1;
+      return Promise.resolve();
+    };
+    engineManager.cancelGeneration();
+    engineManager.cancelRequestGeneration({ requestId: 'req-img', senderId: 4, senderFallback: true });
+    const idle = await handleEngineCancel();
+    stableDiffusion.chatStop = originalStop;
+    assert.equal(idle.ok, true);
+    assert.equal(stops, 0);
+    assert.equal(engineManager.getStatus().phase, 'idle');
+    assert.equal(engineManager.activeRunStopSealed(), false);
+    assert.deepEqual(await engineManager.contextSnapshot().then(contextShape), before);
+    assert.equal(await fs.readFile(allocated.absolutePath, 'utf8'), 'png');
+  });
+
   it('passes alternating history to the newer diffusion run and discards only the older reserved sidecar', async () => {
     contextManager.clear();
     const first = await allocateSessionImagePath(sessions, 'reserved-turn.json');
@@ -434,11 +471,15 @@ describe('sendPrompt diffusion', { concurrency: 1 }, () => {
           resolve({ text: '', imagePaths: [opts.outputPath] });
         };
       });
-    const older = engineManager.sendPrompt('a red fox', { outputPath: first.absolutePath });
+    const older = engineManager.sendPrompt('a red fox', {
+      outputPath: first.absolutePath,
+      reservationId: first.reservationId,
+    });
     await firstStarted;
     engineManager.cancelGeneration();
 
     let secondMessages;
+    let secondContext;
     let releaseSecond;
     let markSecondStarted;
     const secondStarted = new Promise((resolve) => {
@@ -447,22 +488,24 @@ describe('sendPrompt diffusion', { concurrency: 1 }, () => {
     stableDiffusion.runChat = (_model, _thinking, _prompt, opts) =>
       new Promise((resolve) => {
         secondMessages = opts.messages;
+        secondContext = contextManager.snapshot();
         markSecondStarted();
         releaseSecond = async () => {
           await fs.writeFile(opts.outputPath, 'new');
           resolve({ text: '', imagePaths: [opts.outputPath] });
         };
       });
-    const newer = engineManager.sendPrompt('a blue fox', { outputPath: second.absolutePath });
+    const newer = engineManager.sendPrompt('a blue fox', {
+      outputPath: second.absolutePath,
+      reservationId: second.reservationId,
+    });
     await secondStarted;
-    assert.deepEqual(
-      secondMessages.map((msg) => msg.role),
-      ['user', 'assistant', 'user']
-    );
-    assert.equal(
-      secondMessages[1].content.find((part) => part.type === 'text').text,
-      STOP_MARKER
-    );
+    assert.deepEqual(secondMessages, []);
+    assert.deepEqual(contextShape(secondContext), [
+      { role: 'user', text: 'a red fox', image: null },
+      { role: 'assistant', text: STOP_MARKER, image: null },
+      { role: 'user', text: 'a blue fox', image: null },
+    ]);
     await releaseFirst();
     assert.equal(await older, STOP_MARKER);
     await assert.rejects(fs.stat(first.absolutePath));
@@ -475,9 +518,11 @@ describe('sendPrompt diffusion', { concurrency: 1 }, () => {
     const done = await newer;
     assert.deepEqual(done.imagePaths, [second.absolutePath]);
     assert.equal(await fs.readFile(second.absolutePath, 'utf8'), 'new');
-    const stops = (await engineManager.contextSnapshot()).filter(
-      (msg) => msg.role === 'assistant' && msg.content.some((part) => part.type === 'text' && part.text === STOP_MARKER)
-    );
-    assert.equal(stops.length, 1);
+    assert.deepEqual(await engineManager.contextSnapshot().then(contextShape), [
+      { role: 'user', text: 'a red fox', image: null },
+      { role: 'assistant', text: STOP_MARKER, image: null },
+      { role: 'user', text: 'a blue fox', image: null },
+      { role: 'assistant', text: '', image: second.relativePath },
+    ]);
   });
 });

@@ -306,6 +306,30 @@ describe('sendPrompt chat', { concurrency: 1 }, () => {
     state.engineBootstrapped = false;
   });
 
+  it('does not rewrite a finished chat turn when that request is cancelled', async () => {
+    contextManager.clear();
+    llama.runChat = async () => 'hello';
+    assert.equal(await engineManager.sendPrompt('q1', { requestId: 'req-q1', senderId: 3 }), 'hello');
+    const before = await engineManager.contextSnapshot();
+    assert.deepEqual(contextShape(before), [
+      { role: 'user', text: 'q1' },
+      { role: 'assistant', text: 'hello' },
+    ]);
+    let stops = 0;
+    const originalStop = llama.chatStop;
+    llama.chatStop = () => {
+      stops += 1;
+      return Promise.resolve();
+    };
+    engineManager.cancelGeneration();
+    engineManager.cancelRequestGeneration({ requestId: 'req-q1', senderId: 3, senderFallback: true });
+    llama.chatStop = originalStop;
+    assert.equal(stops, 0);
+    assert.equal(engineManager.getStatus().phase, 'idle');
+    assert.equal(engineManager.activeRunStopSealed(), false);
+    assert.deepEqual(await engineManager.contextSnapshot(), before);
+  });
+
   it('forgets settled request ids and does not let a pruned id cancel the active run', async () => {
     contextManager.clear();
     llama.runChat = async () => 'ok';

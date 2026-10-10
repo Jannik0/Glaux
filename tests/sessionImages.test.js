@@ -194,11 +194,27 @@ describe('session image sidecars', () => {
     assert.equal(first.relativePath, 'reserve-1.png');
     assert.equal(second.relativePath, 'reserve-2.png');
     assert.notEqual(first.absolutePath, second.absolutePath);
-    releaseSessionImagePath(first.absolutePath);
+    releaseSessionImagePath(first.absolutePath, first.reservationId);
     const reused = await allocateSessionImagePath(sessions, 'reserve.json');
     assert.equal(reused.relativePath, 'reserve-1.png');
-    releaseSessionImagePath(second.absolutePath);
-    releaseSessionImagePath(reused.absolutePath);
+    releaseSessionImagePath(second.absolutePath, second.reservationId);
+    releaseSessionImagePath(reused.absolutePath, reused.reservationId);
+  });
+
+  it('keeps a newer claim when the previous owner releases again', async () => {
+    const first = await allocateSessionImagePath(sessions, 'owner.json');
+    releaseSessionImagePath(first.absolutePath, first.reservationId);
+    const second = await allocateSessionImagePath(sessions, 'owner.json');
+    assert.equal(second.absolutePath, first.absolutePath);
+    assert.notEqual(second.reservationId, first.reservationId);
+    releaseSessionImagePath(first.absolutePath, first.reservationId);
+    const third = await allocateSessionImagePath(sessions, 'owner.json');
+    assert.notEqual(third.relativePath, second.relativePath);
+    releaseSessionImagePath(second.absolutePath, second.reservationId);
+    const reused = await allocateSessionImagePath(sessions, 'owner.json');
+    assert.equal(reused.relativePath, second.relativePath);
+    releaseSessionImagePath(third.absolutePath, third.reservationId);
+    releaseSessionImagePath(reused.absolutePath, reused.reservationId);
   });
 
   it('does not hand overlapping allocations the same path', async () => {
@@ -208,18 +224,18 @@ describe('session image sidecars', () => {
     ]);
     assert.deepEqual([left.relativePath, right.relativePath].sort(), ['race-1.png', 'race-2.png']);
     assert.notEqual(left.absolutePath, right.absolutePath);
-    releaseSessionImagePath(left.absolutePath);
-    releaseSessionImagePath(right.absolutePath);
+    releaseSessionImagePath(left.absolutePath, left.reservationId);
+    releaseSessionImagePath(right.absolutePath, right.reservationId);
     await fs.writeFile(path.join(sessions, 'skip-1.png'), 'x');
     const reserved = await allocateSessionImagePath(sessions, 'skip.json');
     const next = await allocateSessionImagePath(sessions, 'skip.json');
     assert.equal(reserved.relativePath, 'skip-2.png');
     assert.equal(next.relativePath, 'skip-3.png');
-    releaseSessionImagePath(reserved.absolutePath);
+    releaseSessionImagePath(reserved.absolutePath, reserved.reservationId);
     const freed = await allocateSessionImagePath(sessions, 'skip.json');
     assert.equal(freed.relativePath, 'skip-2.png');
-    releaseSessionImagePath(next.absolutePath);
-    releaseSessionImagePath(freed.absolutePath);
+    releaseSessionImagePath(next.absolutePath, next.reservationId);
+    releaseSessionImagePath(freed.absolutePath, freed.reservationId);
   });
 
   it('does not copy user attachments', async () => {

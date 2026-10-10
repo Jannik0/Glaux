@@ -130,6 +130,7 @@ function startGenerationRun(meta = {}) {
     partialText: '',
     stopSealed: false,
     stoppedText: '',
+    settled: false,
   };
   activeGeneration = run;
   generationInFlight = true;
@@ -154,6 +155,22 @@ function generationMeta(options) {
  */
 function generationOwns(run) {
   return Boolean(run) && run.token === generationRun;
+}
+
+/**
+ * The owning run has returned. A later cancel must not seal this turn.
+ * @param {{ token: number, settled?: boolean } | null | undefined} run
+ */
+function settleOwnedRun(run) {
+  if (!run || !generationOwns(run)) {
+    return;
+  }
+  run.settled = true;
+  generationInFlight = false;
+  phase = 'idle';
+  if (activeGeneration === run) {
+    activeGeneration = null;
+  }
 }
 
 /**
@@ -545,8 +562,9 @@ async function configurePaths(opts) {
  * Outputs copies are never passed here.
  *
  * @param {string | undefined} outputPath
+ * @param {number | undefined | null} [reservationId]
  */
-async function discardGeneratedOutput(outputPath) {
+async function discardGeneratedOutput(outputPath, reservationId) {
   try {
     const sessionsRoot = initOptions && initOptions.sessionsRoot;
     if (typeof outputPath !== 'string' || !outputPath || !sessionsRoot) {
@@ -565,7 +583,7 @@ async function discardGeneratedOutput(outputPath) {
       /* already gone */
     }
   } finally {
-    releaseSessionImagePath(outputPath);
+    releaseSessionImagePath(outputPath, reservationId);
   }
 }
 
@@ -1035,12 +1053,16 @@ async function resetInferenceWorker(options = {}) {
 }
 
 function cancelActiveGeneration() {
-  if (activeGeneration) {
-    activeGeneration.cancelled = true;
-    // The newer prompt snapshots context as soon as this returns. The stop
-    // marker has to be in place before that snapshot, not when this run settles.
-    sealRun(activeGeneration, activeGeneration.partialText || '');
+  const run = activeGeneration;
+  // A finished run stays reachable until its finally clears it. Sealing then
+  // splices [STOP] into a turn that already completed.
+  if (!run || run.settled || !generationInFlight || run.token !== generationRun) {
+    return;
   }
+  run.cancelled = true;
+  // The newer prompt snapshots context as soon as this returns. The stop
+  // marker has to be in place before that snapshot, not when this run settles.
+  sealRun(run, run.partialText || '');
   if (activeModelId) {
     abandonCompanionRestore(activeModelId);
   }
@@ -1093,6 +1115,15 @@ function requestRunTokenCount() {
   return requestRunTokens.size;
 }
 
+/**
+ * True when the active run has already inserted its stop marker.
+ * A settled or idle engine has no active run, so this is false.
+ * @returns {boolean}
+ */
+function activeRunStopSealed() {
+  return Boolean(activeGeneration && activeGeneration.stopSealed);
+}
+
 function configuredSessionsRoot() {
   const root = initOptions && initOptions.sessionsRoot;
   return typeof root === 'string' ? root : '';
@@ -1126,6 +1157,7 @@ async function sendPrompt(message, options = {}) {
       throw new Error('Image generation output path is not configured.');
     }
     const outputPath = options.outputPath;
+    const reservationId = options.reservationId;
     const userId = contextManager.appendUser(prompt, {
       imagePaths,
       files: checked.imageFile ? describeAttachments([checked.imageFile]) : [],
@@ -1134,7 +1166,7 @@ async function sendPrompt(message, options = {}) {
     run.userId = userId;
     const pendingCompanions = companionJobs.get(activeModelId)?.promise;
     const stopThisRun = async () => {
-      await discardGeneratedOutput(outputPath);
+      await discardGeneratedOutput(outputPath, reservationId);
       return sealRun(run, '');
     };
     try {
@@ -1147,7 +1179,7 @@ async function sendPrompt(message, options = {}) {
       const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
         onToken: options.onToken,
         onReplace: options.onReplace,
-        messages: stripThinkingFromMessages(contextManager.snapshot()),
+        messages: [],
         outputPath,
         imagePaths,
         audioPaths: [],
@@ -1176,15 +1208,12 @@ async function sendPrompt(message, options = {}) {
       if (!generationOwns(run) || run.cancelled) {
         return await stopThisRun();
       }
-      await discardGeneratedOutput(outputPath);
+      await discardGeneratedOutput(outputPath, reservationId);
       contextManager.removeMessageById(userId);
       throw err;
     } finally {
-      releaseSessionImagePath(outputPath);
-      if (generationOwns(run)) {
-        generationInFlight = false;
-        phase = 'idle';
-      }
+      releaseSessionImagePath(outputPath, reservationId);
+      settleOwnedRun(run);
     }
   }
 
@@ -1257,10 +1286,7 @@ async function sendPrompt(message, options = {}) {
       throw err;
     }
   } finally {
-    if (generationOwns(run)) {
-      generationInFlight = false;
-      phase = 'idle';
-    }
+    settleOwnedRun(run);
   }
 }
 
@@ -1373,6 +1399,7 @@ module.exports = {
   cancelGeneration,
   cancelRequestGeneration,
   requestRunTokenCount,
+  activeRunStopSealed,
   MAX_TRACKED_REQUEST_RUNS,
   configuredSessionsRoot,
   discardSessionOutput: discardGeneratedOutput,

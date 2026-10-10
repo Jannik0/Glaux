@@ -143,7 +143,7 @@ async function resolveSessionSidecarFile(part, sessionsRoot) {
 /**
  * @param {string} sessionsRoot
  * @param {string} sessionFilename
- * @returns {Promise<{ absolutePath: string, relativePath: string, source: 'sessions' }>}
+ * @returns {Promise<{ absolutePath: string, relativePath: string, source: 'sessions', reservationId: number }>}
  */
 async function allocateSessionImagePath(sessionsRoot, sessionFilename) {
   if (!sessionsRoot) {
@@ -157,7 +157,8 @@ async function allocateSessionImagePath(sessionsRoot, sessionFilename) {
   for (let n = 1; n < 100000; n += 1) {
     const relativePath = `${base}-${n}.png`;
     const absolutePath = path.join(sessionsRoot, relativePath);
-    if (!reserveSessionImagePath(absolutePath)) {
+    const reservationId = reserveSessionImagePath(absolutePath);
+    if (reservationId == null) {
       continue;
     }
     // Claim before the existence check so two overlapping calls cannot both
@@ -165,9 +166,9 @@ async function allocateSessionImagePath(sessionsRoot, sessionFilename) {
     try {
       await fs.access(absolutePath);
     } catch {
-      return { absolutePath, relativePath, source: 'sessions' };
+      return { absolutePath, relativePath, source: 'sessions', reservationId };
     }
-    releaseSessionImagePath(absolutePath);
+    releaseSessionImagePath(absolutePath, reservationId);
   }
   throw new Error('Could not allocate a session image path.');
 }
