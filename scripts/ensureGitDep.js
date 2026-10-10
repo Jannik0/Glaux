@@ -38,25 +38,29 @@ function isEmptyDirectory(dest) {
   }
 }
 
-function ensureGitDep({ dest, url, rev, name }) {
+/**
+ * @param {{ dest: string, url: string, rev: string, name: string, git?: typeof runGit }} opts
+ */
+function ensureGitDep({ dest, url, rev, name, git }) {
   if (fs.existsSync(dest) && !isEmptyDirectory(dest)) {
     console.log(`Using existing ${name} at ${dest}`);
     return;
   }
-  if (!which('git')) {
+  const run = typeof git === 'function' ? git : runGit;
+  if (run === runGit && !which('git')) {
     throw new Error(`git not found on PATH. Install Git to clone ${name} into ${dest}.`);
   }
 
   console.log(`Cloning ${name} (${rev}) into ${dest}`);
   try {
-    runGit(['init', dest]);
-    runGit(['-C', dest, 'remote', 'add', 'origin', url]);
-    runGit(['-C', dest, 'fetch', '--depth', '1', 'origin', rev]);
-    runGit(['-C', dest, '-c', 'advice.detachedHead=false', 'checkout', '--force', 'FETCH_HEAD']);
+    run(['init', dest]);
+    run(['-C', dest, 'remote', 'add', 'origin', url]);
+    run(['-C', dest, 'fetch', '--depth', '1', 'origin', rev]);
+    run(['-C', dest, '-c', 'advice.detachedHead=false', 'checkout', '--force', 'FETCH_HEAD']);
   } catch (err) {
     fs.rmSync(dest, { recursive: true, force: true });
     throw err;
   }
 }
 
-module.exports = { ensureGitDep };
+module.exports = { ensureGitDep, isEmptyDirectory };
