@@ -40,6 +40,7 @@ const PYTHON_SKIP = pythonSkipReason(PYTHON);
 
 // Imports worker/t2i.py without worker/__init__.py, which pulls in torch.
 const SCRIPT = String.raw`
+import os
 import shutil
 import sys
 import tempfile
@@ -195,13 +196,28 @@ if not t2i._is_ram_disk(repo):
     base = Path(tempfile.mkdtemp(prefix="glaux-offload-", dir=repo))
     try:
         state["cache"] = base
-        root = t2i._prepare_disk_offload(str(base / "org" / "repo"), 1)
-        assert root == base / ".glaux-t2i-offload", root
+        parent = base / ".glaux-t2i-offload"
+        dead = parent / "pid-1"
+        live = parent / "pid-424242"
+        dead.mkdir(parents=True)
+        (dead / "weight.dat").write_text("stale", encoding="utf-8")
+        live.mkdir()
+        (live / "weight.dat").write_text("live", encoding="utf-8")
+        real_alive = t2i._pid_alive
+        t2i._pid_alive = lambda pid: pid == os.getpid() or pid == 424242
+        try:
+            root = t2i._prepare_disk_offload(str(base / "org" / "repo"), 1)
+            assert root == parent / f"pid-{os.getpid()}", root
+            assert not dead.exists()
+            assert (live / "weight.dat").read_text(encoding="utf-8") == "live"
+        finally:
+            t2i._pid_alive = real_alive
         assert root.is_dir()
-        assert not t2i._is_ram_disk(root.parent)
+        assert not t2i._is_ram_disk(root.parent.parent)
         (root / "weight.dat").write_text("x", encoding="utf-8")
         t2i.release_disk_offload()
         assert not root.exists()
+        assert (live / "weight.dat").read_text(encoding="utf-8") == "live"
         assert t2i._active_offload_root is None
     finally:
         shutil.rmtree(base, ignore_errors=True)

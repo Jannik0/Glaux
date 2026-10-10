@@ -221,8 +221,44 @@ def _require_offload_space(anchor: Path, nbytes: int) -> None:
     )
 
 
+def _offload_pid_dirname(pid: int | None = None) -> str:
+    return f"pid-{os.getpid() if pid is None else pid}"
+
+
+def _pid_from_offload_dirname(name: str) -> int | None:
+    if not name.startswith("pid-") or not name[4:].isdigit():
+        return None
+    return int(name[4:])
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when *pid* is this process or another process we must not delete.
+
+    Without psutil, another pid is treated as live so one instance cannot
+    remove an offload folder it cannot prove is stale.
+    """
+    if pid == os.getpid():
+        return True
+    try:
+        import psutil
+    except ImportError:
+        return True
+    return bool(psutil.pid_exists(pid))
+
+
+def _clean_stale_offload_dirs(parent: Path) -> None:
+    """Remove pid folders whose process is gone. Leave a live instance alone."""
+    if not parent.is_dir():
+        return
+    for child in list(parent.iterdir()):
+        pid = _pid_from_offload_dirname(child.name)
+        if pid is None or _pid_alive(pid):
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+
+
 def release_disk_offload() -> None:
-    """Delete offload files after the pipeline that reads them is gone."""
+    """Delete this process's offload files after the pipeline that reads them is gone."""
     global _active_offload_root
     root = _active_offload_root
     _active_offload_root = None
@@ -231,15 +267,16 @@ def release_disk_offload() -> None:
 
 
 def _prepare_disk_offload(model_path: str, nbytes: int) -> Path:
-    """Create a fresh offload folder on a real disk with room for *nbytes*."""
+    """Create a fresh per-process offload folder on a real disk with room for *nbytes*."""
     global _active_offload_root
-    root = _disk_offload_root(model_path)
-    # Drop a leftover copy first so its bytes count as free space. A live
-    # pipeline is released before the next load, and an unlinked mmap stays
-    # readable until that process drops it.
+    parent = _disk_offload_root(model_path)
+    # Another app instance keeps its own pid folder. A folder left by a dead
+    # pid, including one whose unload timed out, is removed here.
+    _clean_stale_offload_dirs(parent)
+    root = parent / _offload_pid_dirname()
     if root.exists():
         shutil.rmtree(root, ignore_errors=True)
-    _require_offload_space(root.parent, nbytes)
+    _require_offload_space(parent, nbytes)
     root.mkdir(parents=True, exist_ok=True)
     _active_offload_root = root
     return root
