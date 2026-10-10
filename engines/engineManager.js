@@ -40,7 +40,7 @@ const {
   assertImageToImagePrompt,
   assertTextToImagePrompt,
 } = require('./common/textToImage');
-const { isFileInside } = require('../src/main/sessionImages');
+const { isFileInside } = require('./common/fileInside');
 
 /** How long shutdown waits for the Hugging Face pipeline to drop its offload files. */
 const HF_DESTROY_TIMEOUT_MS = 5000;
@@ -65,12 +65,30 @@ let generationInFlight = false;
 /**
  * Identifies the sendPrompt call that owns generationInFlight.
  * cancelGeneration clears the flag immediately; a newer run must not have it
- * reset by the older run's finally.
+ * reset by the older run's finally. Each run keeps its own cancelled flag.
+ * @type {{ token: number, cancelled: boolean } | null}
  */
+let activeGeneration = null;
 let generationRun = 0;
 
-/** Set by cancelGeneration so sendPrompt can keep the partial assistant turn. */
-let cancelRequested = false;
+/**
+ * @returns {{ token: number, cancelled: boolean }}
+ */
+function startGenerationRun() {
+  const run = { token: ++generationRun, cancelled: false };
+  activeGeneration = run;
+  generationInFlight = true;
+  phase = 'generating';
+  return run;
+}
+
+/**
+ * @param {{ token: number, cancelled: boolean } | null | undefined} run
+ * @returns {boolean}
+ */
+function generationOwns(run) {
+  return Boolean(run) && run.token === generationRun;
+}
 
 /**
  * GGUF id whose base-repo companion download is in flight. Cancel uses this
@@ -912,7 +930,9 @@ async function resetInferenceWorker(options = {}) {
 }
 
 function cancelGeneration() {
-  cancelRequested = true;
+  if (activeGeneration) {
+    activeGeneration.cancelled = true;
+  }
   if (activeModelId) {
     abandonCompanionRestore(activeModelId);
   }
@@ -953,24 +973,27 @@ async function sendPrompt(message, options = {}) {
       throw new Error('Image generation output path is not configured.');
     }
     const outputPath = options.outputPath;
-    cancelRequested = false;
     contextManager.appendUser(prompt, {
       imagePaths,
       files: checked.imageFile ? describeAttachments([checked.imageFile]) : [],
     });
-    const runToken = ++generationRun;
-    generationInFlight = true;
-    phase = 'generating';
+    const run = startGenerationRun();
     const pendingCompanions = companionJobs.get(activeModelId)?.promise;
+    const stopOwned = async () => {
+      await discardGeneratedOutput(outputPath);
+      const stopped = withStopMarker('');
+      contextManager.appendAssistant(stopped);
+      return stopped;
+    };
     try {
       if (pendingCompanions) {
         await pendingCompanions;
       }
-      if (cancelRequested) {
-        await discardGeneratedOutput(outputPath);
-        const stopped = withStopMarker('');
-        contextManager.appendAssistant(stopped);
-        return stopped;
+      if (!generationOwns(run)) {
+        return withStopMarker('');
+      }
+      if (run.cancelled) {
+        return stopOwned();
       }
       const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
         onToken: options.onToken,
@@ -981,11 +1004,11 @@ async function sendPrompt(message, options = {}) {
         audioPaths: [],
         videoPaths: [],
       });
-      if (cancelRequested) {
-        await discardGeneratedOutput(outputPath);
-        const stopped = withStopMarker('');
-        contextManager.appendAssistant(stopped);
-        return stopped;
+      if (!generationOwns(run)) {
+        return withStopMarker('');
+      }
+      if (run.cancelled) {
+        return stopOwned();
       }
       const rawPaths =
         response && typeof response === 'object' && Array.isArray(response.imagePaths)
@@ -1004,17 +1027,17 @@ async function sendPrompt(message, options = {}) {
       contextManager.appendAssistant(packed.text, { imageParts: packed.imageParts });
       return { text: packed.text, imagePaths: packed.imagePaths, images: packed.images };
     } catch (err) {
-      if (cancelRequested) {
-        await discardGeneratedOutput(outputPath);
-        const stopped = withStopMarker('');
-        contextManager.appendAssistant(stopped);
-        return stopped;
+      if (!generationOwns(run)) {
+        return withStopMarker('');
+      }
+      if (run.cancelled) {
+        return stopOwned();
       }
       await discardGeneratedOutput(outputPath);
       contextManager.rollbackLastUser();
       throw err;
     } finally {
-      if (generationRun === runToken) {
+      if (generationOwns(run)) {
         generationInFlight = false;
         phase = 'idle';
       }
@@ -1026,7 +1049,6 @@ async function sendPrompt(message, options = {}) {
   const { message: enrichedMessage, imagePaths, audioPaths, videoPaths, attachmentFiles } =
     await prepareInferenceRequest(message, options.files);
 
-  cancelRequested = false;
   contextManager.appendUser(enrichedMessage, {
     imagePaths,
     audioPaths,
@@ -1034,9 +1056,7 @@ async function sendPrompt(message, options = {}) {
     files: attachmentFiles,
   });
 
-  const runToken = ++generationRun;
-  generationInFlight = true;
-  phase = 'generating';
+  const run = startGenerationRun();
   let accumulated = '';
   try {
     const messages = stripThinkingFromMessages(contextManager.snapshot());
@@ -1061,7 +1081,10 @@ async function sendPrompt(message, options = {}) {
       resubmit,
       messages,
     });
-    if (cancelRequested) {
+    if (!generationOwns(run)) {
+      return withStopMarker(accumulated);
+    }
+    if (run.cancelled) {
       const partial =
         typeof response === 'string' && response.length > 0 ? response : accumulated;
       const stopped = withStopMarker(partial);
@@ -1071,7 +1094,10 @@ async function sendPrompt(message, options = {}) {
     contextManager.appendAssistant(typeof response === 'string' ? response : '');
     return typeof response === 'string' ? response : '';
   } catch (err) {
-    if (cancelRequested) {
+    if (!generationOwns(run)) {
+      return withStopMarker(accumulated);
+    }
+    if (run.cancelled) {
       const stopped = withStopMarker(accumulated);
       contextManager.appendAssistant(stopped);
       return stopped;
@@ -1079,7 +1105,7 @@ async function sendPrompt(message, options = {}) {
     contextManager.rollbackLastUser();
     throw err;
   } finally {
-    if (generationRun === runToken) {
+    if (generationOwns(run)) {
       generationInFlight = false;
       phase = 'idle';
     }

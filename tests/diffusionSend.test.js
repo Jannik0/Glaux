@@ -10,7 +10,7 @@ const contextManager = require('../engines/contextManager');
 const stableDiffusion = require('../engines/stablediffusioncpp/engine');
 const { STOP_MARKER } = require('../engines/common/stopMarker');
 
-describe('sendPrompt diffusion', () => {
+describe('sendPrompt diffusion', { concurrency: 1 }, () => {
   const originalRun = stableDiffusion.runChat;
   let root;
   let sessions;
@@ -132,15 +132,87 @@ describe('sendPrompt diffusion', () => {
     const second = engineManager.sendPrompt('a blue fox', { outputPath: secondPath });
     await secondStarted;
     assert.equal(engineManager.getStatus().phase, 'generating');
+    await fs.writeFile(secondPath, 'new');
     releaseFirst();
     await first;
     assert.equal(engineManager.getStatus().phase, 'generating');
+    assert.equal(await fs.readFile(secondPath, 'utf8'), 'new');
+    const mid = await engineManager.contextSnapshot();
+    const userTexts = mid
+      .filter((msg) => msg.role === 'user')
+      .map((msg) => msg.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n'));
+    assert.deepEqual(userTexts, ['a red fox', 'a blue fox']);
+    assert.equal(
+      mid.some((msg) => msg.role === 'assistant' && msg.content.some((part) => part.type === 'image')),
+      false
+    );
 
-    await fs.writeFile(secondPath, 'new');
     releaseSecond();
     const done = await second;
     assert.deepEqual(done.imagePaths, [secondPath]);
     assert.equal(engineManager.getStatus().phase, 'idle');
+    assert.equal(await fs.readFile(secondPath, 'utf8'), 'new');
+    const doneSnap = await engineManager.contextSnapshot();
+    const doneUsers = doneSnap
+      .filter((msg) => msg.role === 'user')
+      .map((msg) => msg.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n'));
+    assert.deepEqual(doneUsers, ['a red fox', 'a blue fox']);
+    const assistantImages = doneSnap.filter(
+      (msg) => msg.role === 'assistant' && msg.content.some((part) => part.type === 'image')
+    );
+    assert.equal(assistantImages.length, 1);
+    assert.equal(assistantImages[0].content.find((part) => part.type === 'image').relativePath, 'newer.png');
+  });
+
+  it('does not roll back the newer user turn when an older run returns no image', async () => {
+    contextManager.clear();
+    const firstPath = path.join(sessions, 'empty-older.png');
+    const secondPath = path.join(sessions, 'empty-newer.png');
+    await fs.writeFile(firstPath, 'old');
+    let releaseFirst;
+    let markFirstStarted;
+    const firstStarted = new Promise((resolve) => {
+      markFirstStarted = resolve;
+    });
+    stableDiffusion.runChat = () =>
+      new Promise((resolve, reject) => {
+        markFirstStarted();
+        releaseFirst = () => reject(new Error('Image generation did not return an image.'));
+      });
+    const first = engineManager.sendPrompt('a red fox', { outputPath: firstPath });
+    await firstStarted;
+    engineManager.cancelGeneration();
+
+    let releaseSecond;
+    let markSecondStarted;
+    const secondStarted = new Promise((resolve) => {
+      markSecondStarted = resolve;
+    });
+    stableDiffusion.runChat = () =>
+      new Promise((resolve) => {
+        markSecondStarted();
+        releaseSecond = () => resolve({ text: '', imagePaths: [secondPath] });
+      });
+    const second = engineManager.sendPrompt('a blue fox', { outputPath: secondPath });
+    await secondStarted;
+    releaseFirst();
+    await first;
+    const mid = await engineManager.contextSnapshot();
+    const userTexts = mid
+      .filter((msg) => msg.role === 'user')
+      .map((msg) => msg.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n'));
+    assert.deepEqual(userTexts, ['a red fox', 'a blue fox']);
+    assert.equal(mid.some((msg) => msg.role === 'assistant'), false);
+    assert.equal(await fs.readFile(firstPath, 'utf8'), 'old');
+
+    await fs.writeFile(secondPath, 'new');
+    releaseSecond();
+    await second;
+    const done = await engineManager.contextSnapshot();
+    const doneUsers = done
+      .filter((msg) => msg.role === 'user')
+      .map((msg) => msg.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n'));
+    assert.deepEqual(doneUsers, ['a red fox', 'a blue fox']);
     assert.equal(await fs.readFile(secondPath, 'utf8'), 'new');
   });
 });

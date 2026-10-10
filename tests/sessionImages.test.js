@@ -134,6 +134,38 @@ describe('session image sidecars', () => {
     assert.equal(await fs.readFile(path.join(outputs, 'original-1.png'), 'utf8'), 'kept-name');
   });
 
+  it('rejects Windows JSON aliases and a png symlink to a session json', async () => {
+    const names = ['other.json.', 'x.json::$DATA', 'X.JSON', 'shot.png '];
+    for (const name of names) {
+      await fs.writeFile(path.join(sessions, name), 'keep');
+    }
+    const jsonTarget = path.join(sessions, 'notes.json');
+    await fs.writeFile(jsonTarget, '{"n":1}');
+    const link = path.join(sessions, 'a.png');
+    let linked = true;
+    try {
+      await fs.symlink(jsonTarget, link);
+    } catch (err) {
+      if (err && (err.code === 'EPERM' || err.code === 'ENOTSUP')) {
+        linked = false;
+      } else {
+        throw err;
+      }
+    }
+    const content = names.map((name) => ({ type: 'image', source: 'sessions', relativePath: name }));
+    if (linked) {
+      content.push({ type: 'image', source: 'sessions', relativePath: 'a.png' });
+    }
+    await deleteSessionSidecarImages([{ role: 'assistant', content }], sessions);
+    for (const name of names) {
+      assert.equal(await fs.readFile(path.join(sessions, name), 'utf8'), 'keep');
+    }
+    assert.equal(await fs.readFile(jsonTarget, 'utf8'), '{"n":1}');
+    if (linked) {
+      assert.equal((await fs.lstat(link)).isSymbolicLink(), true);
+    }
+  });
+
   it('does not follow a symlink inside Sessions that points outside', async () => {
     const outside = path.join(root, 'secret.png');
     await fs.writeFile(outside, 'secret');

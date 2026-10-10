@@ -10,26 +10,9 @@
 
 const fs = require('fs/promises');
 const path = require('path');
-const { isSubPath } = require('./pathSandbox');
+const { isFileInside } = require('../../engines/common/fileInside');
 
 const IMAGE_PART_TYPES = new Set(['image']);
-
-/**
- * @param {string} root
- * @param {string} candidate
- * @returns {boolean}
- */
-function isFileInside(root, candidate) {
-  if (!root || !candidate) {
-    return false;
-  }
-  const parent = path.resolve(root);
-  const file = path.resolve(candidate);
-  if (file === parent) {
-    return false;
-  }
-  return isSubPath(parent, file);
-}
 
 /**
  * @param {unknown} part
@@ -66,7 +49,16 @@ function isSessionSidecarName(relativePath) {
   if (path.isAbsolute(relativePath)) {
     return false;
   }
-  if (relativePath.includes('/') || relativePath.includes('\\') || relativePath.includes('\0')) {
+  if (
+    relativePath.includes('/') ||
+    relativePath.includes('\\') ||
+    relativePath.includes('\0') ||
+    relativePath.includes(':')
+  ) {
+    return false;
+  }
+  // Windows ignores a trailing dot or space, so `name.json.` can address `name.json`.
+  if (/[. ]$/.test(relativePath)) {
     return false;
   }
   return path.extname(relativePath).toLowerCase() !== '.json';
@@ -128,6 +120,9 @@ async function resolveSessionSidecarFile(part, sessionsRoot) {
     return null;
   }
   if (path.dirname(realFile) !== realRoot) {
+    return null;
+  }
+  if (path.extname(realFile).toLowerCase() === '.json') {
     return null;
   }
   try {
