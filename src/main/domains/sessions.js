@@ -238,6 +238,78 @@ function clearPendingSessionFilename() {
 }
 
 /**
+ * @returns {string | null}
+ */
+function getPendingSessionFilename() {
+  return pendingSessionFilename;
+}
+
+/**
+ * @param {{ contextClear?: () => Promise<void> }} [deps]
+ */
+async function startNewSession(deps = {}) {
+  const clear = deps.contextClear || (() => engineManager.contextClear());
+  await clear();
+  state.activeSessionFilename = null;
+  clearPendingSessionFilename();
+}
+
+/**
+ * @param {unknown} rawName
+ * @param {{
+ *   readSessionFile?: (filename: string) => Promise<Array<object>>,
+ *   contextReplace?: (messages: Array<object>) => Promise<void>,
+ *   assertValidSessionFilename?: (name: string) => string,
+ * }} [deps]
+ */
+async function loadSession(rawName, deps = {}) {
+  const read = deps.readSessionFile || readSessionFile;
+  const replace = deps.contextReplace || ((messages) => engineManager.contextReplace(messages));
+  const assertName = deps.assertValidSessionFilename || assertValidSessionFilename;
+  if (typeof rawName !== 'string' || !rawName.trim()) {
+    throw new Error(t('errors.sessions.nameRequired'));
+  }
+  const sessionName = assertName(rawName.trim());
+  const messages = await read(sessionName);
+  await replace(messages);
+  state.activeSessionFilename = sessionName;
+  clearPendingSessionFilename();
+  return { sessionName, messages };
+}
+
+/**
+ * @param {unknown} rawName
+ * @param {{
+ *   trashSessionFile?: (filename: string) => Promise<void>,
+ *   contextClear?: () => Promise<void>,
+ *   assertValidSessionFilename?: (name: string) => string,
+ *   getActiveSessionFilename?: () => string | null,
+ * }} [deps]
+ */
+async function trashNamedSession(rawName, deps = {}) {
+  const assertName = deps.assertValidSessionFilename || assertValidSessionFilename;
+  const trash = deps.trashSessionFile || ((filename) => trashSessionFile(filename));
+  const clearContext = deps.contextClear || (() => engineManager.contextClear());
+  const activeName = deps.getActiveSessionFilename || (() => state.activeSessionFilename);
+  if (typeof rawName !== 'string' || !rawName.trim()) {
+    throw new Error(t('errors.sessions.nameRequired'));
+  }
+  const sessionName = assertName(rawName.trim());
+  const wasActive = activeName() === sessionName;
+  await trash(sessionName);
+  if (wasActive) {
+    state.activeSessionFilename = null;
+    clearPendingSessionFilename();
+    try {
+      await clearContext();
+    } catch {
+      /* worker may not be running */
+    }
+  }
+  return { sessionName, wasActive };
+}
+
+/**
  * @param {{
  *   contextSnapshot?: () => Promise<Array<object>>,
  *   writeSessionFile?: (filename: string, messages: Array<object>) => Promise<void>,
@@ -329,9 +401,7 @@ function registerSessionsIpc() {
 
   ipcMain.handle('sessions:new', async () => {
     try {
-      await engineManager.contextClear();
-      state.activeSessionFilename = null;
-      clearPendingSessionFilename();
+      await startNewSession();
       return ok({});
     } catch (err) {
       return fail(err, 'E_SESSIONS');
@@ -340,16 +410,8 @@ function registerSessionsIpc() {
 
   ipcMain.handle('sessions:load', async (_event, payload) => {
     try {
-      const rawName = payload && payload.sessionName;
-      if (typeof rawName !== 'string' || !rawName.trim()) {
-        throw new Error(t('errors.sessions.nameRequired'));
-      }
-      const sessionName = assertValidSessionFilename(rawName.trim());
-      const messages = await readSessionFile(sessionName);
-      await engineManager.contextReplace(messages);
-      state.activeSessionFilename = sessionName;
-      clearPendingSessionFilename();
-      return ok({ sessionName, messages });
+      const result = await loadSession(payload && payload.sessionName);
+      return ok(result);
     } catch (err) {
       return fail(err, 'E_SESSIONS');
     }
@@ -383,18 +445,7 @@ function registerSessionsIpc() {
       if (typeof rawName !== 'string' || !rawName.trim()) {
         throw new Error(t('errors.sessions.nameRequired'));
       }
-      const sessionName = assertValidSessionFilename(rawName.trim());
-      const wasActive = state.activeSessionFilename === sessionName;
-      await trashSessionFile(sessionName);
-      if (wasActive) {
-        state.activeSessionFilename = null;
-        clearPendingSessionFilename();
-        try {
-          await engineManager.contextClear();
-        } catch {
-          /* worker may not be running */
-        }
-      }
+      const { sessionName, wasActive } = await trashNamedSession(rawName);
       const sessions = await listSessionFiles();
       return ok({ sessionName, wasActive, sessions });
     } catch (err) {
@@ -460,6 +511,10 @@ module.exports = {
   persistActiveSession,
   reserveActiveSessionFilename,
   clearPendingSessionFilename,
+  getPendingSessionFilename,
+  startNewSession,
+  loadSession,
+  trashNamedSession,
   deleteSessionMessage,
   trashSessionFile,
 };

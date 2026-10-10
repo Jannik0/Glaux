@@ -13,10 +13,15 @@ const {
 const {
   clearPendingSessionFilename,
   deleteSessionMessage,
+  getPendingSessionFilename,
+  loadSession,
   persistActiveSession,
   reserveActiveSessionFilename,
+  startNewSession,
+  trashNamedSession,
   trashSessionFile,
 } = require('../src/main/domains/sessions');
+const { activateWorkspace } = require('../src/main/domains/workspaces');
 
 describe('session delete and trash order', () => {
   let root;
@@ -240,7 +245,7 @@ describe('pending session filename', () => {
     clearPendingSessionFilename();
   });
 
-  it('does not publish the name until persist succeeds, and a failed turn drops the sidecar', async () => {
+  it('does not publish the name until persist succeeds', async () => {
     state.activeSessionFilename = null;
     clearPendingSessionFilename();
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'glaux-pending-session-'));
@@ -265,10 +270,7 @@ describe('pending session filename', () => {
         /disk/
       );
       assert.equal(state.activeSessionFilename, null);
-      clearPendingSessionFilename();
-      await fs.rm(allocated.absolutePath);
-      await assert.rejects(fs.stat(allocated.absolutePath));
-      assert.equal(state.activeSessionFilename, null);
+      assert.equal(getPendingSessionFilename(), filename);
 
       const next = reserveActiveSessionFilename();
       assert.equal(state.activeSessionFilename, null);
@@ -283,10 +285,60 @@ describe('pending session filename', () => {
       assert.equal(state.activeSessionFilename, next);
       assert.equal(written.name, next);
       assert.equal(reserveActiveSessionFilename(), next);
+      assert.equal(getPendingSessionFilename(), null);
     } finally {
       state.activeSessionFilename = null;
       clearPendingSessionFilename();
       await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('clears the pending name on new, load, trash of the active session, and workspace switch', async () => {
+    state.activeSessionFilename = null;
+    clearPendingSessionFilename();
+    const workspaceBefore = state.activeWorkspaceName;
+    try {
+      reserveActiveSessionFilename();
+      assert.ok(getPendingSessionFilename());
+      await startNewSession({ contextClear: async () => {} });
+      assert.equal(getPendingSessionFilename(), null);
+      assert.equal(state.activeSessionFilename, null);
+
+      reserveActiveSessionFilename();
+      const loaded = await loadSession('saved.json', {
+        readSessionFile: async () => [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        contextReplace: async () => {},
+      });
+      assert.equal(loaded.sessionName, 'saved.json');
+      assert.equal(getPendingSessionFilename(), null);
+      assert.equal(state.activeSessionFilename, 'saved.json');
+
+      state.activeSessionFilename = null;
+      const pending = reserveActiveSessionFilename();
+      state.activeSessionFilename = pending;
+      const trashed = await trashNamedSession(pending, {
+        trashSessionFile: async () => {},
+        contextClear: async () => {},
+      });
+      assert.equal(trashed.wasActive, true);
+      assert.equal(state.activeSessionFilename, null);
+      assert.equal(getPendingSessionFilename(), null);
+
+      reserveActiveSessionFilename();
+      const activated = await activateWorkspace('Other', {
+        setActiveWorkspacePaths: (name) => name,
+        ensureWorkspaceDirectories: async () => {},
+        persistActiveWorkspaceName: async () => {},
+        reconfigureEnginePathsIfReady: async () => {},
+        closeWorkspaceDependentWindows: () => {},
+      });
+      assert.equal(activated, 'Other');
+      assert.equal(getPendingSessionFilename(), null);
+      assert.equal(state.activeSessionFilename, null);
+    } finally {
+      state.activeSessionFilename = null;
+      state.activeWorkspaceName = workspaceBefore;
+      clearPendingSessionFilename();
     }
   });
 });

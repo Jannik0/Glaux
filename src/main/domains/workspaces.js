@@ -110,15 +110,20 @@ async function reconfigureEnginePathsIfReady() {
  * @param {string} name
  * @returns {Promise<string>}
  */
-async function activateWorkspace(name) {
-  const safeName = setActiveWorkspacePaths(name);
-  await ensureWorkspaceDirectories(safeName);
+async function activateWorkspace(name, deps = {}) {
+  const setPaths = deps.setActiveWorkspacePaths || setActiveWorkspacePaths;
+  const ensureDirs = deps.ensureWorkspaceDirectories || ensureWorkspaceDirectories;
+  const persistName = deps.persistActiveWorkspaceName || persistActiveWorkspaceName;
+  const reconfigure = deps.reconfigureEnginePathsIfReady || reconfigureEnginePathsIfReady;
+  const closeWindows = deps.closeWorkspaceDependentWindows || closeWorkspaceDependentWindows;
+  const safeName = setPaths(name);
+  await ensureDirs(safeName);
   state.activeWorkspaceName = safeName;
   state.activeSessionFilename = null;
   clearPendingSessionFilename();
-  closeWorkspaceDependentWindows();
-  await persistActiveWorkspaceName(safeName);
-  await reconfigureEnginePathsIfReady();
+  closeWindows();
+  await persistName(safeName);
+  await reconfigure();
   return safeName;
 }
 

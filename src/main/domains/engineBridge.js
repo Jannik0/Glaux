@@ -97,14 +97,46 @@ function normalizeFilesPayload(rawFiles) {
   return normalized;
 }
 
-async function persistStreamSession(logLabel) {
+async function persistTurnSession(logLabel, deps) {
   try {
-    await persistActiveSession();
+    await persistActiveSession(deps);
   } catch (persistErr) {
     console.error(logLabel, persistErr);
     if (!state.activeSessionFilename) {
       clearPendingSessionFilename();
     }
+  }
+}
+
+/**
+ * Non-streaming send. Persists through the same helper as the stream handler.
+ * A failed turn clears a still-unpublished session name. The generated PNG is
+ * discarded inside sendPrompt.
+ *
+ * @param {unknown} payload
+ * @param {{ outputPath?: string, persist?: object }} [deps]
+ * @returns {Promise<{ response: string, images: Array<object> }>}
+ */
+async function deliverSendMessage(payload, deps = {}) {
+  const { message, enableThinking, resubmit, files } = parseInferenceRequest(payload);
+  const outputPath = Object.prototype.hasOwnProperty.call(deps, 'outputPath')
+    ? deps.outputPath
+    : await textToImageOutputPath();
+  try {
+    const response = await engineManager.sendPrompt(message, {
+      enableThinking,
+      resubmit,
+      files,
+      outputPath,
+    });
+    const split = splitPromptResult(response);
+    await persistTurnSession('Failed to persist session after chat turn:', deps.persist);
+    return { response: split.text, images: split.images };
+  } catch (err) {
+    if (!state.activeSessionFilename) {
+      clearPendingSessionFilename();
+    }
+    throw err;
   }
 }
 
@@ -187,20 +219,8 @@ function registerEngineBridgeIpc() {
       return fail(new Error(t('errors.engineBridge.engineNotInitialized')), 'E_NOT_READY');
     }
     try {
-      const { message, enableThinking, resubmit, files } = parseInferenceRequest(payload);
-      const outputPath = await textToImageOutputPath();
-      const response = await engineManager.sendPrompt(message, {
-        enableThinking,
-        resubmit,
-        files,
-        outputPath,
-      });
-      const split = splitPromptResult(response);
-      return ok({ response: split.text, images: split.images });
+      return ok(await deliverSendMessage(payload));
     } catch (err) {
-      if (!state.activeSessionFilename) {
-        clearPendingSessionFilename();
-      }
       return fail(err, 'E_INFERENCE');
     }
   });
@@ -413,7 +433,7 @@ function registerEngineBridgeIpc() {
 
         if (streamState.canceled) {
           emitStreamEvent(sender, { requestId, type: 'canceled' });
-          await persistStreamSession('Failed to persist session after canceled chat turn:');
+          await persistTurnSession('Failed to persist session after canceled chat turn:');
           return;
         }
 
@@ -427,14 +447,14 @@ function registerEngineBridgeIpc() {
           response: split.text,
           images: split.images,
         });
-        await persistStreamSession('Failed to persist session after chat turn:');
+        await persistTurnSession('Failed to persist session after chat turn:');
       } catch (err) {
         if (sendPromptPromise) {
           sendPromptPromise.catch(() => {});
         }
         if (streamState.canceled) {
           emitStreamEvent(sender, { requestId, type: 'canceled' });
-          await persistStreamSession('Failed to persist session after canceled chat turn:');
+          await persistTurnSession('Failed to persist session after canceled chat turn:');
           return;
         }
         const isStreamIdleTimeout =
@@ -501,4 +521,5 @@ function registerEngineBridgeIpc() {
 
 module.exports = {
   registerEngineBridgeIpc,
+  deliverSendMessage,
 };
