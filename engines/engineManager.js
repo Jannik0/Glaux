@@ -40,6 +40,10 @@ const {
   assertImageToImagePrompt,
   assertTextToImagePrompt,
 } = require('./common/textToImage');
+const { isFileInside } = require('../src/main/sessionImages');
+
+/** How long shutdown waits for the Hugging Face pipeline to drop its offload files. */
+const HF_DESTROY_TIMEOUT_MS = 5000;
 
 /** @type {{ resourcesRoot?: string, outputsRoot?: string, sessionsRoot?: string, modelsCacheDir?: string, modelId?: string, onProgress?: (info: object) => void } | null} */
 let initOptions = null;
@@ -57,6 +61,13 @@ let activeEngineId = null;
 let phase = 'idle';
 
 let generationInFlight = false;
+
+/**
+ * Identifies the sendPrompt call that owns generationInFlight.
+ * cancelGeneration clears the flag immediately; a newer run must not have it
+ * reset by the older run's finally.
+ */
+let generationRun = 0;
 
 /** Set by cancelGeneration so sendPrompt can keep the partial assistant turn. */
 let cancelRequested = false;
@@ -456,12 +467,10 @@ async function discardGeneratedOutput(outputPath) {
   if (typeof outputPath !== 'string' || !outputPath || !sessionsRoot) {
     return;
   }
-  const root = path.resolve(sessionsRoot);
-  const file = path.resolve(outputPath);
-  const rel = path.relative(root, file);
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+  if (!isFileInside(sessionsRoot, outputPath)) {
     return;
   }
+  const file = path.resolve(outputPath);
   try {
     const stats = await fs.stat(file);
     if (stats.isFile()) {
@@ -834,15 +843,35 @@ async function ejectModel() {
   emitProgress({ phase: 'unload', status: 'complete' });
 }
 
-async function unloadHuggingFacePipeline() {
+/**
+ * @param {number} [timeoutMs]
+ */
+async function unloadHuggingFacePipeline(timeoutMs = HF_DESTROY_TIMEOUT_MS) {
+  const limit = Number.isFinite(timeoutMs) ? timeoutMs : HF_DESTROY_TIMEOUT_MS;
+  let timer;
+  let timedOut = false;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      console.warn(
+        `Hugging Face pipeline unload timed out after ${limit}ms; closing the worker.`
+      );
+      resolve();
+    }, limit);
+  });
   try {
-    await engines.huggingface.chatbotDestroyIfRunning();
+    await Promise.race([engines.huggingface.chatbotDestroyIfRunning(), timeout]);
   } catch {
     /* worker may already be gone */
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
+  return timedOut;
 }
 
-async function shutdown() {
+async function shutdown(options = {}) {
   for (const engine of Object.values(engines)) {
     try {
       await engine.chatStop();
@@ -851,8 +880,9 @@ async function shutdown() {
     }
   }
   // chatbot_destroy removes the disk-offload folder. close() kills the worker
-  // and would leave those files behind.
-  await unloadHuggingFacePipeline();
+  // and would leave those files behind. A hung destroy must not block close();
+  // the next text-to-image load deletes a leftover offload folder.
+  await unloadHuggingFacePipeline(options.hfDestroyTimeoutMs);
   await Promise.all(
     Object.values(engines).map((engine) => engine.close({ final: true }).catch(() => {}))
   );
@@ -863,7 +893,7 @@ async function shutdown() {
   activeEngineId = null;
 }
 
-async function resetInferenceWorker() {
+async function resetInferenceWorker(options = {}) {
   for (const engine of Object.values(engines)) {
     try {
       await engine.chatStop();
@@ -871,7 +901,7 @@ async function resetInferenceWorker() {
       /* ignore */
     }
   }
-  await unloadHuggingFacePipeline();
+  await unloadHuggingFacePipeline(options.hfDestroyTimeoutMs);
   await Promise.all(
     Object.values(engines).map((engine) => engine.close({ final: false }).catch(() => {}))
   );
@@ -928,6 +958,7 @@ async function sendPrompt(message, options = {}) {
       imagePaths,
       files: checked.imageFile ? describeAttachments([checked.imageFile]) : [],
     });
+    const runToken = ++generationRun;
     generationInFlight = true;
     phase = 'generating';
     const pendingCompanions = companionJobs.get(activeModelId)?.promise;
@@ -983,8 +1014,10 @@ async function sendPrompt(message, options = {}) {
       contextManager.rollbackLastUser();
       throw err;
     } finally {
-      generationInFlight = false;
-      phase = 'idle';
+      if (generationRun === runToken) {
+        generationInFlight = false;
+        phase = 'idle';
+      }
     }
   }
 
@@ -1001,6 +1034,7 @@ async function sendPrompt(message, options = {}) {
     files: attachmentFiles,
   });
 
+  const runToken = ++generationRun;
   generationInFlight = true;
   phase = 'generating';
   let accumulated = '';
@@ -1045,8 +1079,10 @@ async function sendPrompt(message, options = {}) {
     contextManager.rollbackLastUser();
     throw err;
   } finally {
-    generationInFlight = false;
-    phase = 'idle';
+    if (generationRun === runToken) {
+      generationInFlight = false;
+      phase = 'idle';
+    }
   }
 }
 
@@ -1165,4 +1201,5 @@ module.exports = {
   contextReplace,
   contextClear,
   contextUsage,
+  HF_DESTROY_TIMEOUT_MS,
 };

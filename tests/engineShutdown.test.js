@@ -69,6 +69,21 @@ describe('engine shutdown', () => {
     assert.ok(order.includes('close'));
   });
 
+  it('closes workers when Hugging Face unload does not return', async () => {
+    const order = [];
+    hf.chatbotDestroyIfRunning = () => new Promise(() => {});
+    for (const engine of engines) {
+      engine.chatStop = async () => {};
+      engine.close = async () => {
+        order.push('close');
+      };
+    }
+
+    await engineManager.shutdown({ hfDestroyTimeoutMs: 30 });
+
+    assert.ok(order.includes('close'));
+  });
+
   it('does not start a Hugging Face worker when none is running', async () => {
     restore();
     await hf.chatbotDestroyIfRunning();
