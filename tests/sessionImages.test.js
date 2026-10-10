@@ -206,8 +206,7 @@ describe('session image sidecars', () => {
       allocateSessionImagePath(sessions, 'race.json'),
       allocateSessionImagePath(sessions, 'race.json'),
     ]);
-    assert.equal(left.relativePath, 'race-1.png');
-    assert.equal(right.relativePath, 'race-2.png');
+    assert.deepEqual([left.relativePath, right.relativePath].sort(), ['race-1.png', 'race-2.png']);
     assert.notEqual(left.absolutePath, right.absolutePath);
     releaseSessionImagePath(left.absolutePath);
     releaseSessionImagePath(right.absolutePath);
