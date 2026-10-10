@@ -9,6 +9,10 @@
  * (`npm run build:ffmpeg`); this script does not stage ffmpeg/ffprobe.
  * CUDA kernels use a pinned architecture list (Turing–Blackwell) from
  * gpuBackends.cudaArchitectureCmakeArgs rather than the toolkit default.
+ * GGML_MAX_NAME=160 matches stable-diffusion.cpp so the three engines can
+ * load one ggml-cuda module from vendor/cuda. That module is
+ * stable-diffusion.cpp's copy when it has been built; otherwise llama.cpp's.
+ * The loader also scans ../cuda. Vulkan stays next to this binary.
  *
  * Usage:
  *   node scripts/build-llamacpp.js
@@ -31,7 +35,9 @@ const {
   cudaBuildJobs,
   stageNativeRuntime,
   stageSharedCudaRuntime,
-  shareGgmlCudaBackend,
+  stageSharedGgmlCudaBackend,
+  patchGlauxCudaBackendSearch,
+  ggmlMaxNameCmakeArgs,
   removeStagedCudaRedistributables,
   withCudaToolkitEnv,
   which,
@@ -44,8 +50,10 @@ const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SRC = path.join(ROOT, 'deps', 'llama.cpp');
 const DEFAULT_OUT = path.join(ROOT, 'vendor', 'llamacpp');
 const LLAMA_CPP_REPO = 'https://github.com/ggml-org/llama.cpp';
-// b11256. Same upstream ggml (353b63b) as transcribe.cpp; v0.5.0 vendors an older ggml.
-const LLAMA_CPP_REV = 'c85b92c69c955961621193cd51da194f3cbcedf3';
+// b11349. Newest published build whose ggml-backend-impl.h still matches
+// transcribe.cpp v0.3.1 and stable-diffusion.cpp's ggml 89c4413
+// (GGML_BACKEND_API_VERSION 2). The next build, b11351, is API version 3.
+const LLAMA_CPP_REV = 'fb4b2737a808a3fb7c2117a498f43815dc9be53e';
 
 function printHelp() {
   console.log(`Usage: node scripts/build-llamacpp.js [options]
@@ -141,6 +149,7 @@ function main() {
     throw new Error('cmake not found on PATH. Install CMake to build llama.cpp.');
   }
   requirePatchelf();
+  patchGlauxCudaBackendSearch(path.join(opts.srcDir, 'ggml', 'src', 'ggml-backend-reg.cpp'));
 
   const buildDir = path.join(opts.srcDir, 'build-glaux');
   fs.mkdirSync(opts.outDir, { recursive: true });
@@ -163,6 +172,7 @@ function main() {
     '-DGGML_SYCL=OFF',
     '-DLLAMA_BUILD_SERVER=ON',
     ...cmakeGpuArgs('ggml', backends),
+    ...ggmlMaxNameCmakeArgs(),
     ...cudaCompilerCmakeArgs(backends),
     ...cudaArchitectureCmakeArgs(backends),
     ...rpathCmakeArgs(),
@@ -209,7 +219,11 @@ function main() {
     stageSharedCudaRuntime({ required: true });
     pruneCudaFatbinsInTree(opts.outDir);
   }
-  shareGgmlCudaBackend(opts.outDir, path.join(ROOT, 'vendor', 'transcribe'));
+  stageSharedGgmlCudaBackend({
+    llamacpp: opts.outDir,
+    transcribe: path.join(ROOT, 'vendor', 'transcribe'),
+    stablediffusion: path.join(ROOT, 'vendor', 'stablediffusion'),
+  });
 
   console.log('llama.cpp build complete.');
 }

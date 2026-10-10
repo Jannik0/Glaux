@@ -3,6 +3,8 @@
 /**
  * Clone a git repo into dest at a pinned revision when dest is missing.
  * Existing checkouts are left untouched so local work is not overwritten.
+ * An empty directory is not a checkout: git leaves one for an unpopulated
+ * submodule gitlink, and that placeholder must still be filled in.
  */
 
 const { spawnSync } = require('child_process');
@@ -28,25 +30,37 @@ function runGit(args, options = {}) {
 /**
  * @param {{ dest: string, url: string, rev: string, name: string }} opts
  */
-function ensureGitDep({ dest, url, rev, name }) {
-  if (fs.existsSync(dest)) {
+function isEmptyDirectory(dest) {
+  try {
+    return fs.statSync(dest).isDirectory() && fs.readdirSync(dest).length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {{ dest: string, url: string, rev: string, name: string, git?: typeof runGit }} opts
+ */
+function ensureGitDep({ dest, url, rev, name, git }) {
+  if (fs.existsSync(dest) && !isEmptyDirectory(dest)) {
     console.log(`Using existing ${name} at ${dest}`);
     return;
   }
-  if (!which('git')) {
+  const run = typeof git === 'function' ? git : runGit;
+  if (run === runGit && !which('git')) {
     throw new Error(`git not found on PATH. Install Git to clone ${name} into ${dest}.`);
   }
 
   console.log(`Cloning ${name} (${rev}) into ${dest}`);
   try {
-    runGit(['init', dest]);
-    runGit(['-C', dest, 'remote', 'add', 'origin', url]);
-    runGit(['-C', dest, 'fetch', '--depth', '1', 'origin', rev]);
-    runGit(['-C', dest, '-c', 'advice.detachedHead=false', 'checkout', '--force', 'FETCH_HEAD']);
+    run(['init', dest]);
+    run(['-C', dest, 'remote', 'add', 'origin', url]);
+    run(['-C', dest, 'fetch', '--depth', '1', 'origin', rev]);
+    run(['-C', dest, '-c', 'advice.detachedHead=false', 'checkout', '--force', 'FETCH_HEAD']);
   } catch (err) {
     fs.rmSync(dest, { recursive: true, force: true });
     throw err;
   }
 }
 
-module.exports = { ensureGitDep };
+module.exports = { ensureGitDep, isEmptyDirectory };

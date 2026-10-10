@@ -24,7 +24,11 @@ from tqdm.auto import tqdm as base_tqdm
 DownloadProgressEvent = dict
 DownloadProgressCallback = Callable[[DownloadProgressEvent], None]
 
-_download_progress_callback: DownloadProgressCallback | None = None
+# Keyed by the progress id (the GGUF or repo the models list shows) so two
+# snapshot downloads can report bytes at the same time without sharing a sink.
+_download_progress_callbacks: dict[str, DownloadProgressCallback] = {}
+_default_download_progress_callback: DownloadProgressCallback | None = None
+_callback_lock = threading.Lock()
 _active_download_cancels: dict[str, threading.Event] = {}
 
 
@@ -32,15 +36,36 @@ class DownloadCancelledError(Exception):
     """Raised when the user stops an in-progress model download."""
 
 
-def set_download_progress_callback(callback: DownloadProgressCallback | None) -> None:
-    """Register a sink for aggregate download progress (used by the Node IPC layer)."""
-    global _download_progress_callback
-    _download_progress_callback = callback
+def set_download_progress_callback(
+    callback: DownloadProgressCallback | None,
+    progress_id: str | None = None,
+) -> None:
+    """Register a sink for aggregate download progress (used by the Node IPC layer).
+
+    *progress_id* binds the sink to that download. Parallel downloads each keep
+    their own sink. Omitting it sets the fallback used when an event names no id.
+    """
+    global _default_download_progress_callback
+    key = progress_id.strip() if isinstance(progress_id, str) else ""
+    with _callback_lock:
+        if key:
+            if callback is None:
+                _download_progress_callbacks.pop(key, None)
+            else:
+                _download_progress_callbacks[key] = callback
+            return
+        _default_download_progress_callback = callback
 
 
 def _emit_download_progress(event: DownloadProgressEvent) -> None:
-    if _download_progress_callback is not None:
-        _download_progress_callback(event)
+    file_id = event.get("file") if isinstance(event, dict) else None
+    key = file_id.strip() if isinstance(file_id, str) else ""
+    with _callback_lock:
+        callback = _download_progress_callbacks.get(key) if key else None
+        if callback is None:
+            callback = _default_download_progress_callback
+    if callback is not None:
+        callback(event)
 
 
 def begin_download(model_id: str) -> None:
@@ -165,14 +190,19 @@ def download_model(
     model_id: str,
     local_dir: Path,
     allow_patterns: list[str] | None = None,
+    progress_id: str | None = None,
 ) -> str:
     """Download a Hub model into *local_dir* (flat layout).
 
     When *allow_patterns* is set (GGUF variant downloads), only matching files
     are fetched via huggingface_hub's snapshot_download filters.
+    *progress_id* is the cancel and progress key. It matches *model_id* except
+    when a text-to-image GGUF download is fetching that model's VAE and text
+    encoder into the base repo folder.
     """
     model_id = model_id.strip()
-    begin_download(model_id)
+    tracked = (progress_id or model_id).strip()
+    begin_download(tracked)
     try:
         local_dir.mkdir(parents=True, exist_ok=True)
         enable_download_progress_bars()
@@ -180,7 +210,7 @@ def download_model(
             "repo_id": model_id,
             "repo_type": "model",
             "local_dir": str(local_dir),
-            "tqdm_class": aggregate_tqdm_class_for(model_id),
+            "tqdm_class": aggregate_tqdm_class_for(tracked),
             "max_workers": DOWNLOAD_MAX_WORKERS,
         }
         if allow_patterns:
@@ -190,12 +220,12 @@ def download_model(
         except DownloadCancelledError:
             raise
         except Exception:
-            raise_if_download_cancelled(model_id)
+            raise_if_download_cancelled(tracked)
             raise
-        raise_if_download_cancelled(model_id)
+        raise_if_download_cancelled(tracked)
         return str(local_dir)
     finally:
-        end_download(model_id)
+        end_download(tracked)
 
 
 def list_model_files(model_id: str) -> list[dict]:

@@ -24,6 +24,12 @@ from transformers.generation.stopping_criteria import StoppingCriteria, Stopping
 from . import context
 from . import download as _download
 from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_local_dir, read_model_pipeline_tag
+from .t2i import (
+    DiffusionStopped,
+    generate_text_to_image,
+    load_text_to_image_pipeline,
+    release_disk_offload,
+)
 from .thinking import (
     _iter_stripped_non_thinking_markup,
     _parse_tags_and_answer,
@@ -49,6 +55,11 @@ CHAT_GENERATION_STOP = False
 _cuda_unavailable = False
 # Models that did not fit in VRAM. A different model tries CUDA again.
 _cuda_oom_model_ids: set[str] = set()
+# Paths written by the current text-to-image call. Node reads them after the stream.
+_GENERATED_IMAGE_PATHS: list[str] = []
+TEXT_TO_IMAGE_PIPELINE_TAG = "text-to-image"
+IMAGE_TO_IMAGE_PIPELINE_TAG = "image-to-image"
+_DIFFUSION_PIPELINE_TAGS = frozenset({TEXT_TO_IMAGE_PIPELINE_TAG, IMAGE_TO_IMAGE_PIPELINE_TAG})
 
 
 def _force_cpu() -> bool:
@@ -195,6 +206,7 @@ def _fallback_pipeline_to_cpu(exc: BaseException) -> None:
         _release_torch_cache()
     except Exception:
         pass
+    release_disk_offload()
     if model_id:
         chatbot_create(model_id)
 
@@ -222,9 +234,19 @@ def _chat_template_backend():
     return CHATBOT.tokenizer
 
 
+def take_generated_image_paths() -> list[str]:
+    """Return image files from the latest text-to-image call and clear the buffer."""
+    global _GENERATED_IMAGE_PATHS
+    paths = list(_GENERATED_IMAGE_PATHS)
+    _GENERATED_IMAGE_PATHS = []
+    return paths
+
+
 def chatbot_has_chat_template() -> bool:
     """True when the loaded tokenizer/processor defines a usable chat template."""
-    if CHATBOT is None:
+    # Diffusion pipelines are not chat models. Reporting no template keeps the
+    # thinking UI and context-usage gauge off.
+    if CHATBOT is None or CHATBOT_PIPELINE_TAG in _DIFFUSION_PIPELINE_TAGS:
         return False
     backend = _chat_template_backend()
     if backend is None or not hasattr(backend, "apply_chat_template"):
@@ -247,7 +269,21 @@ def chatbot_create(model_id: str):
     model_path = str(model_local_dir(model_id))
     CHATBOT_PIPELINE_TAG = read_model_pipeline_tag(model_id) or DEFAULT_PIPELINE_TAG
 
+    def _diffusion_device(placement: dict) -> str:
+        if placement.get("device") == "cpu":
+            return "cpu"
+        mapped = placement.get("device_map")
+        if mapped in ("cuda", "mps"):
+            return str(mapped)
+        return "cpu"
+
     def _build_pipeline(placement: dict):
+        if CHATBOT_PIPELINE_TAG in _DIFFUSION_PIPELINE_TAGS:
+            return load_text_to_image_pipeline(
+                model_path,
+                _diffusion_device(placement),
+                allow_img2img=CHATBOT_PIPELINE_TAG == IMAGE_TO_IMAGE_PIPELINE_TAG,
+            )
         return pipeline(
             CHATBOT_PIPELINE_TAG,
             model=model_path,
@@ -322,6 +358,7 @@ def chatbot_destroy():
         del chatbot
     gc.collect()
     _release_torch_cache()
+    release_disk_offload()
 
 
 _THINKING_TEMPLATE_PARAMS = ("enable_thinking",)
@@ -922,6 +959,81 @@ def _iter_direct_pipeline_stream(
     yield from _iter_direct_pipeline_batch(pipeline_input)
 
 
+def _reject_diffusion_media(
+    image_paths: list[str] | None,
+    audio_paths: list[str] | None,
+    video_paths: list[str] | None,
+    *,
+    allow_image: bool,
+) -> str | None:
+    """Return the optional init-image path. Reject anything else."""
+    images = [path for path in (image_paths or []) if path]
+    if audio_paths or video_paths or (images and not allow_image):
+        raise RuntimeError(
+            "Image-to-image models accept a text prompt and an optional image."
+            if allow_image
+            else "Text-to-image models accept a text prompt only."
+        )
+    if len(images) > 1:
+        raise RuntimeError("Image-to-image models accept at most one image.")
+    return images[0] if images else None
+
+
+def _generate_text_to_image_turn(
+    message: str,
+    image_paths: list[str] | None,
+    audio_paths: list[str] | None,
+    video_paths: list[str] | None,
+    output_path: str | None,
+) -> str:
+    """One image from the current prompt. Caller holds ``_CHAT_LOCK``.
+
+    Chat history is ignored. Size, steps, seed, and CFG stay at pipeline defaults.
+    ``chat_stop()`` ends sampling at the next denoising step and yields no image.
+    """
+    global CHAT_GENERATION_STOP, _GENERATED_IMAGE_PATHS
+    _GENERATED_IMAGE_PATHS = []
+    # Same as the chat and ASR streams: a stop from an earlier turn must not
+    # cancel this one. Stops that arrive after this point are seen at the next step.
+    CHAT_GENERATION_STOP = False
+    init_image = _reject_diffusion_media(
+        image_paths,
+        audio_paths,
+        video_paths,
+        allow_image=_active_pipeline_tag() == IMAGE_TO_IMAGE_PIPELINE_TAG,
+    )
+    prompt = (message or "").strip()
+    if not prompt:
+        raise ValueError("Image generation requires a prompt.")
+    if not output_path:
+        raise ValueError("Image generation output path is not configured.")
+    saved: str | None = None
+    stopped = False
+    try:
+        for attempt in range(2):
+            try:
+                saved = generate_text_to_image(CHATBOT, prompt, output_path, init_image)
+                break
+            except DiffusionStopped:
+                stopped = True
+                break
+            except Exception as exc:
+                if attempt == 0 and _pipeline_uses_cuda() and _is_cuda_failure(exc):
+                    _fallback_pipeline_to_cpu(exc)
+                    continue
+                raise
+    finally:
+        if CHAT_GENERATION_STOP:
+            stopped = True
+        CHAT_GENERATION_STOP = False
+    if stopped:
+        return ""
+    if not saved:
+        raise RuntimeError("Text-to-image pipeline returned no images.")
+    _GENERATED_IMAGE_PATHS = [saved]
+    return saved
+
+
 def chat_stream(
     model_id: str,
     thinking: bool,
@@ -932,14 +1044,17 @@ def chat_stream(
     *,
     resubmit: bool = True,
     messages: list | None = None,
+    output_path: str | None = None,
 ):
     """Stream a chat response.
 
     When ``messages`` is provided (canonical history from contextManager, already
     including the new user turn), it becomes the working CONTEXT for this call and
     assistant text is *not* appended here — the Node contextManager owns commits.
+
+    Text-to-image ignores ``messages`` and writes one image to ``output_path``.
     """
-    global CHAT_GENERATION_STOP
+    global CHAT_GENERATION_STOP, _GENERATED_IMAGE_PATHS
     model_id = _assert_valid_model_id(model_id)
     owns_history = messages is None
     with _chat_lock_guard():
@@ -949,6 +1064,24 @@ def chat_stream(
             old = None
         if CHATBOT is None:
             chatbot_create(model_id)
+        if _active_pipeline_tag() in _DIFFUSION_PIPELINE_TAGS:
+            try:
+                _generate_text_to_image_turn(
+                    message,
+                    image_paths,
+                    audio_paths,
+                    video_paths,
+                    output_path,
+                )
+            finally:
+                if old is not None:
+                    del old
+                    gc.collect()
+                    _release_torch_cache()
+            return
+        # Drop any image paths left by a failed text-to-image call so a later
+        # chat turn is not reported as an image result.
+        _GENERATED_IMAGE_PATHS = []
         if messages is not None:
             context._validate_context_messages(messages)
             context.CONTEXT.clear()
@@ -1034,6 +1167,7 @@ def run_chat(
     *,
     resubmit: bool = True,
     messages: list | None = None,
+    output_path: str | None = None,
 ) -> str:
     return "".join(
         chat_stream(
@@ -1045,5 +1179,6 @@ def run_chat(
             video_paths=video_paths,
             resubmit=resubmit,
             messages=messages,
+            output_path=output_path,
         )
     )

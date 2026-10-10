@@ -1,8 +1,9 @@
 /**
  * Inference facade. The rest of the app talks to engineManager only.
  * Routes by weight format and pipeline_tag:
- *   safetensors/pytorch → huggingface
+ *   safetensors/pytorch → huggingface (including diffusers text- and image-to-image)
  *   GGUF + ASR          → transcribecpp
+ *   GGUF + text-to-image or image-to-image → stablediffusioncpp
  *   GGUF (chat/other)   → llamacpp
  * Hub downloads always use the huggingface downloader stack.
  */
@@ -12,8 +13,10 @@ const path = require('path');
 const hfEngine = require('./huggingface/engine');
 const llamaEngine = require('./llamacpp/engine');
 const transcribeEngine = require('./transcribecpp/engine');
+const stableDiffusionEngine = require('./stablediffusioncpp/engine');
 const contextManager = require('./contextManager');
-const { detectModelFormat } = require('./common/modelFormat');
+const { COMPANION_ALLOW_PATTERNS, detectModelFormat } = require('./common/modelFormat');
+const { baseCompanionsReady, missingBaseCompanions } = require('./stablediffusioncpp/weights');
 const { stripThinkingFromMessages } = require('./common/stripThinking');
 const { withStopMarker } = require('./common/stopMarker');
 const {
@@ -26,9 +29,24 @@ const {
 const { extractPdfToMarkdown } = require('./common/extractPdf');
 const { extractVideoToWav } = require('./common/extractVideo');
 const { readModelPipelineTag: readPipelineTagFromCache } = require('./common/pipelineTag');
-const { ASR_PIPELINE_TAG, resolveEngineId } = require('./common/resolveEngineId');
+const {
+  ASR_PIPELINE_TAG,
+  IMAGE_TO_IMAGE_PIPELINE_TAG,
+  isDiffusionPipelineTag,
+  resolveEngineId,
+} = require('./common/resolveEngineId');
+const {
+  assertGgufTextToImagePrompt,
+  assertImageToImagePrompt,
+  assertTextToImagePrompt,
+} = require('./common/textToImage');
+const { isFileInside } = require('./common/fileInside');
+const { releaseSessionImagePath } = require('./common/imagePathReservation');
 
-/** @type {{ resourcesRoot?: string, outputsRoot?: string, modelsCacheDir?: string, modelId?: string, onProgress?: (info: object) => void } | null} */
+/** How long shutdown waits for the Hugging Face pipeline to drop its offload files. */
+const HF_DESTROY_TIMEOUT_MS = 5000;
+
+/** @type {{ resourcesRoot?: string, outputsRoot?: string, sessionsRoot?: string, modelsCacheDir?: string, modelId?: string, onProgress?: (info: object) => void } | null} */
 let initOptions = null;
 
 /** @type {string | null} */
@@ -37,7 +55,7 @@ let activeModelId = null;
 /** @type {string | null} */
 let activePipelineTag = null;
 
-/** @type {'huggingface' | 'llamacpp' | 'transcribecpp' | null} */
+/** @type {'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusioncpp' | null} */
 let activeEngineId = null;
 
 /** @type {'idle' | 'loading' | 'generating' | 'downloading'} */
@@ -45,13 +63,134 @@ let phase = 'idle';
 
 let generationInFlight = false;
 
-/** Set by cancelGeneration so sendPrompt can keep the partial assistant turn. */
-let cancelRequested = false;
+/**
+ * Identifies the sendPrompt call that owns generationInFlight.
+ * cancelGeneration clears the flag immediately; a newer run must not have it
+ * reset by the older run's finally. Each run keeps its own cancelled flag.
+ * @type {{ token: number, cancelled: boolean, requestId: string, senderId: unknown } | null}
+ */
+let activeGeneration = null;
+let generationRun = 0;
+
+/**
+ * request id → run token. Settled ids are pruned down to the newest
+ * MAX_TRACKED_REQUEST_RUNS so the map cannot grow without bound. A missing id
+ * is unknown and must not cancel whatever run is active now.
+ * @type {Map<string, number>}
+ */
+const requestRunTokens = new Map();
+const MAX_TRACKED_REQUEST_RUNS = 64;
+
+/**
+ * @param {string} requestId
+ * @param {number} token
+ */
+function rememberRequestRun(requestId, token) {
+  if (!requestId) {
+    return;
+  }
+  if (requestRunTokens.has(requestId)) {
+    requestRunTokens.delete(requestId);
+  }
+  requestRunTokens.set(requestId, token);
+  while (requestRunTokens.size > MAX_TRACKED_REQUEST_RUNS) {
+    const oldest = requestRunTokens.keys().next().value;
+    if (
+      activeGeneration &&
+      activeGeneration.requestId &&
+      oldest === activeGeneration.requestId
+    ) {
+      const activeToken = requestRunTokens.get(oldest);
+      requestRunTokens.delete(oldest);
+      requestRunTokens.set(oldest, activeToken);
+      const nextOldest = requestRunTokens.keys().next().value;
+      if (!nextOldest || nextOldest === activeGeneration.requestId) {
+        break;
+      }
+      requestRunTokens.delete(nextOldest);
+      continue;
+    }
+    requestRunTokens.delete(oldest);
+  }
+}
+
+/**
+ * @param {{ requestId?: string, senderId?: unknown }} [meta]
+ * @returns {{ token: number, cancelled: boolean, requestId: string, senderId: unknown, userId: number | null, partialText: string, stopSealed: boolean, stoppedText: string }}
+ */
+function startGenerationRun(meta = {}) {
+  const requestId = meta && meta.requestId ? String(meta.requestId) : '';
+  const senderId = meta && meta.senderId != null ? meta.senderId : undefined;
+  const run = {
+    token: ++generationRun,
+    cancelled: false,
+    requestId,
+    senderId,
+    userId: null,
+    partialText: '',
+    stopSealed: false,
+    stoppedText: '',
+    settled: false,
+  };
+  activeGeneration = run;
+  generationInFlight = true;
+  phase = 'generating';
+  rememberRequestRun(requestId, run.token);
+  return run;
+}
+
+/**
+ * @param {{ requestId?: string, senderId?: unknown }} [options]
+ * @returns {{ requestId: string, senderId: unknown }}
+ */
+function generationMeta(options) {
+  const requestId = options && options.requestId ? String(options.requestId) : '';
+  const senderId = options && options.senderId != null ? options.senderId : undefined;
+  return { requestId, senderId };
+}
+
+/**
+ * @param {{ token: number, cancelled: boolean } | null | undefined} run
+ * @returns {boolean}
+ */
+function generationOwns(run) {
+  return Boolean(run) && run.token === generationRun;
+}
+
+/**
+ * The owning run has returned. A later cancel must not seal this turn.
+ * @param {{ token: number, settled?: boolean } | null | undefined} run
+ */
+function settleOwnedRun(run) {
+  if (!run || !generationOwns(run)) {
+    return;
+  }
+  run.settled = true;
+  generationInFlight = false;
+  phase = 'idle';
+  if (activeGeneration === run) {
+    activeGeneration = null;
+  }
+}
+
+/**
+ * GGUF id whose base-repo companion download is in flight. Cancel uses this
+ * id because the snapshot reports progress under the model the user is running.
+ * @type {string | null}
+ */
+let baseCompanionDownloadId = null;
+/**
+ * VAE and text-encoder fetches keyed by GGUF id. Switching models leaves these
+ * running; only an explicit stop cancels one.
+ * @type {Map<string, { promise: Promise<void>, cancelled: boolean }>}
+ */
+const companionJobs = new Map();
 
 const engines = {
   huggingface: hfEngine,
   llamacpp: llamaEngine,
   transcribecpp: transcribeEngine,
+  stablediffusioncpp: stableDiffusionEngine,
 };
 
 function getActiveEngine() {
@@ -89,6 +228,7 @@ async function ensureEnginePaths(opts) {
   };
   await llamaEngine.configure(mediaOpts);
   await transcribeEngine.configure(mediaOpts);
+  await stableDiffusionEngine.configure(mediaOpts);
   return dir;
 }
 
@@ -107,6 +247,46 @@ function emitProgress(info) {
   }
 }
 
+/** @type {((modelId: string, info: object) => void) | null} */
+let modelDownloadProgressListener = null;
+
+/**
+ * Models-list progress for a transfer that is not the panel's Add-model download
+ * (a VAE and text encoder fetched while running a diffusion GGUF).
+ *
+ * @param {(modelId: string, info: object) => void} listener
+ */
+function setModelDownloadProgressListener(listener) {
+  modelDownloadProgressListener = typeof listener === 'function' ? listener : null;
+}
+
+/**
+ * @param {string} modelId
+ * @param {object} info
+ */
+function emitModelDownloadProgress(modelId, info) {
+  if (typeof modelDownloadProgressListener !== 'function') {
+    return;
+  }
+  try {
+    modelDownloadProgressListener(modelId, info);
+  } catch {
+    // The models list observes the transfer; it must not fail or cancel it.
+  }
+}
+
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isDownloadCancelledError(err) {
+  return Boolean(
+    err &&
+      (/** @type {{ code?: string, message?: string }} */ (err).code === 'DOWNLOAD_CANCELLED' ||
+        /cancelled/i.test(String(/** @type {{ message?: string }} */ (err).message || '')))
+  );
+}
+
 /**
  * @param {string} modelId
  * @returns {Promise<string | null>}
@@ -117,7 +297,7 @@ async function readModelPipelineTag(modelId) {
 
 /**
  * @param {string} modelId
- * @returns {Promise<'huggingface' | 'llamacpp' | 'transcribecpp'>}
+ * @returns {Promise<'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusioncpp'>}
  */
 async function resolveEngineForModel(modelId) {
   const dir = initOptions && initOptions.modelsCacheDir;
@@ -167,6 +347,36 @@ function resolveInferenceFilePath(file) {
     throw new Error('Engine paths are not configured.');
   }
   return path.resolve(root, rel);
+}
+
+/**
+ * Workspace identity for each attachment, keyed later by absolute path.
+ * Documents keep their original relative path (a PDF stays a PDF, not the
+ * extracted markdown path written into the prompt).
+ *
+ * @param {Array<{ source: string, relativePath: string }>} files
+ * @returns {Array<{ path: string, source: string, relativePath: string, kind: string }>}
+ */
+function describeAttachments(files) {
+  const described = [];
+  for (const file of files || []) {
+    if (!file || typeof file.relativePath !== 'string' || !file.relativePath) {
+      continue;
+    }
+    const abs = resolveInferenceFilePath(file);
+    const mediaKind = mediaKindFromPath(abs);
+    const kind = mediaKind || (isDocumentPath(abs) ? 'document' : null);
+    if (!kind || typeof file.source !== 'string' || !file.source) {
+      continue;
+    }
+    described.push({
+      path: abs,
+      source: file.source,
+      relativePath: file.relativePath,
+      kind,
+    });
+  }
+  return described;
 }
 
 /**
@@ -294,9 +504,10 @@ async function enrichMessageWithDocumentAttachments(message, files) {
 /**
  * @param {string} message
  * @param {Array<{ source: string, relativePath: string }>} [files]
- * @returns {Promise<{ message: string, imagePaths: string[], audioPaths: string[], videoPaths: string[] }>}
+ * @returns {Promise<{ message: string, imagePaths: string[], audioPaths: string[], videoPaths: string[], attachmentFiles: Array<{ path: string, source: string, relativePath: string, kind: string }> }>}
  */
 async function prepareInferenceRequest(message, files) {
+  const attachmentFiles = describeAttachments(files);
   const enriched = await enrichMessageWithDocumentAttachments(message, files);
   let finalMessage = enriched.message;
   if (!String(finalMessage || '').trim() && enriched.files.length > 0) {
@@ -307,6 +518,18 @@ async function prepareInferenceRequest(message, files) {
   }
   const { imagePaths, audioPaths, videoPaths } = mediaPathsFromFiles(enriched.files);
   const asrWavPaths = await convertAsrVideoToAudio(videoPaths);
+  for (let i = 0; i < asrWavPaths.length; i += 1) {
+    const video = attachmentFiles.find((item) => item.path === videoPaths[i] && item.kind === 'video');
+    if (!video) {
+      continue;
+    }
+    attachmentFiles.push({
+      path: asrWavPaths[i],
+      source: video.source,
+      relativePath: video.relativePath,
+      kind: 'audio',
+    });
+  }
   const finalAudioPaths = [...audioPaths, ...asrWavPaths];
   const finalVideoPaths = activePipelineTag === ASR_PIPELINE_TAG ? [] : videoPaths;
   return {
@@ -314,6 +537,7 @@ async function prepareInferenceRequest(message, files) {
     imagePaths,
     audioPaths: finalAudioPaths,
     videoPaths: finalVideoPaths,
+    attachmentFiles,
   };
 }
 
@@ -326,10 +550,116 @@ async function configurePaths(opts) {
   initOptions = {
     resourcesRoot: opts.resourcesRoot,
     outputsRoot: opts.outputsRoot,
+    sessionsRoot: opts.sessionsRoot,
     modelsCacheDir: opts.modelsCacheDir,
     onProgress: opts.onProgress,
   };
   await ensureEnginePaths(opts);
+}
+
+/**
+ * Drop a generated file when it lives inside the sessions directory.
+ * Outputs copies are never passed here.
+ *
+ * @param {string | undefined} outputPath
+ * @param {number | undefined | null} [reservationId]
+ */
+async function discardGeneratedOutput(outputPath, reservationId) {
+  try {
+    const sessionsRoot = initOptions && initOptions.sessionsRoot;
+    if (typeof outputPath !== 'string' || !outputPath || !sessionsRoot) {
+      return;
+    }
+    if (!isFileInside(sessionsRoot, outputPath)) {
+      return;
+    }
+    const file = path.resolve(outputPath);
+    try {
+      const stats = await fs.stat(file);
+      if (stats.isFile()) {
+        await fs.unlink(file);
+      }
+    } catch {
+      /* already gone */
+    }
+  } finally {
+    releaseSessionImagePath(outputPath, reservationId);
+  }
+}
+
+/**
+ * Place the stop-marker assistant immediately after this run's own user turn.
+ * A missing id is left alone so the marker cannot land on a newer turn.
+ *
+ * @param {number | null | undefined} userId
+ * @param {string} text
+ * @returns {string}
+ */
+function recordStoppedAssistant(userId, text) {
+  const stopped = withStopMarker(text);
+  contextManager.insertAssistantAfter(userId, stopped);
+  return stopped;
+}
+
+/**
+ * Insert this run's stop marker once, immediately after its own user message.
+ * A later settle of the same run must not insert a second marker.
+ *
+ * @param {{ userId?: number | null, partialText?: string, stopSealed?: boolean, stoppedText?: string } | null | undefined} run
+ * @param {string} [text]
+ * @returns {string}
+ */
+function sealRun(run, text) {
+  const body = typeof text === 'string' ? text : run && typeof run.partialText === 'string' ? run.partialText : '';
+  if (!run || run.userId == null) {
+    return withStopMarker(body);
+  }
+  if (run.stopSealed) {
+    return run.stoppedText || withStopMarker(body);
+  }
+  run.stopSealed = true;
+  run.stoppedText = recordStoppedAssistant(run.userId, body);
+  return run.stoppedText;
+}
+
+/**
+ * @param {string[]} imagePaths
+ * @param {string} text
+ */
+function imageResultFromPaths(imagePaths, text) {
+  const sessionsRoot = initOptions && initOptions.sessionsRoot;
+  const imageParts = [];
+  const images = [];
+  for (const raw of imagePaths) {
+    if (typeof raw !== 'string' || !raw) {
+      continue;
+    }
+    const abs = path.resolve(raw);
+    let relativePath = path.basename(abs);
+    if (sessionsRoot) {
+      const rel = path.relative(path.resolve(sessionsRoot), abs);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+        relativePath = rel.split(path.sep).join('/');
+      }
+    }
+    imageParts.push({
+      type: 'image',
+      path: abs,
+      relativePath,
+      source: 'sessions',
+    });
+    images.push({
+      source: 'sessions',
+      relativePath,
+      name: path.basename(relativePath),
+    });
+  }
+  return {
+    text: typeof text === 'string' ? text : '',
+    imagePaths: imageParts.map((part) => part.path),
+    images,
+    imageParts,
+  };
 }
 
 /**
@@ -343,6 +673,18 @@ async function initialize(opts) {
   await ensureEnginePaths(opts);
   const modelId = opts.modelId.trim();
   const engineId = await resolveEngineForModel(modelId);
+  const modelsCacheDir = initOptions && initOptions.modelsCacheDir;
+  if (engineId === 'stablediffusioncpp' && modelsCacheDir) {
+    const modelRoot = path.join(modelsCacheDir, ...modelId.split('/'));
+    if (missingBaseCompanions(modelRoot, modelsCacheDir)) {
+      activeModelId = null;
+      activePipelineTag = null;
+      activeEngineId = null;
+      phase = 'idle';
+      startCompanionRestore(modelId);
+      return { downloadRequired: true };
+    }
+  }
   const engine = engines[engineId];
 
   activeModelId = modelId;
@@ -367,6 +709,9 @@ async function initialize(opts) {
       },
     });
     emitProgress({ phase: 'loading', status: 'complete', modelId: activeModelId });
+    if (activeEngineId === 'stablediffusioncpp') {
+      startCompanionRestore(activeModelId);
+    }
   } catch (err) {
     activeModelId = null;
     activePipelineTag = null;
@@ -377,17 +722,165 @@ async function initialize(opts) {
       phase = 'idle';
     }
   }
+  return { downloadRequired: false };
 }
 
 /**
+ * A GGUF download passes a variant key or an allow-list that names a .gguf file.
  * @param {object} opts
+ * @returns {boolean}
  */
+function isGgufDownload(opts) {
+  if (opts && typeof opts.ggufVariant === 'string' && opts.ggufVariant.trim()) {
+    return true;
+  }
+  return (
+    Array.isArray(opts && opts.allowPatterns) &&
+    opts.allowPatterns.some((pattern) => typeof pattern === 'string' && /\.gguf$/i.test(pattern))
+  );
+}
+
+/**
+ * @param {string} baseModelId
+ * @param {string} progressModelId
+ * @param {((info: object) => void) | undefined} report
+ */
+async function downloadBaseCompanions(baseModelId, progressModelId, report) {
+  process.stderr.write(`[glaux] Fetching VAE and text encoder into ${baseModelId}.\n`);
+  baseCompanionDownloadId = progressModelId;
+  try {
+    await hfEngine.downloadModel(baseModelId, {
+      allowPatterns: COMPANION_ALLOW_PATTERNS,
+      progressId: progressModelId,
+      onProgress: typeof report === 'function' ? (event) => report(event) : undefined,
+    });
+  } finally {
+    if (baseCompanionDownloadId === progressModelId) {
+      baseCompanionDownloadId = null;
+    }
+  }
+}
+
+/**
+ * Text-to-image GGUF downloads need the base repo's VAE and text encoder in
+ * that repo's cache folder before the GGUF itself is fetched.
+ * @param {string} modelId
+ * @param {string} modelsCacheDir
+ * @param {(info: object) => void} report
+ */
+async function ensureT2iBaseCompanions(modelId, modelsCacheDir, report) {
+  const card = await hfEngine.readHubModelCard(modelId);
+  const pipelineTag = card && typeof card.pipeline_tag === 'string' ? card.pipeline_tag : '';
+  const baseModelId = card && typeof card.base_model === 'string' ? card.base_model : '';
+  if (!isDiffusionPipelineTag(pipelineTag) || !baseModelId) {
+    return;
+  }
+  const baseRoot = path.join(modelsCacheDir, ...baseModelId.split('/'));
+  if (baseCompanionsReady(baseRoot)) {
+    return;
+  }
+  await downloadBaseCompanions(baseModelId, modelId, report);
+}
+
+/**
+ * Stop one GGUF's VAE and text-encoder fetch and clear its models-list row.
+ * Does not remove the GGUF that was already downloaded, and does not affect
+ * another model's fetch.
+ * @param {string} modelId
+ * @returns {Promise<void>}
+ */
+function abandonCompanionRestore(modelId) {
+  const id = typeof modelId === 'string' ? modelId.trim() : '';
+  const job = id ? companionJobs.get(id) : null;
+  if (!job) {
+    return Promise.resolve();
+  }
+  job.cancelled = true;
+  hfEngine.cancelDownloadModel(id).catch(() => {});
+  emitModelDownloadProgress(id, {
+    phase: 'download',
+    status: 'cancelled',
+    modelId: id,
+  });
+  return job.promise.catch(() => {});
+}
+
+/**
+ * Check the selected diffusion GGUF's base repo and download a missing VAE and
+ * text encoder. The model load does not wait for the transfer. A fetch already
+ * running for this GGUF, or for another one, is left running.
+ * @param {string} modelId
+ */
+function startCompanionRestore(modelId) {
+  const existing = companionJobs.get(modelId);
+  if (existing) {
+    return existing.promise;
+  }
+  /** @type {{ promise: Promise<void>, cancelled: boolean }} */
+  const job = { promise: Promise.resolve(), cancelled: false };
+  const tracked = restoreMissingBaseCompanions(modelId, job).finally(() => {
+    if (companionJobs.get(modelId) === job) {
+      companionJobs.delete(modelId);
+    }
+  });
+  job.promise = tracked;
+  companionJobs.set(modelId, job);
+  tracked.catch(() => {});
+  return tracked;
+}
+
+/**
+ * A diffusion GGUF reads its VAE and text encoder from the base repo folder.
+ * Fetch them when that folder does not have both.
+ * @param {string} modelId
+ * @param {{ cancelled: boolean }} job
+ */
+async function restoreMissingBaseCompanions(modelId, job) {
+  const modelsCacheDir = initOptions && initOptions.modelsCacheDir;
+  if (!modelsCacheDir || !modelId || job.cancelled) {
+    return;
+  }
+  const modelRoot = path.join(modelsCacheDir, ...String(modelId).split('/'));
+  const baseModelId = missingBaseCompanions(modelRoot, modelsCacheDir);
+  if (!baseModelId || job.cancelled) {
+    return;
+  }
+  await ensureDownloadEnginePaths({ modelsCacheDir });
+  if (job.cancelled) {
+    return;
+  }
+  const report = (event) => {
+    if (job.cancelled) {
+      return;
+    }
+    emitModelDownloadProgress(modelId, event && typeof event === 'object' ? event : {});
+  };
+  report({ phase: 'download', status: 'starting', modelId });
+  try {
+    await downloadBaseCompanions(baseModelId, modelId, report);
+  } catch (err) {
+    const cancelled = job.cancelled || isDownloadCancelledError(err);
+    report({
+      phase: 'download',
+      status: cancelled ? 'cancelled' : 'error',
+      modelId,
+      message: err && err.message ? String(err.message) : '',
+    });
+    throw err;
+  }
+  if (job.cancelled) {
+    report({ phase: 'download', status: 'cancelled', modelId });
+    return;
+  }
+  report({ phase: 'download', status: 'complete', modelId });
+}
+
 async function downloadModel(opts) {
   if (!opts || typeof opts.modelId !== 'string' || !opts.modelId.trim()) {
     throw new Error('Model id is required.');
   }
   const modelId = opts.modelId.trim();
-  await ensureDownloadEnginePaths(opts);
+  const modelsCacheDir = await ensureDownloadEnginePaths(opts);
   const report = (info) => {
     try {
       if (typeof opts.onProgress === 'function') {
@@ -400,6 +893,9 @@ async function downloadModel(opts) {
     }
   };
   report({ phase: 'download', status: 'starting', modelId });
+  if (isGgufDownload(opts)) {
+    await ensureT2iBaseCompanions(modelId, modelsCacheDir, report);
+  }
   await hfEngine.downloadModel(modelId, {
     onProgress: (event) => report(event),
     allowPatterns: opts.allowPatterns,
@@ -468,6 +964,9 @@ async function ejectModel() {
   if (generationInFlight) {
     throw new Error('Wait until generation finishes before ejecting the model.');
   }
+  if (activeModelId) {
+    await abandonCompanionRestore(activeModelId);
+  }
   if (!activeModelId || !activeEngineId) {
     return;
   }
@@ -485,7 +984,35 @@ async function ejectModel() {
   emitProgress({ phase: 'unload', status: 'complete' });
 }
 
-async function shutdown() {
+/**
+ * @param {number} [timeoutMs]
+ */
+async function unloadHuggingFacePipeline(timeoutMs = HF_DESTROY_TIMEOUT_MS) {
+  const limit = Number.isFinite(timeoutMs) ? timeoutMs : HF_DESTROY_TIMEOUT_MS;
+  let timer;
+  let timedOut = false;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      console.warn(
+        `Hugging Face pipeline unload timed out after ${limit}ms; closing the worker.`
+      );
+      resolve();
+    }, limit);
+  });
+  try {
+    await Promise.race([engines.huggingface.chatbotDestroyIfRunning(), timeout]);
+  } catch {
+    /* worker may already be gone */
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+  return timedOut;
+}
+
+async function shutdown(options = {}) {
   for (const engine of Object.values(engines)) {
     try {
       await engine.chatStop();
@@ -493,6 +1020,10 @@ async function shutdown() {
       /* ignore */
     }
   }
+  // chatbot_destroy removes the disk-offload folder. close() kills the worker
+  // and would leave those files behind. A hung destroy must not block close();
+  // the next text-to-image load deletes a leftover offload folder.
+  await unloadHuggingFacePipeline(options.hfDestroyTimeoutMs);
   await Promise.all(
     Object.values(engines).map((engine) => engine.close({ final: true }).catch(() => {}))
   );
@@ -503,7 +1034,7 @@ async function shutdown() {
   activeEngineId = null;
 }
 
-async function resetInferenceWorker() {
+async function resetInferenceWorker(options = {}) {
   for (const engine of Object.values(engines)) {
     try {
       await engine.chatStop();
@@ -511,6 +1042,7 @@ async function resetInferenceWorker() {
       /* ignore */
     }
   }
+  await unloadHuggingFacePipeline(options.hfDestroyTimeoutMs);
   await Promise.all(
     Object.values(engines).map((engine) => engine.close({ final: false }).catch(() => {}))
   );
@@ -520,8 +1052,20 @@ async function resetInferenceWorker() {
   }
 }
 
-function cancelGeneration() {
-  cancelRequested = true;
+function cancelActiveGeneration() {
+  const run = activeGeneration;
+  // A finished run stays reachable until its finally clears it. Sealing then
+  // splices [STOP] into a turn that already completed.
+  if (!run || run.settled || !generationInFlight || run.token !== generationRun) {
+    return;
+  }
+  run.cancelled = true;
+  // The newer prompt snapshots context as soon as this returns. The stop
+  // marker has to be in place before that snapshot, not when this run settles.
+  sealRun(run, run.partialText || '');
+  if (activeModelId) {
+    abandonCompanionRestore(activeModelId);
+  }
   if (activeEngineId) {
     engines[activeEngineId].chatStop();
   }
@@ -529,6 +1073,60 @@ function cancelGeneration() {
   if (phase === 'generating') {
     phase = 'idle';
   }
+}
+
+function cancelGeneration() {
+  cancelActiveGeneration();
+}
+
+/**
+ * Cancel the run bound to this request id. An unknown id is a no-op: it must
+ * not cancel the active run. Sender fallback is only for sender destruction,
+ * and only when the active run was started by that same request.
+ *
+ * @param {{ requestId?: string, senderId?: unknown, senderFallback?: boolean }} [scope]
+ */
+function cancelRequestGeneration(scope = {}) {
+  const requestId = scope && scope.requestId ? String(scope.requestId) : '';
+  if (requestId && requestRunTokens.has(requestId)) {
+    const token = requestRunTokens.get(requestId);
+    if (activeGeneration && activeGeneration.token === token) {
+      cancelActiveGeneration();
+    }
+    return;
+  }
+  if (!scope || scope.senderFallback !== true) {
+    return;
+  }
+  const senderId = scope.senderId;
+  if (
+    activeGeneration &&
+    requestId &&
+    activeGeneration.requestId === requestId &&
+    senderId != null &&
+    activeGeneration.senderId != null &&
+    activeGeneration.senderId === senderId
+  ) {
+    cancelActiveGeneration();
+  }
+}
+
+function requestRunTokenCount() {
+  return requestRunTokens.size;
+}
+
+/**
+ * True when the active run has already inserted its stop marker.
+ * A settled or idle engine has no active run, so this is false.
+ * @returns {boolean}
+ */
+function activeRunStopSealed() {
+  return Boolean(activeGeneration && activeGeneration.stopSealed);
+}
+
+function configuredSessionsRoot() {
+  const root = initOptions && initOptions.sessionsRoot;
+  return typeof root === 'string' ? root : '';
 }
 
 /**
@@ -544,60 +1142,154 @@ async function sendPrompt(message, options = {}) {
     throw new Error('Engine is busy.');
   }
 
+  if (isDiffusionPipelineTag(activePipelineTag)) {
+    const imageToImage = activePipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
+    const checked = imageToImage
+      ? assertImageToImagePrompt(message, options.files)
+      : activeEngineId === 'stablediffusioncpp'
+        ? assertGgufTextToImagePrompt(message, options.files)
+        : { prompt: assertTextToImagePrompt(message, options.files), imageFile: null };
+    const prompt = checked.prompt;
+    const imagePaths = checked.imageFile
+      ? mediaPathsFromFiles([checked.imageFile]).imagePaths
+      : [];
+    if (typeof options.outputPath !== 'string' || !options.outputPath.trim()) {
+      throw new Error('Image generation output path is not configured.');
+    }
+    const outputPath = options.outputPath;
+    const reservationId = options.reservationId;
+    const userId = contextManager.appendUser(prompt, {
+      imagePaths,
+      files: checked.imageFile ? describeAttachments([checked.imageFile]) : [],
+    });
+    const run = startGenerationRun(generationMeta(options));
+    run.userId = userId;
+    const pendingCompanions = companionJobs.get(activeModelId)?.promise;
+    const stopThisRun = async () => {
+      await discardGeneratedOutput(outputPath, reservationId);
+      return sealRun(run, '');
+    };
+    try {
+      if (pendingCompanions) {
+        await pendingCompanions;
+      }
+      if (!generationOwns(run) || run.cancelled) {
+        return await stopThisRun();
+      }
+      const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
+        onToken: options.onToken,
+        onReplace: options.onReplace,
+        messages: [],
+        outputPath,
+        imagePaths,
+        audioPaths: [],
+        videoPaths: [],
+      });
+      if (!generationOwns(run) || run.cancelled) {
+        return await stopThisRun();
+      }
+      const rawPaths =
+        response && typeof response === 'object' && Array.isArray(response.imagePaths)
+          ? response.imagePaths
+          : [];
+      const text =
+        response && typeof response === 'object' && typeof response.text === 'string'
+          ? response.text
+          : typeof response === 'string'
+            ? response
+            : '';
+      if (!rawPaths.length) {
+        throw new Error('Image generation did not return an image.');
+      }
+      const packed = imageResultFromPaths(rawPaths, text);
+      contextManager.appendAssistant(packed.text, { imageParts: packed.imageParts });
+      return { text: packed.text, imagePaths: packed.imagePaths, images: packed.images };
+    } catch (err) {
+      if (!generationOwns(run) || run.cancelled) {
+        return await stopThisRun();
+      }
+      // Drop this turn and settle before the await. A Stop during the discard
+      // must not seal a run whose user message is about to be removed.
+      contextManager.removeMessageById(userId);
+      settleOwnedRun(run);
+      await discardGeneratedOutput(outputPath, reservationId);
+      throw err;
+    } finally {
+      releaseSessionImagePath(outputPath, reservationId);
+      settleOwnedRun(run);
+    }
+  }
+
   const enableThinking = options.enableThinking === true;
   const resubmit = options.resubmit !== false;
-  const { message: enrichedMessage, imagePaths, audioPaths, videoPaths } =
-    await prepareInferenceRequest(message, options.files);
-
-  cancelRequested = false;
-  contextManager.appendUser(enrichedMessage, { imagePaths, audioPaths, videoPaths });
-
-  generationInFlight = true;
-  phase = 'generating';
-  let accumulated = '';
+  const run = startGenerationRun(generationMeta(options));
   try {
-    const messages = stripThinkingFromMessages(contextManager.snapshot());
-    const response = await engines[activeEngineId].runChat(activeModelId, enableThinking, enrichedMessage, {
-      onToken: (chunk) => {
-        if (typeof chunk === 'string' && chunk) {
-          accumulated += chunk;
-        }
-        if (typeof options.onToken === 'function') {
-          options.onToken(chunk);
-        }
-      },
-      onReplace: (text) => {
-        accumulated = typeof text === 'string' ? text : '';
-        if (typeof options.onReplace === 'function') {
-          options.onReplace(text);
-        }
-      },
+    const prepared = await prepareInferenceRequest(message, options.files);
+    if (!generationOwns(run)) {
+      return withStopMarker('');
+    }
+    const { message: enrichedMessage, imagePaths, audioPaths, videoPaths, attachmentFiles } = prepared;
+    const userId = contextManager.appendUser(enrichedMessage, {
       imagePaths,
       audioPaths,
       videoPaths,
-      resubmit,
-      messages,
+      files: attachmentFiles,
     });
-    if (cancelRequested) {
-      const partial =
-        typeof response === 'string' && response.length > 0 ? response : accumulated;
-      const stopped = withStopMarker(partial);
-      contextManager.appendAssistant(stopped);
-      return stopped;
+    run.userId = userId;
+    if (run.cancelled) {
+      return sealRun(run, run.partialText || '');
     }
-    contextManager.appendAssistant(typeof response === 'string' ? response : '');
-    return typeof response === 'string' ? response : '';
-  } catch (err) {
-    if (cancelRequested) {
-      const stopped = withStopMarker(accumulated);
-      contextManager.appendAssistant(stopped);
-      return stopped;
+    let accumulated = '';
+    try {
+      const messages = stripThinkingFromMessages(contextManager.snapshot());
+      const response = await engines[activeEngineId].runChat(
+        activeModelId,
+        enableThinking,
+        enrichedMessage,
+        {
+          onToken: (chunk) => {
+            if (typeof chunk === 'string' && chunk) {
+              accumulated += chunk;
+              run.partialText = accumulated;
+            }
+            if (typeof options.onToken === 'function') {
+              options.onToken(chunk);
+            }
+          },
+          onReplace: (text) => {
+            accumulated = typeof text === 'string' ? text : '';
+            run.partialText = accumulated;
+            if (typeof options.onReplace === 'function') {
+              options.onReplace(text);
+            }
+          },
+          imagePaths,
+          audioPaths,
+          videoPaths,
+          resubmit,
+          messages,
+        }
+      );
+      if (!generationOwns(run)) {
+        return sealRun(run, run.partialText || accumulated);
+      }
+      if (run.cancelled) {
+        const partial =
+          typeof response === 'string' && response.length > 0 ? response : accumulated;
+        return sealRun(run, run.stopSealed ? run.partialText : partial);
+      }
+      const text = typeof response === 'string' ? response : '';
+      contextManager.appendAssistant(text);
+      return text;
+    } catch (err) {
+      if (!generationOwns(run) || run.cancelled) {
+        return sealRun(run, run.partialText || accumulated);
+      }
+      contextManager.removeMessageById(userId);
+      throw err;
     }
-    contextManager.rollbackLastUser();
-    throw err;
   } finally {
-    generationInFlight = false;
-    phase = 'idle';
+    settleOwnedRun(run);
   }
 }
 
@@ -617,6 +1309,9 @@ async function chatbotHasChatTemplate() {
 
 async function chatGenerationStartsInThinking(message, options = {}) {
   if (!activeModelId || !activeEngineId) {
+    return false;
+  }
+  if (isDiffusionPipelineTag(activePipelineTag)) {
     return false;
   }
   const enableThinking = options.enableThinking === true;
@@ -694,6 +1389,8 @@ async function contextUsage(resubmit = true, options = {}) {
 module.exports = {
   configurePaths,
   initialize,
+  setModelDownloadProgressListener,
+  cancelCompanionDownload: abandonCompanionRestore,
   downloadModel,
   cancelModelDownload,
   listHubModelFiles,
@@ -703,6 +1400,12 @@ module.exports = {
   resetInferenceWorker,
   sendPrompt,
   cancelGeneration,
+  cancelRequestGeneration,
+  requestRunTokenCount,
+  activeRunStopSealed,
+  MAX_TRACKED_REQUEST_RUNS,
+  configuredSessionsRoot,
+  discardSessionOutput: discardGeneratedOutput,
   getStatus,
   chatbotSupportsThinking,
   chatbotHasChatTemplate,
@@ -711,4 +1414,5 @@ module.exports = {
   contextReplace,
   contextClear,
   contextUsage,
+  HF_DESTROY_TIMEOUT_MS,
 };

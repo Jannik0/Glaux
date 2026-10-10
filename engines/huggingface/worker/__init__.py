@@ -12,7 +12,8 @@ Import order matters here and mirrors the internal dependency graph:
 4. ``context``  -- conversation history + usage cache (depends on ``thinking``;
    reaches into ``chat`` lazily via local imports to avoid a circular import).
 5. ``chat``     -- chatbot lifecycle + run_chat/chat_stream generation (depends on all of the
-   above at module scope; reaches into ``asr`` lazily for the ASR streaming branch).
+   above at module scope; reaches into ``asr`` lazily for the ASR streaming branch
+   and into ``t2i`` for diffusers text-to-image).
 6. ``asr``      -- streaming ASR paths (depends on ``chat`` at module scope; safe since
    ``chat`` is already fully loaded by this point).
 """
@@ -22,6 +23,7 @@ from .download import (
     DownloadCancelledError,
     download_model,
     list_model_files,
+    read_hub_model_card,
     model_local_dir,
     models_cache_dir,
     read_model_pipeline_tag,
@@ -47,6 +49,7 @@ from .chat import (
     chatbot_has_chat_template,
     chatbot_supports_thinking,
     run_chat,
+    take_generated_image_paths,
 )
 from . import asr  # noqa: F401  (registers ASR streaming paths used by chat.chat_stream)
 
@@ -54,6 +57,7 @@ __all__ = [
     "DownloadCancelledError",
     "download_model",
     "list_model_files",
+    "read_hub_model_card",
     "model_local_dir",
     "models_cache_dir",
     "read_model_pipeline_tag",
@@ -65,6 +69,7 @@ __all__ = [
     "context_snapshot",
     "context_usage",
     "run_chat",
+    "take_generated_image_paths",
     "chat_generation_starts_in_thinking",
     "chat_stop",
     "chat_stream",

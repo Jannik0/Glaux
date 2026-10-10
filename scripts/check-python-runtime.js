@@ -48,7 +48,7 @@ if (process.platform !== 'darwin') {
   }
   if (!cuda.startsWith('13')) {
     console.error(
-      `Bundled Torch CUDA is ${cuda}, expected 13.x so it can share vendor/cuda with llama.cpp and transcribe.cpp.\n` +
+      `Bundled Torch CUDA is ${cuda}, expected 13.x so it can share vendor/cuda with llama.cpp, transcribe.cpp, and stable-diffusion.cpp.\n` +
         `Rebuild:\n  npm run build:python`
     );
     process.exit(1);

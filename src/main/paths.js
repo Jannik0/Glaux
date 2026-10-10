@@ -283,6 +283,17 @@ function resolvePanelFilePath(panel, relativePath) {
   throw new Error(t('errors.paths.unknownFilePanel'));
 }
 
+function resolveSessionsMediaPath(relativePath) {
+  if (!sessionsRoot) {
+    throw new Error(t('errors.paths.noActiveWorkspace'));
+  }
+  return resolveWorkspacePath(
+    sessionsRoot,
+    relativePath,
+    t('errors.paths.pathEscapesSessions')
+  );
+}
+
 function resolvePanelMediaPath(panel, relativePath) {
   if (typeof relativePath !== 'string' || !relativePath.trim()) {
     throw new Error(t('errors.paths.filePathRequired'));
@@ -295,6 +306,9 @@ function resolvePanelMediaPath(panel, relativePath) {
   }
   if (panel === 'outputs') {
     return resolveOutputsPath(relativePath);
+  }
+  if (panel === 'sessions') {
+    return resolveSessionsMediaPath(relativePath);
   }
   throw new Error(t('errors.paths.unknownFilePanel'));
 }

@@ -69,11 +69,14 @@ function variantGroupKey(fileName) {
 }
 
 /**
+ * VAE and text-encoder files are companions for a diffusion GGUF. They do not
+ * by themselves make a folder a runnable model.
  * @param {string} dir
  * @param {number} [depth]
+ * @param {string} [root]
  * @returns {Promise<{ hasSafetensors: boolean, hasPytorchBin: boolean, hasGguf: boolean, hasTextGguf: boolean }>}
  */
-async function scanWeightKinds(dir, depth = 0) {
+async function scanWeightKinds(dir, depth = 0, root = dir) {
   const result = {
     hasSafetensors: false,
     hasPytorchBin: false,
@@ -92,6 +95,10 @@ async function scanWeightKinds(dir, depth = 0) {
   for (const ent of entries) {
     const full = path.join(dir, ent.name);
     if (ent.isFile()) {
+      const rel = path.relative(root, full).split(path.sep).join('/');
+      if (isCompanionWeightPath(rel)) {
+        continue;
+      }
       if (/\.safetensors$/i.test(ent.name)) {
         result.hasSafetensors = true;
       } else if (/^pytorch_model.*\.bin$/i.test(ent.name)) {
@@ -103,7 +110,7 @@ async function scanWeightKinds(dir, depth = 0) {
         }
       }
     } else if (ent.isDirectory()) {
-      const nested = await scanWeightKinds(full, depth + 1);
+      const nested = await scanWeightKinds(full, depth + 1, root);
       result.hasSafetensors = result.hasSafetensors || nested.hasSafetensors;
       result.hasPytorchBin = result.hasPytorchBin || nested.hasPytorchBin;
       result.hasGguf = result.hasGguf || nested.hasGguf;
@@ -156,14 +163,19 @@ function classifyHubRepoFiles(files) {
   let hasPytorchBin = false;
   /** @type {Map<string, { key: string, files: string[], size: number }>} */
   const ggufGroups = new Map();
+  let hasModelIndex = false;
 
   for (const entry of list) {
     const filePath = typeof entry === 'string' ? entry : entry && entry.path;
     if (!filePath || typeof filePath !== 'string') {
       continue;
     }
-    const base = path.basename(filePath).replace(/\\/g, '/');
+    const normalized = filePath.replace(/\\/g, '/');
+    const base = path.basename(normalized);
     const size = typeof entry === 'object' && entry && typeof entry.size === 'number' ? entry.size : 0;
+    if (/(^|\/)model_index\.json$/i.test(normalized)) {
+      hasModelIndex = true;
+    }
     if (/\.safetensors$/i.test(base)) {
       hasSafetensors = true;
     } else if (/^pytorch_model.*\.bin$/i.test(base)) {
@@ -180,7 +192,9 @@ function classifyHubRepoFiles(files) {
     }
   }
 
-  if (hasSafetensors || hasPytorchBin) {
+  // A diffusers tree has model_index.json. A GGUF repo may also ship a VAE or
+  // text encoder as safetensors; that does not make it a diffusers checkpoint.
+  if (hasModelIndex && (hasSafetensors || hasPytorchBin)) {
     return { kind: 'huggingface', variants: [] };
   }
 
@@ -194,6 +208,10 @@ function classifyHubRepoFiles(files) {
       }))
       .sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
     return { kind: 'gguf', variants };
+  }
+
+  if (hasSafetensors || hasPytorchBin) {
+    return { kind: 'huggingface', variants: [] };
   }
 
   return { kind: 'unknown', variants: [] };
@@ -228,6 +246,38 @@ function formatBytes(n) {
   return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)}${units[i]}`;
 }
 
+const COMPANION_DIR_PREFIXES = [
+  'vae/',
+  'text_encoder/',
+  'text_encoder_2/',
+  'text_encoder_3/',
+  'text_encoders/',
+  'tokenizer/',
+  'tokenizer_2/',
+];
+
+/**
+ * VAE and text-encoder files that belong with a diffusion GGUF. Matched by
+ * directory role, not by model family.
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function isCompanionWeightPath(filePath) {
+  const norm = String(filePath || '').replace(/\\/g, '/');
+  const lower = norm.toLowerCase();
+  if (COMPANION_DIR_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
+    return true;
+  }
+  const base = lower.slice(lower.lastIndexOf('/') + 1);
+  return /(vae|clip[-_]?[lg]|t5xxl|t5).*\.(safetensors|gguf)$/.test(base);
+}
+
+/** Glob filters for fetching those companion trees from a Hub repo. */
+const COMPANION_ALLOW_PATTERNS = COMPANION_DIR_PREFIXES.flatMap((prefix) => [
+  `${prefix}*`,
+  `${prefix}**/*`,
+]);
+
 /**
  * Build snapshot_download allow_patterns for a chosen GGUF variant.
  *
@@ -252,6 +302,10 @@ function buildGgufAllowPatterns(allFiles, variant) {
       continue;
     }
     if (/^readme\.md$/i.test(base)) {
+      patterns.add(filePath);
+      continue;
+    }
+    if (isCompanionWeightPath(filePath)) {
       patterns.add(filePath);
       continue;
     }
@@ -382,6 +436,8 @@ module.exports = {
   directoryContainsModelWeights,
   scanWeightKinds,
   classifyHubRepoFiles,
+  isCompanionWeightPath,
+  COMPANION_ALLOW_PATTERNS,
   buildGgufAllowPatterns,
   readGgufSelection,
   writeGgufSelection,

@@ -2,9 +2,9 @@
 
 /**
  * afterPack (invoked by `npm run dist`): Chromium locale filter, then restore
- * ELF SONAME links, the shared ggml CUDA backend, and shared CUDA 13 overlap
+ * ELF SONAME links, the shared ggml CUDA backend in resources/cuda, and shared CUDA 13 overlap
  * that electron-builder may have copied as full files. All size cuts already
- * ran in build:python / ffmpeg / llamacpp / transcribe — this hook does not
+ * ran in build:python / ffmpeg / llamacpp / transcribe / stablediffusion — this hook does not
  * prune a second policy.
  */
 
@@ -14,7 +14,7 @@ const pruneElectronLocales = require('./prune-electron-locales');
 const {
   collapseDuplicateLibsRecursive,
   finishStagedNativeDir,
-  shareGgmlCudaBackend,
+  stageSharedGgmlCudaBackend,
   shareTorchCuda13WithVendor,
 } = require('./gpuBackends');
 
@@ -42,11 +42,18 @@ module.exports = async function afterPack(context) {
     return;
   }
 
-  for (const name of ['cuda', 'ffmpeg', 'llamacpp', 'transcribe']) {
+  for (const name of ['cuda', 'ffmpeg', 'llamacpp', 'transcribe', 'stablediffusion']) {
     finishStagedNativeDir(path.join(resources, name), { strip: false });
   }
   if (context.electronPlatformName !== 'darwin') {
-    shareGgmlCudaBackend(path.join(resources, 'llamacpp'), path.join(resources, 'transcribe'));
+    stageSharedGgmlCudaBackend(
+      {
+        llamacpp: path.join(resources, 'llamacpp'),
+        transcribe: path.join(resources, 'transcribe'),
+        stablediffusion: path.join(resources, 'stablediffusion'),
+      },
+      path.join(resources, 'cuda')
+    );
   }
 
   const python = path.join(resources, 'python');

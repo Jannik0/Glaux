@@ -19,7 +19,7 @@ const missing = missingSharedCudaRedists(dir);
 if (missing.length) {
   console.error(
     `Missing shared CUDA 13 runtime under ${dir} (${missing.join(', ')}).\n` +
-      `Rebuild a GPU vendor tree:\n  npm run build:python\n  npm run build:llamacpp\n  npm run build:transcribe`
+      `Rebuild a GPU vendor tree:\n  npm run build:python\n  npm run build:llamacpp\n  npm run build:transcribe\n  npm run build:stablediffusion`
   );
   process.exit(1);
 }

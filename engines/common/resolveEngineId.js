@@ -6,11 +6,23 @@
  */
 
 const ASR_PIPELINE_TAG = 'automatic-speech-recognition';
+const TEXT_TO_IMAGE_PIPELINE_TAG = 'text-to-image';
+const IMAGE_TO_IMAGE_PIPELINE_TAG = 'image-to-image';
+
+/**
+ * Text-to-image and image-to-image share the diffusion engines.
+ * Image-to-image also accepts an optional init image.
+ * @param {string | null | undefined} pipelineTag
+ * @returns {boolean}
+ */
+function isDiffusionPipelineTag(pipelineTag) {
+  return pipelineTag === TEXT_TO_IMAGE_PIPELINE_TAG || pipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
+}
 
 /**
  * @param {'huggingface' | 'llamacpp' | null} format
  * @param {string | null | undefined} pipelineTag
- * @returns {'huggingface' | 'llamacpp' | 'transcribecpp' | null}
+ * @returns {'huggingface' | 'llamacpp' | 'transcribecpp' | 'stablediffusioncpp' | null}
  */
 function resolveEngineId(format, pipelineTag) {
   if (format === 'huggingface') {
@@ -20,6 +32,9 @@ function resolveEngineId(format, pipelineTag) {
     if (pipelineTag === ASR_PIPELINE_TAG) {
       return 'transcribecpp';
     }
+    if (isDiffusionPipelineTag(pipelineTag)) {
+      return 'stablediffusioncpp';
+    }
     return 'llamacpp';
   }
   return null;
@@ -27,5 +42,8 @@ function resolveEngineId(format, pipelineTag) {
 
 module.exports = {
   ASR_PIPELINE_TAG,
+  TEXT_TO_IMAGE_PIPELINE_TAG,
+  IMAGE_TO_IMAGE_PIPELINE_TAG,
+  isDiffusionPipelineTag,
   resolveEngineId,
 };

@@ -4,9 +4,9 @@
 
 # Glaux
 
-Glaux is a **local AI workspace** for Windows, macOS, and Linux. It runs Hugging Face [Transformers](https://github.com/huggingface/transformers) models and GGUF models (via [llama.cpp](https://github.com/ggml-org/llama.cpp) for chat, and [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) for ASR) on your machine through a desktop UI — no cloud API required for inference.
+Glaux is a **local AI workspace** for Windows, Linux, and macOS. It runs Hugging Face [Transformers](https://github.com/huggingface/transformers) and [Diffusers](https://github.com/huggingface/diffusers) models, and GGUF models (via [llama.cpp](https://github.com/ggml-org/llama.cpp) for chat, [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) for transcription, and [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) for image generation) on your machine through a desktop UI — no cloud API required for inference.
 
-It is designed to be as **user-friendly and accessible as possible**: you do not need any prior knowledge or experience running AI models. Pick a model from the [Hub](https://huggingface.co/models), download it through Glaux, and start chatting. Attach images, audio, video, or PDFs (parsed into markdown) when the model supports them. All content and sessions stay on disk under your user profile.
+It is designed to be as **user-friendly and accessible as possible**: you do not need any prior knowledge or experience running AI models. Everything should work out of the box. Simply pick a model from the [Hub](https://huggingface.co/models), download it through Glaux, and start chatting. Attach images, audio, video, or PDFs (parsed into markdown) when the model supports them. All content and sessions stay on disk under your user profile.
 
 ![Glaux workspace in dark mode with a local chat session](assets/screenshot01_dark.png)
 
@@ -27,13 +27,22 @@ These models have been tested and confirmed fully working with Glaux:
 | Ministral 3 3B Instruct | ✓ [`mistralai/Ministral-3-3B-Instruct-2512`] | ✓ [`unsloth/Ministral-3-3B-Instruct-2512-GGUF`] |
 | Ministral 3 3B Reasoning | ✓ [`mistralai/Ministral-3-3B-Reasoning-2512`] | ✓ [`unsloth/Ministral-3-3B-Reasoning-2512-GGUF`] |
 | Qwen 3.5 2B | ✓ [`Qwen/Qwen3.5-2B`] | ✓ [`unsloth/Qwen3.5-2B-GGUF`] |
-| Nemotron ASR streaming 0.6B<br/>(cache-aware input streaming of files supported) | ✓ [`nvidia/nemotron-3.5-asr-streaming-0.6b`] | ✓ [`handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf`] |
+| Nemotron 3.5 ASR streaming 0.6B | ✓ [`nvidia/nemotron-3.5-asr-streaming-0.6b`] | ✓ [`handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf`] |
 | Parakeet TDT 0.6B v3 | ✓ [`nvidia/parakeet-tdt-0.6b-v3`] | ✓ [`handy-computer/parakeet-tdt-0.6b-v3-gguf`] |
 | Whisper Large V3 Turbo | ✓ [`openai/whisper-large-v3-turbo`] | ✓ [`handy-computer/whisper-large-v3-turbo-gguf`] |
+| FLUX.2 klein 4B | ✓ [`black-forest-labs/FLUX.2-klein-4B`] | ✓ [`leejet/FLUX.2-klein-4B-GGUF`] |
+| Qwen Image 2.1 | ✓ [`Qwen/Qwen-Image-2.1`] | ✓ [`leejet/Qwen-Image-2.1-GGUF`] |
+| Z-Image Turbo | ✓ [`Tongyi-MAI/Z-Image-Turbo`] | ✓ [`leejet/Z-Image-Turbo-GGUF`] |
 
-Other Hub models may work as well; safetensors support depends on the [Transformers](https://github.com/huggingface/transformers) stack, chat GGUF support depends on [llama.cpp](https://github.com/ggml-org/llama.cpp), and ASR GGUF support depends on [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp).
+Other Hub models may work as well; safetensors chat and ASR support depends on the [Transformers](https://github.com/huggingface/transformers) stack, safetensors text-to-image and image-to-image support depends on [Diffusers](https://github.com/huggingface/diffusers), chat GGUF support depends on [llama.cpp](https://github.com/ggml-org/llama.cpp), ASR GGUF support depends on [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), and text-to-image and image-to-image GGUF support depends on [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
 
-> **Note:** Some models do not declare a pipeline_tag in their README.md. The safetensors engine defaults to text-generation if no explicit pipeline_tag is given. For full support of model capabilities add the proper pipeline_tag in the model's README.md yourself (refer to the task the model is categorized under on Hugging Face to determine the correct pipeline_tag).
+> **Note:** Glaux reads `pipeline_tag` from the model card. When that field is missing, it uses the first of `automatic-speech-recognition`, `text-to-image`, or `image-to-image` in the card's `tags` list. A safetensors model with none of those defaults to text-generation. A GGUF model with none of those is treated as chat. Other Hugging Face tasks (`summarization`, `image-text-to-text`, `any-to-any`, etc.) are recognized only from `pipeline_tag`.
+
+### Image generation models
+
+A diffusion GGUF is often the denoiser only. When its card names a base repo, Glaux keeps the VAE and text encoder in that repo's cache folder — the same place a download of the base model would use. If that folder does not already contain both files, they are downloaded along with the GGUF. Selecting the GGUF checks again and downloads them when they are missing. Quants of the same base model share the folder. While the folder holds only those files, it is not listed as its own model. If the base model is downloaded in full, it will be listed as a separate model. Deleting the base model also deletes the VAE and text encoder with it.
+
+Safetensors text-to-image models only accept a prompt. GGUF text-to-image and image-to-image models accept a prompt and one optional reference image. The reference image is fit within the CLI's 512-pixel canvas, on a 64-pixel grid, and VAE tiling is enabled so the encode fits.
 
 ### Gated models (`HF_TOKEN`)
 
@@ -41,7 +50,7 @@ Some Hub repos are **gated**. Glaux has no in-app Hugging Face login. `huggingfa
 
 1. While logged in at [huggingface.co](https://huggingface.co), open the model page and accept its license.
 2. Create an access token at [Hugging Face token settings](https://huggingface.co/settings/tokens) (a read-only token is enough to download).
-3. Set `HF_TOKEN` in the environment **before launching** Glaux. `HUGGING_FACE_HUB_TOKEN` is also accepted by `huggingface_hub`. Do not commit the token or paste it into chat logs.
+3. Set `HF_TOKEN` in the environment **before launching** Glaux. `HUGGING_FACE_HUB_TOKEN` is also accepted by `huggingface_hub`.
 
 ```bash
 # Windows (PowerShell)
@@ -51,18 +60,20 @@ $env:HF_TOKEN="hf_your_token"
 export HF_TOKEN=hf_your_token
 ```
 
-**Packaged app:** set the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / `glaux`, then launch. Hub **model weights stay under their own licenses**; downloading a gated model does not change the Glaux MIT license.
+**Packaged app:** set the variable in the shell (or system environment) that starts Glaux, then launch. Hub **model weights stay under their own licenses**; downloading a gated model does not change the Glaux MIT license.
 
 
 
 ## Features
 
-- Local chat with Hugging Face Transformers models (PyTorch), chat GGUFs (llama.cpp `llama-server`), and ASR GGUFs (transcribe.cpp `transcribe-cli`), with **automatic GPU** (CUDA / Vulkan / Metal / MPS) and CPU fallback
-- Automatic engine routing (safetensors → Transformers, ASR GGUF → transcribe.cpp, other GGUF → llama.cpp) — invisible to the user
+- Local chat with Hugging Face Transformers models
+- Transcription of audio and video files through ASR
+- Image generation and editing with Diffusers models
+- Automatic GPU routing (CUDA / Vulkan / MPS) and CPU fallback
+- Automatic engine routing (safetensors → Transformers or Diffusers, ASR GGUF → transcribe.cpp, text-to-image and image-to-image GGUF → stable-diffusion.cpp, other GGUF → llama.cpp)
 - Model download and cache management from the Hub, including a GGUF quant-variant picker (download only the selected Q4_K_M / Q8_0 / … files)
 - Multimodal inputs (images, audio, video, PDF) when the selected model supports them
 - Automatic parsing of PDFs into markdown
-- Audio and video transcription
 - Mid-session model switching (including across engines, with chat context preserved)
 - Workspace system
 - Light and dark UI themes (follows the OS by default)
@@ -71,32 +82,34 @@ export HF_TOKEN=hf_your_token
 - Delete and export individual turns
 - Markdown editor and media viewers
 - Resource library and outputs browser with drag-and-drop support
-- Standalone installers / archives (Electron + bundled Python + llama-server + transcribe-cli) for Windows, macOS, and Linux
+- Standalone installers / archives (Electron + bundled Python + llama-server + transcribe-cli + sd-cli) for Windows, Linux, and macOS
 
 
 
 ## How it works
 
 ```
-┌─────────────────┐              ┌──────────────────┐
-│  Renderer (UI)  │     IPC      │  Electron main   │
-│  src/renderer/  │ ───────────► │  src/main +      │
-│                 │              │  engineManager   │
-└─────────────────┘              └────────┬─────────┘
-                                          │
-          ┌───────────────────────────────┼───────────────────────────────┐
-          ▼                               ▼                               ▼
-      safetensors                   Hub downloads                 *.gguf (by tag)
-  engines/huggingface           (HF model-downloader)             chat → llamacpp
-(Python / Transformers)                                         ASR → transcribecpp
+┌─────────────────┐                    ┌──────────────────┐
+│  Renderer (UI)  │        IPC         │  Electron main   │
+│  src/renderer/  │ ─────────────────► │  src/main +      │
+│                 │                    │  engineManager   │
+└─────────────────┘                    └────────┬─────────┘
+                                                │
+                ┌───────────────────────────────┼───────────────────────────────┐
+                ▼                               ▼                               ▼
+            safetensors                   Hub downloads                 *.gguf (by tag)
+        engines/huggingface           (HF model-downloader)             chat → llamacpp
+(Python / Transformers + Diffusers)                                   ASR → transcribecpp
+                                                                 ImageGen → stablediffusioncpp
 ```
 
 1. **Electron** hosts the UI (`src/renderer/`) and filesystem/IPC logic (`src/main/`, `src/preload/`).
-2. `engines/engineManager.js` is the only inference facade the app talks to. It routes by weight format and `pipeline_tag`.
+2. `engines/engineManager.js` is the only inference facade the app talks to. It routes by weight format and `pipeline_tag`. When `pipeline_tag` is absent, `automatic-speech-recognition`, `text-to-image`, and `image-to-image` are read from `tags`.
 3. The **Hugging Face engine** (`engines/huggingface/`) spawns a long-lived Python worker (`engine.py` → `worker/`) and talks JSON-RPC over stdin/stdout. It uses CUDA or MPS when Torch reports them, otherwise CPU.
 4. The **llama.cpp engine** (`engines/llamacpp/`) spawns a long-lived bundled `llama-server` (dynamic CUDA/Vulkan/Metal backends) and uses its OpenAI-compatible HTTP API (chat / multimodal GGUFs).
 5. The **transcribe.cpp engine** (`engines/transcribecpp/`) spawns a one-shot bundled `transcribe-cli` per transcription (`--backend auto`; ASR GGUFs, including Nemotron cache-aware streaming).
-6. Models are stored under the OS app-data directory (not inside the app install). Other user data lives beside that:
+6. The **stable-diffusion.cpp engine** (`engines/stablediffusioncpp/`) spawns a one-shot bundled `sd-cli` per image (`--mode img_gen`; text-to-image and image-to-image GGUFs). Safetensors image generation stays on the Hugging Face worker (`worker/t2i.py`, Diffusers).
+7. Models are stored under the OS app-data directory (not inside the app install). Other user data lives beside that:
 
 
 | Path | Purpose |
@@ -105,10 +118,10 @@ export HF_TOKEN=hf_your_token
 | `<appData>/Glaux/Models` | Downloaded Hub model weights (shared across workspaces) |
 | `<appData>/Glaux/Workspaces/<name>/Resources` | User resource library for that workspace |
 | `<appData>/Glaux/Workspaces/<name>/Outputs` | Generated / exported outputs for that workspace |
-| `<appData>/Glaux/Workspaces/<name>/Sessions` | Saved chat sessions for that workspace |
+| `<appData>/Glaux/Workspaces/<name>/Sessions` | Saved chat sessions for that workspace. Generated images sit beside the session JSON (`<stem>-N.png`) |
 
 
-`<appData>` resolves to `%AppData%` on Windows, `~/Library/Application Support` on macOS, and `~/.config` on Linux.
+`<appData>` resolves to `%AppData%` on Windows, `~/.config` on Linux, and `~/Library/Application Support` on macOS.
 
 
 
@@ -117,27 +130,28 @@ export HF_TOKEN=hf_your_token
 ### Development
 
 - **Node.js** (npm)
-- **Git** (to clone llama.cpp / transcribe.cpp into `deps/` on first native build)
-- **Windows, macOS, or Linux** (packaging builds for the host OS by default)
+- **Git** (to clone llama.cpp / transcribe.cpp / stable-diffusion.cpp into `deps/` on first native build)
+- **Windows, Linux, or macOS** (packaging builds for the host OS by default)
 - **Python 3.14** with the packages in `engines/huggingface/requirements.txt`
   - Or build the bundled runtime (see below) and let the app use `vendor/python`
 - For GGUF inference in development:
   - Chat / multimodal: `npm run build:llamacpp` (clones a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) into `deps/llama.cpp` if missing)
   - ASR: `npm run build:transcribe` (clones a pinned [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) into `deps/transcribe.cpp` if missing)
-  - Install **CMake** + a C++ toolchain (VS 2022 on Windows, Xcode CLT on macOS, `build-essential` on Linux)
-  - On Windows/Linux, also install the **CUDA Toolkit** (`nvcc`) and **Vulkan SDK** (or Debian/Ubuntu `sudo apt install libvulkan-dev glslc spirv-headers`) so GPU backends are compiled into the vendor trees (not required on the end-user machine)
+  - Text-to-image and image-to-image: `npm run build:stablediffusion` (clones a pinned [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) into `deps/stable-diffusion.cpp` if missing, plus its ggml pin)
+  - Install **CMake** + a C++ toolchain (VS 2022 on Windows, `build-essential` on Linux, Xcode CLT on macOS)
+  - On Windows/Linux, also install the **CUDA Toolkit** (`nvcc`) and **Vulkan SDK** (on Debian/Ubuntu: `sudo apt install libvulkan-dev glslc spirv-headers`) so GPU backends are compiled into the vendor trees (not required on the end-user machine)
   - Non-WAV / video ASR prep and Hugging Face audio/video decode use ffmpeg/ffprobe from `vendor/ffmpeg` (built by `npm run build:ffmpeg`)
   - Chat GGUF video input also needs that same `ffprobe` next to ffmpeg (llama.cpp probes with ffprobe, then decodes with ffmpeg)
   - Building `vendor/ffmpeg` needs **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Windows install [MSYS2](https://www.msys2.org/) MinGW64 (`mingw-w64-x86_64-gcc`, `nasm`, `meson`, `ninja`, `pkg-config`). On Debian/Ubuntu: `sudo apt install cmake nasm meson ninja-build pkg-config`
   - **patchelf** is required on Linux (`sudo apt install patchelf`). Vendor builds use it to set `$ORIGIN` RPATH and to drop leftover `DT_NEEDED` entries after Python extras are pruned.
   - Packaging the Linux `.rpm` needs **rpmbuild**. On Debian/Ubuntu: `sudo apt install rpm`.
 
-Optional: [uv](https://github.com/astral-sh/uv) for managing a local venv. Pass `--cpu-only` to `build:llamacpp` / `build:transcribe` if you need a CPU-only native build for local iteration (note that cpu-only trees cannot be packaged).
+Optional: [uv](https://github.com/astral-sh/uv) for managing a local venv. Pass `--cpu-only` to `build:llamacpp` / `build:transcribe` / `build:stablediffusion` if you need a CPU-only native build for local iteration (note that cpu-only trees cannot be packaged).
 
 ### End users (packaged app)
 
 - Windows 10/11, macOS, or a modern Linux distro (x64 or arm64, matching the build)
-- No separate Python, llama.cpp, transcribe.cpp, CUDA Toolkit, or Vulkan SDK install required (runtimes and GPU backends are bundled)
+- No separate Python, llama.cpp, transcribe.cpp, stable-diffusion.cpp, CUDA Toolkit, or Vulkan SDK install required (runtimes and GPU backends are bundled)
 - A current GPU **driver** when you want GPU inference (NVIDIA for CUDA, any Vulkan-capable driver for Vulkan, Apple Silicon for Metal/MPS). Without a usable GPU, the app falls back to CPU
 - Disk space for models (downloaded on demand)
 - Enough **RAM** (and VRAM, when using GPU) for the models you load
@@ -163,7 +177,7 @@ uv pip install -r engines/huggingface/requirements.txt --python .env/Scripts/pyt
 uv pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu130 --python .env/Scripts/python.exe
 ```
 
-**macOS / Linux**
+**Linux / macOS**
 
 ```bash
 uv venv .env
@@ -180,12 +194,13 @@ Alternatively, build the bundled Python runtime:
 npm run build:python
 ```
 
-For GGUF inference, build the native engines (requires **Git**, **CMake**, and a C++ toolchain). The llama.cpp and transcribe.cpp sources are cloned into `deps/` at pinned revisions if they are not already present (`deps/` is gitignored):
+For GGUF inference, build the native engines (requires **Git**, **CMake**, and a C++ toolchain). The llama.cpp, transcribe.cpp, and stable-diffusion.cpp sources are cloned into `deps/` at pinned revisions if they are not already present (`deps/` is gitignored):
 
 ```bash
 npm run build:ffmpeg
 npm run build:llamacpp
 npm run build:transcribe
+npm run build:stablediffusion
 ```
 
 Run the app:
@@ -197,7 +212,7 @@ npm start
 Python resolution order in the engine bridge:
 
 1. `PYTHON` environment variable (if set)
-2. Bundled runtime under `vendor/python` (after `npm run build:python`) — `python.exe` on Windows, `bin/python3` on macOS/Linux
+2. Bundled runtime under `vendor/python` (after `npm run build:python`) — `python.exe` on Windows, `bin/python3` on Linux/macOS
 3. `python` / `python3` on `PATH`
 
 
@@ -206,16 +221,17 @@ Python resolution order in the engine bridge:
 
 One installer per OS/arch contains every backend that OS can use. At runtime the host’s drivers decide what actually runs; missing modules are skipped.
 
-| OS | llama.cpp / transcribe.cpp | Hugging Face (PyTorch) |
+| OS | llama.cpp / transcribe.cpp / stable-diffusion.cpp | Hugging Face (PyTorch / Diffusers) |
 | --- | --- | --- |
 | Windows, Linux | CPU + CUDA + Vulkan (auto) | CUDA, else CPU |
 | macOS | CPU + Metal (auto) | MPS on Apple Silicon, else CPU |
 
-PyTorch has no Vulkan device; Vulkan is used by the GGUF engines only. CUDA is not available on macOS. Bundled CUDA images cover compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0. Newer NVIDIA GPUs JIT the 12.0 PTX image. An older NVIDIA GPU is hidden from CUDA so llama.cpp and transcribe.cpp run it on Vulkan; if a kernel launch still reports that no image is available, that GGUF engine retries once on Vulkan. The same GPUs are hidden from PyTorch, so safetensors models load on CPU. If a CUDA load or the first generation still fails, the Hugging Face worker reloads that model on CPU and retries once. An out-of-memory failure stays on CPU only for that model; the next model tries CUDA again. A missing kernel image keeps later Hugging Face models on CPU.
+PyTorch has no Vulkan device; Vulkan is used by the GGUF engines only. CUDA is not available on macOS. Bundled CUDA images cover compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0. Newer NVIDIA GPUs JIT the 12.0 PTX image. An older NVIDIA GPU is hidden from CUDA so llama.cpp, transcribe.cpp, and stable-diffusion.cpp run it on Vulkan; if a kernel launch still reports that no image is available, that GGUF engine retries once on Vulkan. The same GPUs are hidden from PyTorch, so safetensors models load on CPU. If a CUDA load or the first generation still fails, the Hugging Face worker reloads that model on CPU and retries once. An out-of-memory failure stays on CPU only for that model; the next model tries CUDA again. A missing kernel image keeps later Hugging Face models on CPU.
 
-To force CPU **at runtime** (debug / comparison), put `GLAUX_FORCE_CPU=1` in the **process environment** that launches the app — it is read when a model is loaded (Hugging Face pipeline / llama-server start) and when a transcription starts. It is not a build flag; GPU backends are still compiled and shipped. Changing the variable while the app is already running has no effect until you restart Glaux.
+To force CPU **at runtime** (debug / comparison), put `GLAUX_FORCE_CPU=1` in the **process environment** that launches the app — it is read when a model is loaded (Hugging Face pipeline / llama-server start) and when a transcription or image generation starts. It is not a build flag; GPU backends are still compiled and shipped. Changing the variable while the app is already running has no effect until you restart Glaux.
 
-Chat GGUFs leave llama-server’s `--ctx-size` unset so `--fit` can keep the model’s trained window when it fits, or shrink it (down to 4096) to stay on GPU. Priority order for llama-server’s `--fit` is: 1. fit entire model in GPU memory (and shrink context if necessary) 2. if context is shrunk to 4096 and model still does not fit in GPU memory, offload everything that does not fit in GPU to CPU and system RAM (context stays 4096) 3. if GPU and CPU together cannot hold model with 4096 context size, fail. Set `GLAUX_LLAMA_CTX` to a positive token count (for example `8192`) **before launching** if you need a fixed window; `--fit` will not shrink that value.
+Chat GGUFs leave llama-server’s `--ctx-size` unset so `--fit` can keep the model’s trained window when it fits, or shrink it (down to 4096) to stay on GPU. Priority order for llama-server’s `--fit` is: 1. Fit entire model in GPU memory (and shrink context if necessary) 2. If context is shrunk to 4096 and model still does not fit in GPU memory, offload everything that does not fit in GPU to CPU and system RAM (context stays 4096) 3. If GPU and CPU together cannot hold model with 4096 context size, fail.
+Set `GLAUX_LLAMA_CTX` to a positive token count (for example `8192`) **before launching** if you need a fixed window; `--fit` will not shrink that value.
 
 **Example**
 
@@ -224,7 +240,7 @@ Chat GGUFs leave llama-server’s `--ctx-size` unset so `--fit` can keep the mod
 $env:GLAUX_FORCE_CPU="1"
 $env:GLAUX_LLAMA_CTX="8192"
 
-# macOS / Linux — export so npm/Electron inherit the vars
+# Linux / macOS — export so npm/Electron inherit the vars
 export GLAUX_FORCE_CPU=1
 export GLAUX_LLAMA_CTX=8192
 
@@ -232,7 +248,7 @@ export GLAUX_LLAMA_CTX=8192
 GLAUX_FORCE_CPU=1 GLAUX_LLAMA_CTX=8192 npm start
 ```
 
-**Packaged app:** export the variable in the shell (or system environment) that starts `Glaux.exe` / the `.app` / `glaux`, then launch. `GLAUX_FORCE_CPU` accepts `1`, `true`, `yes`. `GLAUX_LLAMA_CTX` accepts any positive number.
+**Packaged app:** export the variable in the shell (or system environment) that starts Glaux, then launch. `GLAUX_FORCE_CPU` accepts `1`, `true`, `yes`. `GLAUX_LLAMA_CTX` accepts any positive number.
 
 
 
@@ -247,10 +263,11 @@ See [ENV_VARS.md](ENV_VARS.md) for every environment variable Glaux can read, ac
 Packaging uses **electron-builder** plus:
 
 - a **relocatable Python** tree under `vendor/python` (from [python-build-standalone](https://github.com/astral-sh/python-build-standalone); CUDA Torch on Windows/Linux, MPS-capable wheels on macOS)
-- a **shared CUDA 13 runtime** under `vendor/cuda` (cudart / cublas / cublasLt / nvJitLink) used by PyTorch, llama.cpp, and transcribe.cpp — ELF SONAME links are kept as relative symlinks so those libraries are not stored three times
+- a **shared CUDA 13 runtime** under `vendor/cuda` (cudart / cublas / cublasLt / nvJitLink) used by PyTorch, llama.cpp, transcribe.cpp, and stable-diffusion.cpp — ELF SONAME links are kept as relative symlinks so those libraries are not stored four times
 - shared **ffmpeg + ffprobe** (LGPL, plus dav1d) under `vendor/ffmpeg`
 - `llama-server` with **dynamic ggml backends** under `vendor/llamacpp` built from `deps/llama.cpp`
-- `transcribe-cli` with the same dynamic backends under `vendor/transcribe` built from `deps/transcribe.cpp`. The CUDA module is a link to llama.cpp’s `libggml-cuda` / `ggml-cuda.dll`, so that fatbin is stored once. Vulkan stays next to each engine.
+- `transcribe-cli` with the same dynamic backends under `vendor/transcribe` built from `deps/transcribe.cpp`.
+- `sd-cli` with dynamic backends under `vendor/stablediffusion` built from `deps/stable-diffusion.cpp`. CUDA runtime libraries and the one shared `ggml-cuda` / `libggml-cuda` module live in `vendor/cuda`. All three engines compile ggml with `GGML_MAX_NAME=160` and load that module from the sibling `cuda` directory. It includes the diffusion kernels. Vulkan and Metal stay next to each engine.
 
 The packaged app is larger than a CPU-only build (CUDA Torch and CUDA redistributables). End users do not install the CUDA Toolkit or Vulkan SDK.
 
@@ -264,9 +281,9 @@ npm run build:python
 
 This downloads a platform-matched CPython, installs pinned requirements from `engines/huggingface/requirements.txt`, and writes `vendor/python/`.
 
-Default on Windows/Linux is a **CUDA 13** PyTorch wheel (still runs on CPU when no NVIDIA GPU is present). Overlapping CUDA 13 runtime libraries are staged once into `vendor/cuda/` (shared with llama.cpp and transcribe.cpp; Torch’s `nvidia/cu13` copies become symlinks to that folder). macOS always installs the default PyPI wheels (MPS-capable).
+Default on Windows/Linux is a **CUDA 13** PyTorch wheel (still runs on CPU when no NVIDIA GPU is present). Overlapping CUDA 13 runtime libraries are staged once into `vendor/cuda/` (shared with llama.cpp, transcribe.cpp, and stable-diffusion.cpp; Torch’s `nvidia/cu13` copies become symlinks to that folder). macOS always installs the default PyPI wheels (MPS-capable).
 
-The runtime then drops packaging leftovers that inference does not load: **triton** (`torch.compile`), NVTX / `cuda-bindings`, CUDA headers / static libs / profiling extras (`nvperf`, `nvrtc*.alt`, cusolverMg), and unused CPython stdlib (`idlelib`, `test`, `tkinter`). The same names are removed on Windows (DLLs / `.lib`) and Linux (`.so` / `.a`). Linux also collapses ELF SONAME copies and uses **patchelf** to strip leftover `DT_NEEDED` entries so Torch still loads. Prebuilt CUDA fatbins in this tree (PyTorch, cuDNN, cuBLAS, cuFFT, nvJitLink, and the other bundled CUDA libraries) are cut to those same architectures: cubins for 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0, plus PTX for 12.0 and newer. cuDNN stays, including the Tensor IR engine (convolution fails with `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` if that library is missing). The cuDNN ext plugin is dropped (`libcudnn_ext` on Linux, `cudnn_ext64_9.dll` on Windows); cuDNN loads it only when the file is present. cuFFT, cuRAND, NVRTC, cuSOLVER, cuSPARSE, and CUPTI stay (libtorch calls them). PyTorch’s `libtorch_nvshmem.so` stays. **NCCL, cuSPARSELt, NVSHMEM, and cuFile** are replaced with tiny loader stubs on Windows and Linux: libtorch still links those names, but the NVIDIA binaries are not shipped. NVSHMEM device bitcode and bootstrap plugins are deleted. The wheel `*.dist-info` directories for those four packages stay with the tree. That drops multi-GPU collectives, 2:4 structured sparsity, and GPUDirect Storage, which Glaux does not use. **librosa** (and scipy / sklearn / numba) stay — many Hub audio models import them. Change prune logic and rerun `npm run build:python`; `npm run dist` only restores copies electron-builder may have flattened.
+The runtime then drops packaging leftovers that inference does not load: **triton** (`torch.compile`), NVTX / `cuda-bindings`, CUDA headers / static libs / profiling extras (`nvperf`, `nvrtc*.alt`, cusolverMg), and unused CPython stdlib (`idlelib`, `test`, `tkinter`). The same names are removed on Windows (DLLs / `.lib`) and Linux (`.so` / `.a`). Linux also collapses ELF SONAME copies and uses **patchelf** to strip leftover `DT_NEEDED` entries so Torch still loads. Prebuilt CUDA fatbins in this tree (PyTorch, cuDNN, cuBLAS, cuFFT, nvJitLink, and the other bundled CUDA libraries) are cut to the following architectures: cubins for 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0, plus PTX for 12.0 and newer. cuDNN stays, including the Tensor IR engine (convolution fails with `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` if that library is missing). The cuDNN ext plugin is dropped (`libcudnn_ext` on Linux, `cudnn_ext64_9.dll` on Windows); cuDNN loads it only when the file is present. cuFFT, cuRAND, NVRTC, cuSOLVER, cuSPARSE, and CUPTI stay (libtorch calls them). PyTorch’s `libtorch_nvshmem.so` stays. **NCCL, cuSPARSELt, NVSHMEM, and cuFile** are replaced with tiny loader stubs on Windows and Linux: libtorch still links those names, but the NVIDIA binaries are not shipped. NVSHMEM device bitcode and bootstrap plugins are deleted. The wheel `*.dist-info` directories for those four packages stay with the tree. That drops multi-GPU collectives, 2:4 structured sparsity, and GPUDirect Storage, which Glaux does not use.
 
 To force CPU Torch:
 
@@ -280,7 +297,7 @@ node scripts/build-python-runtime.js --torch-variant=cpu
 npm run build:ffmpeg
 ```
 
-This downloads FFmpeg 7.1.1 and dav1d 1.5.1, configures a shared LGPL-minimal decode-oriented build, and stages `ffmpeg`, `ffprobe`, and `libav*` / `libdav1d` into `vendor/ffmpeg/`. llama.cpp, transcribe.cpp, and the Hugging Face worker all use this tree.
+This downloads FFmpeg 7.1.1 and dav1d 1.5.1, configures a shared LGPL-minimal decode-oriented build, and stages `ffmpeg`, `ffprobe`, and `libav*` / `libdav1d` into `vendor/ffmpeg/`. llama.cpp, transcribe.cpp, and the Hugging Face worker all use this tree. Image generation does not.
 
 Requires **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Windows, use MSYS2 MinGW64 (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-meson mingw-w64-x86_64-ninja mingw-w64-x86_64-pkg-config`). On Debian/Ubuntu: `sudo apt install build-essential nasm meson ninja-build pkg-config patchelf`. Linux also requires **patchelf** to bake `$ORIGIN` into DT_RUNPATH.
 
@@ -290,7 +307,7 @@ Requires **nasm**, **meson**, **ninja**, **pkg-config**, and a C compiler. On Wi
 npm run build:llamacpp
 ```
 
-This clones [llama.cpp](https://github.com/ggml-org/llama.cpp) at the pinned revision in `scripts/build-llamacpp.js` into `deps/llama.cpp` if that directory is missing, configures CMake with `GGML_BACKEND_DL` and enables CUDA+Vulkan (Windows/Linux) or Metal (macOS), builds `llama-server`, stages backend modules into `vendor/llamacpp/`, and stages CUDA 13 runtime libraries into the shared `vendor/cuda/` folder. CUDA kernels are compiled for Turing through Blackwell consumer GPUs (`75-real` … `120`) rather than the toolkit’s default fat arch list. The same list is applied to prebuilt CUDA libraries when they are staged. At runtime, NVIDIA GPUs outside that list are hidden from CUDA so Vulkan can run them, and a “no kernel image” launch failure retries once on Vulkan. Video decode uses `vendor/ffmpeg` (see above).
+This clones [llama.cpp](https://github.com/ggml-org/llama.cpp) at the pinned revision in `scripts/build-llamacpp.js` into `deps/llama.cpp` if that directory is missing, configures CMake with `GGML_BACKEND_DL` and `GGML_MAX_NAME=160`, and enables CUDA+Vulkan (Windows/Linux) or Metal (macOS), builds `llama-server`, stages backend modules into `vendor/llamacpp/`, and stages CUDA 13 runtime libraries into the shared `vendor/cuda/` folder. The ggml CUDA module is not left next to `llama-server`; the loader also scans `../cuda`. CUDA kernels are compiled for Turing through Blackwell consumer GPUs (`75-real` … `120`) rather than the toolkit’s default fat arch list. The same list is applied to prebuilt CUDA libraries when they are staged. At runtime, NVIDIA GPUs outside that list are hidden from CUDA so Vulkan can run them, and a “no kernel image” launch failure retries once on Vulkan. Video decode uses `vendor/ffmpeg` (see above).
 
 Local CPU-only iteration (not packagable):
 
@@ -304,7 +321,7 @@ node scripts/build-llamacpp.js --cpu-only
 npm run build:transcribe
 ```
 
-This clones [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) at the pinned revision in `scripts/build-transcribe.js` into `deps/transcribe.cpp` if that directory is missing, configures CMake with `TRANSCRIBE_GGML_BACKEND_DL` and the same per-OS GPU backends and CUDA architecture list as llama.cpp, builds `transcribe-cli`, and stages it plus backend modules into `vendor/transcribe/` (CUDA runtime libraries go to `vendor/cuda/`). When `vendor/llamacpp` already contains the CUDA backend, the transcribe copy is replaced with a link to that file.
+This clones [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) at the pinned revision in `scripts/build-transcribe.js` into `deps/transcribe.cpp` if that directory is missing, configures CMake with `TRANSCRIBE_GGML_BACKEND_DL`, `GGML_MAX_NAME=160`, and the same per-OS GPU backends and CUDA architecture list as llama.cpp, builds `transcribe-cli`, and stages it plus backend modules into `vendor/transcribe/` (CUDA runtime libraries and the shared ggml CUDA module go to `vendor/cuda/`). That module is the stable-diffusion.cpp build when it exists, otherwise llama.cpp's. The loader scans `../cuda` in addition to the directory that contains `transcribe-cli`.
 
 Local CPU-only iteration (not packagable):
 
@@ -312,7 +329,21 @@ Local CPU-only iteration (not packagable):
 node scripts/build-transcribe.js --cpu-only
 ```
 
-### 5. Package for the current OS
+### 5. Build stable-diffusion.cpp
+
+```bash
+npm run build:stablediffusion
+```
+
+This clones [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) at the pinned revision in `scripts/build-stablediffusion.js` into `deps/stable-diffusion.cpp` if that directory is missing, then clones the matching [ggml](https://github.com/leejet/ggml) commit into `deps/stable-diffusion.cpp/ggml`. That ggml commit uses the same backend loader header as llama.cpp b11349 and transcribe.cpp v0.3.1 (`GGML_BACKEND_API_VERSION` 2) and adds the diffusion ops. CMake builds a shared `sd-cli` with dynamic backends (CUDA+Vulkan on Windows/Linux, Metal on macOS), `GGML_MAX_NAME=160`, the same CUDA architecture list as llama.cpp, and stages them into `vendor/stablediffusion/`. CUDA runtime libraries go to `vendor/cuda/`. The ggml CUDA fatbin is then moved to `vendor/cuda`, and the copies next to llama.cpp, transcribe.cpp, and `sd-cli` are removed. Each engine loads it from `../cuda`. WebP decoding is enabled with the libwebp submodule pinned by that revision and linked statically into `sd-cli`, so packaging does not add a shared WebP library. WebM output stays off.
+
+Local CPU-only iteration (not packagable):
+
+```bash
+node scripts/build-stablediffusion.js --cpu-only
+```
+
+### 6. Package for the current OS
 
 ```bash
 npm run dist
@@ -324,14 +355,14 @@ Unpacked-only build (faster while iterating):
 npm run dist:dir
 ```
 
-Target a specific platform from a matching host (cross-compilation of `vendor/python` / `vendor/cuda` / `vendor/ffmpeg` / `vendor/llamacpp` / `vendor/transcribe` is not supported—build them on the same OS/arch you package):
+Target a specific platform from a matching host (cross-compilation of `vendor/python` / `vendor/cuda` / `vendor/ffmpeg` / `vendor/llamacpp` / `vendor/transcribe` / `vendor/stablediffusion` is not supported—build them on the same OS/arch you package):
 
 
 | Command              | Artifacts (typical) |
 | -------------------- | ------------------- |
-| `npm run dist:win`   | `Glaux-Setup-*.exe` (NSIS) and `Glaux-*-win.zip` |
-| `npm run dist:mac`   | `.dmg`, `.zip` |
+| `npm run dist:win`   | `.exe` (NSIS installer), `.zip` |
 | `npm run dist:linux` | `.deb`, `.rpm`, `.tar.gz` |
+| `npm run dist:mac`   | `.dmg`, `.zip` |
 
 
 > **Note (Windows):** The NSIS installer is a single `Setup.exe` with the app embedded. Do not use electron-builder’s self-extracting “portable” `.exe`: the app (with torch) is multi‑gigabyte unpacked, so that format extracts into `%TEMP%` on every launch and appears to hang with no window. The **zip** is a single-file archive alternative (larger than the installer).
@@ -348,10 +379,11 @@ Target a specific platform from a matching host (cross-compilation of `vendor/py
 - `engines/huggingface/*.py` plus `worker/**/*.py` and the full `vendor/python` tree as `extraResources`
 - `vendor/cuda` (shared CUDA 13 runtime libraries) as `extraResources` on Windows and Linux; overlapping Torch `nvidia/cu13` copies are links into this folder
 - `vendor/ffmpeg` (`ffmpeg` + `ffprobe` + shared libav/dav1d) as `extraResources`
-- `vendor/llamacpp` (`llama-server` + ggml backend modules) as `extraResources`
-- `vendor/transcribe` (`transcribe-cli` + ggml backend modules) as `extraResources`; its CUDA backend file is a link to the llama.cpp copy
+- `vendor/llamacpp` (`llama-server` + ggml backend modules) as `extraResources`; its CUDA backend is the shared module in `vendor/cuda`
+- `vendor/transcribe` (`transcribe-cli` + ggml backend modules) as `extraResources`; its CUDA backend is the shared module in `vendor/cuda`
+- `vendor/stablediffusion` (`sd-cli` + ggml backend modules) as `extraResources`; the ggml CUDA fatbin (`GGML_MAX_NAME=160`) is the shared module in `vendor/cuda`
 - Models are **not** bundled; users download them at runtime into `<appData>/Glaux/Models`
-- `LICENSE` and `THIRD_PARTY_LICENSES.md` (ffmpeg, CUDA redistributables, Electron/Chromium, llama.cpp, transcribe.cpp, PyTorch / Transformers)
+- `LICENSE` and `THIRD_PARTY_LICENSES.md` (ffmpeg, CUDA redistributables, Electron/Chromium, llama.cpp, transcribe.cpp, stable-diffusion.cpp, PyTorch / Transformers / Diffusers)
 
 
 
@@ -368,24 +400,27 @@ Glaux/
     engineManager.js              # Inference facade (routes by format + pipeline_tag)
     contextManager.js             # Canonical chat history
     common/                       # Format detection, GPU helpers, PDF/video, ffmpeg
-    huggingface/                  # JS bridge + Python Transformers worker
-      worker/                     # Modular Python HF worker (chat, ASR, download, …)
+    huggingface/                  # JS bridge + Python Transformers / Diffusers worker
+      worker/                     # Modular Python HF worker (chat, ASR, image generation, download, …)
     llamacpp/                     # llama-server HTTP bridge
     transcribecpp/                # transcribe-cli bridge
+    stablediffusioncpp/           # sd-cli bridge
   tests/                          # Node unit tests (`npm test`)
   scripts/                        # Build scripts
   assets/                         # App icons and README screenshot
   deps/                           # Auto-cloned (gitignored)
+    ffmpeg-glaux/                 # Pinned source for ffmpeg
     llama.cpp/                    # Pinned source for llamacpp
     transcribe.cpp/               # Pinned source for transcribe
-    ffmpeg-glaux/                 # Pinned source for ffmpeg
+    stable-diffusion.cpp/         # Pinned source for sd-cli (ggml submodule cloned beside it)
   vendor/                         # Generated (gitignored)
-    python/                       # Bundled CPython + PyTorch / Transformers
-    cuda/                         # Shared CUDA 13 runtime (Win/Linux)
+    python/                       # Bundled CPython + PyTorch / Transformers + Diffusers
+    cuda/                         # Shared CUDA 13 runtime and ggml-cuda (Win/Linux)
     ffmpeg/                       # Shared ffmpeg + ffprobe + libav/dav1d
     llamacpp/                     # llama-server + GPU backends
     transcribe/                   # transcribe-cli + GPU backends
-  dist/                           # Generated — installers / archives (gitignored)
+    stablediffusion/              # sd-cli + GPU backends (ggml-cuda lives in cuda/)
+  dist/                           # Generated (gitignored) — installers / archives
 ```
 
 
@@ -397,21 +432,22 @@ Glaux/
 | ---------------------------------------------- | ---------------------------------------------------- |
 | `npm start`                                    | Run Electron in development                          |
 | `npm test`                                     | Run Node unit tests                                  |
-| `npm run build`                                | Run `build:python`, `build:ffmpeg`, `build:llamacpp`, and `build:transcribe` in that order |
+| `npm run build`                                | Run `build:python`, `build:ffmpeg`, `build:llamacpp`, `build:transcribe`, and `build:stablediffusion` in that order |
 | `npm run build:python`                         | Build `vendor/python` (CUDA 13 Torch on Win/Linux; CUDA redists → `vendor/cuda`) |
 | `npm run build:ffmpeg`                         | Build shared ffmpeg + ffprobe + dav1d into `vendor/ffmpeg` |
 | `npm run build:llamacpp`                       | Build `llama-server` + GPU backends into `vendor/llamacpp` (CUDA redists → `vendor/cuda`) |
 | `npm run build:transcribe`                     | Build `transcribe-cli` + GPU backends into `vendor/transcribe` (CUDA redists → `vendor/cuda`) |
+| `npm run build:stablediffusion`                | Build `sd-cli` + GPU backends into `vendor/stablediffusion` (CUDA redists and ggml-cuda → `vendor/cuda`) |
 | `npm run dist`                                 | Package for the current OS                           |
 | `npm run dist:dir`                             | Unpacked app only (current OS)                       |
-| `npm run dist:win` / `dist:mac` / `dist:linux` | Package for a specific OS                            |
+| `npm run dist:win` / `dist:linux` / `dist:mac` | Package for a specific OS                            |
 
 
 
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Testing models and validating macOS GPU builds is especially appreciated.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Testing models and validating macOS builds is especially appreciated.
 
 ## Security
 
@@ -421,4 +457,4 @@ See [SECURITY.md](SECURITY.md) for how to report vulnerabilities privately.
 
 MIT, Copyright (c) 2026 Jannik Lehmkuhl — see [LICENSE](LICENSE).
 
-Packaged installers also redistribute third-party components (ffmpeg, NVIDIA CUDA libraries, Electron/Chromium, llama.cpp, transcribe.cpp, the bundled Python/PyTorch stack). Those licenses are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Hub model weights are not part of Glaux and keep their own terms.
+Packaged installers also redistribute third-party components (ffmpeg, NVIDIA CUDA libraries, Electron/Chromium, llama.cpp, transcribe.cpp, stable-diffusion.cpp, the bundled Python/PyTorch stack). Those licenses are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Hub model weights are not part of Glaux and keep their own terms.

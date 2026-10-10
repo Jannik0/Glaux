@@ -328,12 +328,13 @@ async function handleMoveCachedModelToTrash(modelId) {
   }
 }
 
-function downloadingRowExists(modelId) {
+function modelRowShowsDownload(modelId) {
   if (!modelsCacheListEl) {
     return false;
   }
   const esc = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(modelId) : modelId;
-  return Boolean(modelsCacheListEl.querySelector(`.models-cache-row[data-model-id="${esc}"]`));
+  const row = modelsCacheListEl.querySelector(`.models-cache-row[data-model-id="${esc}"]`);
+  return Boolean(row && row.classList.contains('is-downloading'));
 }
 
 let downloadRowRefreshQueued = false;
@@ -384,6 +385,9 @@ function handleTrackedDownloadEvent(modelId, event) {
   if (!modelId || !event || typeof event !== 'object') {
     return;
   }
+  if (event.phase === 'download' && event.status === 'starting') {
+    settledDownloadIds.delete(modelId);
+  }
   if (event.phase === 'download' && event.status === 'complete') {
     finishTrackedDownload(modelId, 'complete');
     return;
@@ -401,7 +405,7 @@ function handleTrackedDownloadEvent(modelId, event) {
     return;
   }
   handleModelDownloadProgress(modelId, event);
-  if (downloadingModels.has(modelId) && !downloadingRowExists(modelId)) {
+  if (downloadingModels.has(modelId) && !modelRowShowsDownload(modelId)) {
     queueDownloadRowRefresh();
   }
 }

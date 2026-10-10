@@ -11,13 +11,14 @@ These are the variables the running app inspects. Unset means the documented def
 
 | Variable | Values | Effect |
 | -------- | ------ | ------ |
-| `GLAUX_FORCE_CPU` | `1`, `true`, `yes` (case-insensitive). Unset, `0`, `false`, and any other value leave GPU on. | Force CPU inference on every engine: Hugging Face pipelines pin `device="cpu"` and hide CUDA/HIP (`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` cleared); llama-server is started with `--device none -ngl 0 --no-mmproj-offload`; transcribe-cli uses `--backend cpu` instead of `auto`. Not a build flag — GPU backends are still shipped. Read when a model is loaded or a transcription starts. |
+| `GLAUX_FORCE_CPU` | `1`, `true`, `yes` (case-insensitive). Unset, `0`, `false`, and any other value leave GPU on. | Force CPU inference on every engine: Hugging Face pipelines pin `device="cpu"` and hide CUDA/HIP (`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` cleared); llama-server is started with `--device none -ngl 0 --no-mmproj-offload`; transcribe-cli uses `--backend cpu` instead of `auto`; sd-cli is started with `--backend cpu` (omit `--backend` for automatic GPU). Not a build flag — GPU backends are still shipped. Read when a model is loaded or a transcription or image generation starts. |
 | `GLAUX_LLAMA_CTX` | Positive integer (token count), e.g. `8192`. Unset, `0`, negative, or non-numeric → ignored. | Pins llama-server `--ctx-size` (`-c`) to that window. When unset, `-c` is omitted so `--fit` can keep the model’s trained context or shrink it (floor 4096) to stay on GPU. An explicit value is not shrunk by `--fit`. Chat GGUFs only. |
 | `GLAUX_DOWNLOAD_MAX_WORKERS` | Positive integer. Default `16`. | Concurrent HTTP file downloads when fetching a Hub snapshot (sharded checkpoints, tokenizer files, GGUF variants). Read when the Hugging Face downloader module loads. |
 | `GLAUX_LLAMA_DEBUG` | Exactly `1`. Any other value (including `true` / `yes`) is ignored. | Writes llama-server stderr to the Electron process stderr (`[llama-server] …`) and logs llama.cpp context-usage failures. Development / troubleshooting. |
 | `PYTHON` | Absolute path to a Python interpreter. | Hugging Face worker interpreter. Resolution order: `PYTHON` if set, then bundled `vendor/python` (or packaged `resources/python`), then `python` / `python3` on `PATH`. |
 | `GLAUX_LLAMA_SERVER` | Absolute path to a `llama-server` binary. | Overrides the bundled `vendor/llamacpp` (or packaged `resources/llamacpp`) binary. Useful in development with a locally built llama.cpp. |
 | `GLAUX_TRANSCRIBE_CLI` | Absolute path to a `transcribe-cli` binary. | Overrides the bundled `vendor/transcribe` (or packaged `resources/transcribe`) binary. Useful in development with a locally built transcribe.cpp. |
+| `GLAUX_SD_CLI` | Absolute path to an `sd-cli` binary. | Overrides the bundled `vendor/stablediffusion` (or packaged `resources/stablediffusion`) binary. Useful in development with a locally built stable-diffusion.cpp. |
 | `LC_ALL`, `LANG` | Locale string, e.g. `en_US.UTF-8`. | Fallback OS language when Electron’s locale APIs are unavailable. The in-app language preference (Settings / `preferences.json`) takes precedence. |
 
 ## Hugging Face Hub
@@ -50,7 +51,7 @@ Used only by `npm run build:*`, `npm run dist*` / `scripts/*.js` on a developer 
 
 | Variable | Values | Effect |
 | -------- | ------ | ------ |
-| `CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT` | CUDA Toolkit install directory (checked in that order). | Locate `nvcc` / CUDA headers when compiling llama.cpp and transcribe.cpp GPU backends. If unset, the scripts look for `nvcc` on `PATH`, then common install locations (`/usr/local/cuda` on Linux). The toolkit `bin` directory is added to `PATH` for cmake even when Debian/Ubuntu did not put `nvcc` on `PATH`. |
+| `CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT` | CUDA Toolkit install directory (checked in that order). | Locate `nvcc` / CUDA headers when compiling llama.cpp, transcribe.cpp, and stable-diffusion.cpp GPU backends. If unset, the scripts look for `nvcc` on `PATH`, then common install locations (`/usr/local/cuda` on Linux). The toolkit `bin` directory is added to `PATH` for cmake even when Debian/Ubuntu did not put `nvcc` on `PATH`. |
 | `VULKAN_SDK` | Vulkan SDK root directory. | Locate Vulkan headers/libs for those same native builds. If unset, the scripts search `C:\VulkanSDK\<version>` on Windows and system include paths on Linux. |
 | `MSYS2_BASH` | Absolute path to MSYS2 `bash.exe`. | Windows-only: which bash runs the ffmpeg configure/build (`npm run build:ffmpeg`). |
 | `MSYS2_PATH` | MSYS2 install root (e.g. `C:\msys64`). | Windows-only: fallback if `MSYS2_BASH` is unset; the script uses `%MSYS2_PATH%\usr\bin\bash.exe`. Otherwise it tries `C:\msys64`, `D:\msys64`, `C:\msys32`, then `bash` on `PATH`. |
