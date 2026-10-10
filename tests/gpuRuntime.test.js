@@ -680,6 +680,29 @@ describe('stageSharedGgmlCudaBackend', () => {
   });
 });
 
+describe('stageSharedGgmlCudaBackend when nothing is built', () => {
+  it('returns false when no engine has a CUDA module', () => {
+    const name = ggmlCudaBackendFileName();
+    if (!name) {
+      return;
+    }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-ggml-cuda-empty-'));
+    try {
+      const llama = path.join(root, 'llamacpp');
+      fs.mkdirSync(llama);
+      assert.equal(
+        stageSharedGgmlCudaBackend(
+          { llamacpp: llama, stablediffusion: path.join(root, 'missing') },
+          path.join(root, 'cuda')
+        ),
+        false
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('patchGlauxCudaBackendSearch', () => {
   it('adds a sibling cuda search and does not apply twice', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-ggml-patch-'));
