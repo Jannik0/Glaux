@@ -10,7 +10,8 @@ const contextManager = require('../engines/contextManager');
 const stableDiffusion = require('../engines/stablediffusioncpp/engine');
 const { STOP_MARKER } = require('../engines/common/stopMarker');
 const state = require('../src/main/state');
-const { cancelStreamRequest } = require('../src/main/domains/engineBridge');
+const { allocateSessionImagePath } = require('../src/main/sessionImages');
+const { cancelStreamRequest, handleEngineCancel } = require('../src/main/domains/engineBridge');
 
 function contextShape(messages) {
   return messages.map((msg) => {
@@ -358,7 +359,7 @@ describe('sendPrompt diffusion', { concurrency: 1 }, () => {
     state.activeStreamRequests.delete('req-old');
   });
 
-  it('cancels the active run for an unknown request only when the sender matches', async () => {
+  it('cancels a stream request only when that request owns the active run', async () => {
     contextManager.clear();
     const outputPath = path.join(sessions, 'scope-sender.png');
     await fs.writeFile(outputPath, 'png');
@@ -379,14 +380,104 @@ describe('sendPrompt diffusion', { concurrency: 1 }, () => {
     });
     await started;
     state.activeStreamRequests.set('req-live', { canceled: false });
-    cancelStreamRequest('req-other', { id: 9 });
+    cancelStreamRequest('req-other', { id: 4 });
     assert.equal(state.activeStreamRequests.get('req-live').canceled, false);
     assert.equal(engineManager.getStatus().phase, 'generating');
-    cancelStreamRequest('', { id: 4 });
+    cancelStreamRequest('req-live', { id: 4 });
+    assert.equal(state.activeStreamRequests.get('req-live').canceled, true);
     assert.equal(engineManager.getStatus().phase, 'idle');
     release();
     assert.equal(await pending, STOP_MARKER);
     await assert.rejects(fs.stat(outputPath));
     state.activeStreamRequests.delete('req-live');
+  });
+
+  it('engine:cancel still cancels the active run', async () => {
+    contextManager.clear();
+    const outputPath = path.join(sessions, 'engine-cancel.png');
+    await fs.writeFile(outputPath, 'png');
+    let release;
+    let markStarted;
+    const started = new Promise((resolve) => {
+      markStarted = resolve;
+    });
+    stableDiffusion.runChat = () =>
+      new Promise((resolve) => {
+        markStarted();
+        release = () => resolve({ text: '', imagePaths: [outputPath] });
+      });
+    const pending = engineManager.sendPrompt('a red fox', { outputPath, requestId: 'req-cancel' });
+    await started;
+    const result = await handleEngineCancel();
+    assert.equal(result.ok, true);
+    assert.equal(engineManager.getStatus().phase, 'idle');
+    release();
+    assert.equal(await pending, STOP_MARKER);
+    await assert.rejects(fs.stat(outputPath));
+  });
+
+  it('passes alternating history to the newer diffusion run and discards only the older reserved sidecar', async () => {
+    contextManager.clear();
+    const first = await allocateSessionImagePath(sessions, 'reserved-turn.json');
+    const second = await allocateSessionImagePath(sessions, 'reserved-turn.json');
+    assert.notEqual(first.relativePath, second.relativePath);
+    let releaseFirst;
+    let markFirstStarted;
+    const firstStarted = new Promise((resolve) => {
+      markFirstStarted = resolve;
+    });
+    stableDiffusion.runChat = (_model, _thinking, _prompt, opts) =>
+      new Promise((resolve) => {
+        markFirstStarted();
+        releaseFirst = async () => {
+          await fs.writeFile(opts.outputPath, 'old');
+          resolve({ text: '', imagePaths: [opts.outputPath] });
+        };
+      });
+    const older = engineManager.sendPrompt('a red fox', { outputPath: first.absolutePath });
+    await firstStarted;
+    engineManager.cancelGeneration();
+
+    let secondMessages;
+    let releaseSecond;
+    let markSecondStarted;
+    const secondStarted = new Promise((resolve) => {
+      markSecondStarted = resolve;
+    });
+    stableDiffusion.runChat = (_model, _thinking, _prompt, opts) =>
+      new Promise((resolve) => {
+        secondMessages = opts.messages;
+        markSecondStarted();
+        releaseSecond = async () => {
+          await fs.writeFile(opts.outputPath, 'new');
+          resolve({ text: '', imagePaths: [opts.outputPath] });
+        };
+      });
+    const newer = engineManager.sendPrompt('a blue fox', { outputPath: second.absolutePath });
+    await secondStarted;
+    assert.deepEqual(
+      secondMessages.map((msg) => msg.role),
+      ['user', 'assistant', 'user']
+    );
+    assert.equal(
+      secondMessages[1].content.find((part) => part.type === 'text').text,
+      STOP_MARKER
+    );
+    await releaseFirst();
+    assert.equal(await older, STOP_MARKER);
+    await assert.rejects(fs.stat(first.absolutePath));
+    assert.deepEqual(await engineManager.contextSnapshot().then(contextShape), [
+      { role: 'user', text: 'a red fox', image: null },
+      { role: 'assistant', text: STOP_MARKER, image: null },
+      { role: 'user', text: 'a blue fox', image: null },
+    ]);
+    await releaseSecond();
+    const done = await newer;
+    assert.deepEqual(done.imagePaths, [second.absolutePath]);
+    assert.equal(await fs.readFile(second.absolutePath, 'utf8'), 'new');
+    const stops = (await engineManager.contextSnapshot()).filter(
+      (msg) => msg.role === 'assistant' && msg.content.some((part) => part.type === 'text' && part.text === STOP_MARKER)
+    );
+    assert.equal(stops.length, 1);
   });
 });

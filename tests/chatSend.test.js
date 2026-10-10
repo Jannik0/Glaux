@@ -6,6 +6,7 @@ const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const engineManager = require('../engines/engineManager');
+const { MAX_TRACKED_REQUEST_RUNS } = engineManager;
 const contextManager = require('../engines/contextManager');
 const llama = require('../engines/llamacpp/engine');
 const { STOP_MARKER, withStopMarker } = require('../engines/common/stopMarker');
@@ -107,16 +108,26 @@ describe('sendPrompt chat', { concurrency: 1 }, () => {
 
     let releaseSecond;
     let markSecondStarted;
+    let secondMessages;
     const secondStarted = new Promise((resolve) => {
       markSecondStarted = resolve;
     });
-    llama.runChat = () =>
+    llama.runChat = (_model, _thinking, _message, opts) =>
       new Promise((resolve) => {
+        secondMessages = opts.messages;
         markSecondStarted();
         releaseSecond = () => resolve('second reply');
       });
     const second = engineManager.sendPrompt('second prompt');
     await secondStarted;
+    assert.deepEqual(
+      secondMessages.map((msg) => msg.role),
+      ['user', 'assistant', 'user']
+    );
+    assert.equal(
+      secondMessages[1].content.filter((part) => part.type === 'text').map((part) => part.text).join('\n'),
+      withStopMarker('partial')
+    );
     releaseFirst();
     assert.equal(await first, withStopMarker('partial'));
     assert.deepEqual(await engineManager.contextSnapshot().then(contextShape), [
@@ -293,5 +304,32 @@ describe('sendPrompt chat', { concurrency: 1 }, () => {
     assert.equal(allowed.response, 'from ipc');
     assert.deepEqual(allowed.images, []);
     state.engineBootstrapped = false;
+  });
+
+  it('forgets settled request ids and does not let a pruned id cancel the active run', async () => {
+    contextManager.clear();
+    llama.runChat = async () => 'ok';
+    for (let i = 0; i < MAX_TRACKED_REQUEST_RUNS + 8; i += 1) {
+      await engineManager.sendPrompt(`m${i}`, { requestId: `req-${i}`, senderId: 3 });
+    }
+    assert.equal(engineManager.requestRunTokenCount(), MAX_TRACKED_REQUEST_RUNS);
+
+    let release;
+    let markStarted;
+    const started = new Promise((resolve) => {
+      markStarted = resolve;
+    });
+    llama.runChat = () =>
+      new Promise((resolve) => {
+        markStarted();
+        release = () => resolve('live');
+      });
+    const live = engineManager.sendPrompt('live', { requestId: 'req-live', senderId: 3 });
+    await started;
+    assert.ok(engineManager.requestRunTokenCount() <= MAX_TRACKED_REQUEST_RUNS);
+    engineManager.cancelRequestGeneration({ requestId: 'req-0', senderId: 3, senderFallback: true });
+    assert.equal(engineManager.getStatus().phase, 'generating');
+    release();
+    assert.equal(await live, 'live');
   });
 });

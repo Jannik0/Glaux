@@ -14,6 +14,7 @@ const { allocateSessionImagePath, releaseSessionImagePath } = require('../src/ma
 const {
   clearPendingSessionFilename,
   getPendingSessionFilename,
+  persistActiveSession,
   reserveActiveSessionFilename,
 } = require('../src/main/domains/sessions');
 
@@ -150,7 +151,7 @@ describe('engine:sendMessage session persist', { concurrency: 1 }, () => {
     assert.equal(getPendingSessionFilename(), null);
   });
 
-  it('deletes only that turn sidecar when persisting the session fails', async () => {
+  it('keeps the sidecar when persisting the session fails so the next save can record it', async () => {
     contextManager.clear();
     state.activeSessionFilename = null;
     clearPendingSessionFilename();
@@ -177,8 +178,28 @@ describe('engine:sendMessage session persist', { concurrency: 1 }, () => {
     assert.equal(result.response, 'done');
     assert.equal(state.activeSessionFilename, null);
     assert.equal(getPendingSessionFilename(), null);
-    await assert.rejects(fs.stat(sidecar));
+    assert.equal(await fs.readFile(sidecar, 'utf8'), 'png');
     assert.equal(await fs.readFile(keep, 'utf8'), 'keep');
+    const live = await engineManager.contextSnapshot();
+    const liveImage = live
+      .flatMap((msg) => (Array.isArray(msg.content) ? msg.content : []))
+      .find((part) => part.type === 'image');
+    assert.equal(liveImage.relativePath, result.images[0].relativePath);
+    assert.equal(liveImage.source, 'sessions');
+
+    let saved;
+    await persistActiveSession({
+      contextSnapshot: () => engineManager.contextSnapshot(),
+      writeSessionFile: async (name, messages) => {
+        saved = messages;
+        await fs.writeFile(path.join(sessions, name), `${JSON.stringify(messages)}\n`);
+      },
+    });
+    const savedImage = saved
+      .flatMap((msg) => (Array.isArray(msg.content) ? msg.content : []))
+      .find((part) => part.type === 'image');
+    assert.equal(savedImage.relativePath, liveImage.relativePath);
+    assert.equal(await fs.readFile(path.join(sessions, savedImage.relativePath), 'utf8'), 'png');
 
     await fs.writeFile(keep, 'orig');
     stableDiffusion.runChat = async (_model, _thinking, _prompt, opts) => {

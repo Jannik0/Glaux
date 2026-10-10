@@ -73,26 +73,68 @@ let activeGeneration = null;
 let generationRun = 0;
 
 /**
- * request id → run token. Kept after the run settles so a late cancel for that
- * request cannot fall through and cancel a newer run from the same sender.
+ * request id → run token. Settled ids are pruned down to the newest
+ * MAX_TRACKED_REQUEST_RUNS so the map cannot grow without bound. A missing id
+ * is unknown and must not cancel whatever run is active now.
  * @type {Map<string, number>}
  */
 const requestRunTokens = new Map();
+const MAX_TRACKED_REQUEST_RUNS = 64;
+
+/**
+ * @param {string} requestId
+ * @param {number} token
+ */
+function rememberRequestRun(requestId, token) {
+  if (!requestId) {
+    return;
+  }
+  if (requestRunTokens.has(requestId)) {
+    requestRunTokens.delete(requestId);
+  }
+  requestRunTokens.set(requestId, token);
+  while (requestRunTokens.size > MAX_TRACKED_REQUEST_RUNS) {
+    const oldest = requestRunTokens.keys().next().value;
+    if (
+      activeGeneration &&
+      activeGeneration.requestId &&
+      oldest === activeGeneration.requestId
+    ) {
+      const activeToken = requestRunTokens.get(oldest);
+      requestRunTokens.delete(oldest);
+      requestRunTokens.set(oldest, activeToken);
+      const nextOldest = requestRunTokens.keys().next().value;
+      if (!nextOldest || nextOldest === activeGeneration.requestId) {
+        break;
+      }
+      requestRunTokens.delete(nextOldest);
+      continue;
+    }
+    requestRunTokens.delete(oldest);
+  }
+}
 
 /**
  * @param {{ requestId?: string, senderId?: unknown }} [meta]
- * @returns {{ token: number, cancelled: boolean, requestId: string, senderId: unknown }}
+ * @returns {{ token: number, cancelled: boolean, requestId: string, senderId: unknown, userId: number | null, partialText: string, stopSealed: boolean, stoppedText: string }}
  */
 function startGenerationRun(meta = {}) {
   const requestId = meta && meta.requestId ? String(meta.requestId) : '';
   const senderId = meta && meta.senderId != null ? meta.senderId : undefined;
-  const run = { token: ++generationRun, cancelled: false, requestId, senderId };
+  const run = {
+    token: ++generationRun,
+    cancelled: false,
+    requestId,
+    senderId,
+    userId: null,
+    partialText: '',
+    stopSealed: false,
+    stoppedText: '',
+  };
   activeGeneration = run;
   generationInFlight = true;
   phase = 'generating';
-  if (requestId) {
-    requestRunTokens.set(requestId, run.token);
-  }
+  rememberRequestRun(requestId, run.token);
   return run;
 }
 
@@ -542,6 +584,27 @@ function recordStoppedAssistant(userId, text) {
 }
 
 /**
+ * Insert this run's stop marker once, immediately after its own user message.
+ * A later settle of the same run must not insert a second marker.
+ *
+ * @param {{ userId?: number | null, partialText?: string, stopSealed?: boolean, stoppedText?: string } | null | undefined} run
+ * @param {string} [text]
+ * @returns {string}
+ */
+function sealRun(run, text) {
+  const body = typeof text === 'string' ? text : run && typeof run.partialText === 'string' ? run.partialText : '';
+  if (!run || run.userId == null) {
+    return withStopMarker(body);
+  }
+  if (run.stopSealed) {
+    return run.stoppedText || withStopMarker(body);
+  }
+  run.stopSealed = true;
+  run.stoppedText = recordStoppedAssistant(run.userId, body);
+  return run.stoppedText;
+}
+
+/**
  * @param {string[]} imagePaths
  * @param {string} text
  */
@@ -974,6 +1037,9 @@ async function resetInferenceWorker(options = {}) {
 function cancelActiveGeneration() {
   if (activeGeneration) {
     activeGeneration.cancelled = true;
+    // The newer prompt snapshots context as soon as this returns. The stop
+    // marker has to be in place before that snapshot, not when this run settles.
+    sealRun(activeGeneration, activeGeneration.partialText || '');
   }
   if (activeModelId) {
     abandonCompanionRestore(activeModelId);
@@ -992,11 +1058,11 @@ function cancelGeneration() {
 }
 
 /**
- * Cancel only the run bound to this request. A request that already settled
- * does not cancel whatever is running now. With no matching request, cancel
- * the active run only when it belongs to the same sender.
+ * Cancel the run bound to this request id. An unknown id is a no-op: it must
+ * not cancel the active run. Sender fallback is only for sender destruction,
+ * and only when the active run was started by that same request.
  *
- * @param {{ requestId?: string, senderId?: unknown }} [scope]
+ * @param {{ requestId?: string, senderId?: unknown, senderFallback?: boolean }} [scope]
  */
 function cancelRequestGeneration(scope = {}) {
   const requestId = scope && scope.requestId ? String(scope.requestId) : '';
@@ -1007,15 +1073,24 @@ function cancelRequestGeneration(scope = {}) {
     }
     return;
   }
-  const senderId = scope && scope.senderId;
+  if (!scope || scope.senderFallback !== true) {
+    return;
+  }
+  const senderId = scope.senderId;
   if (
     activeGeneration &&
+    requestId &&
+    activeGeneration.requestId === requestId &&
     senderId != null &&
     activeGeneration.senderId != null &&
     activeGeneration.senderId === senderId
   ) {
     cancelActiveGeneration();
   }
+}
+
+function requestRunTokenCount() {
+  return requestRunTokens.size;
 }
 
 function configuredSessionsRoot() {
@@ -1056,10 +1131,11 @@ async function sendPrompt(message, options = {}) {
       files: checked.imageFile ? describeAttachments([checked.imageFile]) : [],
     });
     const run = startGenerationRun(generationMeta(options));
+    run.userId = userId;
     const pendingCompanions = companionJobs.get(activeModelId)?.promise;
     const stopThisRun = async () => {
       await discardGeneratedOutput(outputPath);
-      return recordStoppedAssistant(userId, '');
+      return sealRun(run, '');
     };
     try {
       if (pendingCompanions) {
@@ -1071,7 +1147,7 @@ async function sendPrompt(message, options = {}) {
       const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
         onToken: options.onToken,
         onReplace: options.onReplace,
-        messages: [],
+        messages: stripThinkingFromMessages(contextManager.snapshot()),
         outputPath,
         imagePaths,
         audioPaths: [],
@@ -1127,8 +1203,9 @@ async function sendPrompt(message, options = {}) {
       videoPaths,
       files: attachmentFiles,
     });
+    run.userId = userId;
     if (run.cancelled) {
-      return recordStoppedAssistant(userId, '');
+      return sealRun(run, run.partialText || '');
     }
     let accumulated = '';
     try {
@@ -1141,6 +1218,7 @@ async function sendPrompt(message, options = {}) {
           onToken: (chunk) => {
             if (typeof chunk === 'string' && chunk) {
               accumulated += chunk;
+              run.partialText = accumulated;
             }
             if (typeof options.onToken === 'function') {
               options.onToken(chunk);
@@ -1148,6 +1226,7 @@ async function sendPrompt(message, options = {}) {
           },
           onReplace: (text) => {
             accumulated = typeof text === 'string' ? text : '';
+            run.partialText = accumulated;
             if (typeof options.onReplace === 'function') {
               options.onReplace(text);
             }
@@ -1160,19 +1239,19 @@ async function sendPrompt(message, options = {}) {
         }
       );
       if (!generationOwns(run)) {
-        return recordStoppedAssistant(userId, accumulated);
+        return sealRun(run, run.partialText || accumulated);
       }
       if (run.cancelled) {
         const partial =
           typeof response === 'string' && response.length > 0 ? response : accumulated;
-        return recordStoppedAssistant(userId, partial);
+        return sealRun(run, run.stopSealed ? run.partialText : partial);
       }
       const text = typeof response === 'string' ? response : '';
       contextManager.appendAssistant(text);
       return text;
     } catch (err) {
       if (!generationOwns(run) || run.cancelled) {
-        return recordStoppedAssistant(userId, accumulated);
+        return sealRun(run, run.partialText || accumulated);
       }
       contextManager.removeMessageById(userId);
       throw err;
@@ -1293,6 +1372,8 @@ module.exports = {
   sendPrompt,
   cancelGeneration,
   cancelRequestGeneration,
+  requestRunTokenCount,
+  MAX_TRACKED_REQUEST_RUNS,
   configuredSessionsRoot,
   discardSessionOutput: discardGeneratedOutput,
   getStatus,
