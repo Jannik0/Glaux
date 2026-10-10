@@ -33,6 +33,19 @@ function pushOutputTail(state, chunk, cap) {
 }
 
 /**
+ * Drop a leading partial UTF-8 sequence left by a byte-cap cut.
+ * @param {Buffer} buf
+ * @returns {Buffer}
+ */
+function trimUtf8Start(buf) {
+  let i = 0;
+  while (i < buf.length && (buf[i] & 0xc0) === 0x80) {
+    i += 1;
+  }
+  return i === 0 ? buf : buf.subarray(i);
+}
+
+/**
  * @param {{ parts: Buffer[], bytes: number }} state
  * @returns {string}
  */
@@ -40,7 +53,7 @@ function outputTailString(state) {
   if (!state.parts.length || state.bytes <= 0) {
     return '';
   }
-  return Buffer.concat(state.parts, state.bytes).toString('utf8');
+  return trimUtf8Start(Buffer.concat(state.parts, state.bytes)).toString('utf8');
 }
 
 /**
@@ -167,6 +180,8 @@ function runSdCli(args, opts = {}) {
 module.exports = {
   pickSdCli,
   runSdCli,
+  pushOutputTail,
+  outputTailString,
   SD_CLI_KILL_GRACE_MS,
   SD_CLI_OUTPUT_TAIL_BYTES,
 };

@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
-const { runSdCli } = require('../engines/stablediffusioncpp/cli');
+const { outputTailString, pushOutputTail, runSdCli } = require('../engines/stablediffusioncpp/cli');
 const generateApi = require('../engines/stablediffusioncpp/generate');
 const engine = require('../engines/stablediffusioncpp/engine');
 
@@ -59,6 +59,14 @@ describe('runSdCli', () => {
     });
     assert.equal(result.stdout, 'B'.repeat(30));
     assert.equal(result.stderr, 'D'.repeat(30));
+  });
+
+  it('drops a partial UTF-8 sequence at the start of the tail', () => {
+    const euro = Buffer.from([0xe2, 0x82, 0xac]);
+    const state = { parts: [], bytes: 0 };
+    pushOutputTail(state, Buffer.concat([euro, euro]), 4);
+    assert.equal(outputTailString(state), '€');
+    assert.equal(outputTailString(state).includes('\uFFFD'), false);
   });
 });
 
