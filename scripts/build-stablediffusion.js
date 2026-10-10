@@ -57,7 +57,7 @@ const DEFAULT_SRC = path.join(ROOT, 'deps', 'stable-diffusion.cpp');
 const DEFAULT_OUT = path.join(ROOT, 'vendor', 'stablediffusion');
 const SD_CPP_REPO = 'https://github.com/leejet/stable-diffusion.cpp';
 const SD_CPP_REV = 'a1ded76da5818803fca97a3b433669ef727d32cf';
-const GGML_REPO = 'https://github.com/ggml-org/ggml';
+const GGML_REPO = 'https://github.com/leejet/ggml';
 const GGML_REV = '89c4413f5da6fb20cc796f16033d37f129be81fd';
 /** Gitlink of thirdparty/libwebp at SD_CPP_REV. No system libwebp. */
 const LIBWEBP_REPO = 'https://github.com/webmproject/libwebp.git';
@@ -346,9 +346,16 @@ function main() {
   console.log('ggml-cuda is staged in vendor/cuda (GGML_MAX_NAME=160).');
 }
 
-try {
-  main();
-} catch (err) {
-  console.error(err.message || err);
-  process.exit(1);
+if (require.main === module) {
+  try {
+    main();
+  } catch (err) {
+    console.error(err.message || err);
+    process.exit(1);
+  }
 }
+
+module.exports = {
+  stageThirdPartyLicenses,
+  patchStaticLibwebp,
+};
