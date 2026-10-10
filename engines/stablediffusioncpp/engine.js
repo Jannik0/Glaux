@@ -15,7 +15,7 @@ const {
   isDiffusionPipelineTag,
 } = require('../common/resolveEngineId');
 const { pickSdCli } = require('./cli');
-const { generateImage } = require('./generate');
+const generateApi = require('./generate');
 
 let closed = false;
 
@@ -199,7 +199,7 @@ async function runChat(modelId, _thinking, message, options = {}) {
   activeChatAbort = abort;
 
   try {
-    const written = await generateImage(activeModelPath, prompt, opts.outputPath, {
+    const written = await generateApi.generateImage(activeModelPath, prompt, opts.outputPath, {
       signal: abort.signal,
       modelRoot: activeModelRoot || undefined,
       modelsCacheDir,
@@ -212,7 +212,7 @@ async function runChat(modelId, _thinking, message, options = {}) {
     }
     return { text: '', imagePaths: [written] };
   } catch (err) {
-    if (abort.signal.aborted || /abort/i.test(String(err && err.message))) {
+    if (abort.signal.aborted) {
       return '';
     }
     throw err;

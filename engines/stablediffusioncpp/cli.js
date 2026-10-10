@@ -9,6 +9,40 @@ const path = require('path');
 const { findVendorBinary } = require('../common/runtimePaths');
 const { withVendorLibPath, withSharedCudaLibPath, withUnsupportedCudaHidden } = require('../common/gpuRuntime');
 
+/** Keep the tail of sd-cli logs so a long run cannot grow without a bound. */
+const SD_CLI_OUTPUT_TAIL_BYTES = 256 * 1024;
+/** After SIGTERM, SIGKILL a child that is still running. */
+const SD_CLI_KILL_GRACE_MS = 1000;
+
+/**
+ * @param {{ parts: Buffer[], bytes: number }} state
+ * @param {Buffer | string} chunk
+ * @param {number} cap
+ */
+function pushOutputTail(state, chunk, cap) {
+  const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  state.parts.push(buf);
+  state.bytes += buf.length;
+  while (state.bytes > cap && state.parts.length > 1) {
+    state.bytes -= state.parts.shift().length;
+  }
+  if (state.parts.length === 1 && state.parts[0].length > cap) {
+    state.parts[0] = state.parts[0].subarray(state.parts[0].length - cap);
+    state.bytes = state.parts[0].length;
+  }
+}
+
+/**
+ * @param {{ parts: Buffer[], bytes: number }} state
+ * @returns {string}
+ */
+function outputTailString(state) {
+  if (!state.parts.length || state.bytes <= 0) {
+    return '';
+  }
+  return Buffer.concat(state.parts, state.bytes).toString('utf8');
+}
+
 /**
  * @returns {string}
  */
@@ -30,12 +64,14 @@ function pickSdCli() {
  * Spawn sd-cli and collect stdout/stderr.
  *
  * @param {string[]} args
- * @param {{ signal?: AbortSignal, cwd?: string, env?: NodeJS.ProcessEnv }} [opts]
+ * @param {{ signal?: AbortSignal, cwd?: string, env?: NodeJS.ProcessEnv, bin?: string, killGraceMs?: number, outputTailBytes?: number }} [opts]
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string }>}
  */
 function runSdCli(args, opts = {}) {
-  const bin = pickSdCli();
+  const bin = opts.bin || pickSdCli();
   const binDir = path.dirname(bin);
+  const graceMs = Number.isFinite(opts.killGraceMs) ? opts.killGraceMs : SD_CLI_KILL_GRACE_MS;
+  const tailBytes = Number.isFinite(opts.outputTailBytes) ? opts.outputTailBytes : SD_CLI_OUTPUT_TAIL_BYTES;
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
       windowsHide: true,
@@ -45,15 +81,40 @@ function runSdCli(args, opts = {}) {
       ),
     });
 
-    let stdout = '';
-    let stderr = '';
+    const stdoutTail = { parts: [], bytes: 0 };
+    const stderrTail = { parts: [], bytes: 0 };
     let settled = false;
+    /** @type {NodeJS.Timeout | null} */
+    let killTimer = null;
+
+    const clearKillTimer = () => {
+      if (killTimer) {
+        clearTimeout(killTimer);
+        killTimer = null;
+      }
+    };
 
     const onAbort = () => {
       try {
         child.kill();
       } catch {
         /* ignore */
+      }
+      if (killTimer || settled) {
+        return;
+      }
+      killTimer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already exited */
+        }
+      }, graceMs);
+      if (typeof killTimer.unref === 'function') {
+        killTimer.unref();
       }
     };
 
@@ -66,11 +127,11 @@ function runSdCli(args, opts = {}) {
     }
 
     child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
+      pushOutputTail(stdoutTail, chunk, tailBytes);
     });
 
     child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
+      pushOutputTail(stderrTail, chunk, tailBytes);
     });
 
     child.on('error', (err) => {
@@ -78,6 +139,7 @@ function runSdCli(args, opts = {}) {
         return;
       }
       settled = true;
+      clearKillTimer();
       if (opts.signal) {
         opts.signal.removeEventListener('abort', onAbort);
       }
@@ -89,10 +151,15 @@ function runSdCli(args, opts = {}) {
         return;
       }
       settled = true;
+      clearKillTimer();
       if (opts.signal) {
         opts.signal.removeEventListener('abort', onAbort);
       }
-      resolve({ code, stdout, stderr });
+      resolve({
+        code,
+        stdout: outputTailString(stdoutTail),
+        stderr: outputTailString(stderrTail),
+      });
     });
   });
 }
@@ -100,4 +167,6 @@ function runSdCli(args, opts = {}) {
 module.exports = {
   pickSdCli,
   runSdCli,
+  SD_CLI_KILL_GRACE_MS,
+  SD_CLI_OUTPUT_TAIL_BYTES,
 };
