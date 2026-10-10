@@ -290,6 +290,7 @@ function resolveRunComponents(modelRoot, modelsCacheDir) {
 
 module.exports = {
   readBaseModelId,
+  componentPath,
   findLocalComponents,
   baseCompanionsReady,
   missingBaseCompanions,

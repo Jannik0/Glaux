@@ -12,6 +12,7 @@ const {
   imageSizeFromBuffer,
 } = require('../engines/stablediffusioncpp/generate');
 const {
+  componentPath,
   findLocalComponents,
   readBaseModelId,
   missingBaseCompanions,
@@ -183,6 +184,31 @@ describe('imageSizeFromBuffer', () => {
     ]);
     assert.deepEqual(imageSizeFromBuffer(buf), { width: 1920, height: 1080 });
   });
+
+  it('reads a progressive JPEG frame and swaps axes for Exif orientation 6', () => {
+    const progressive = Buffer.from([
+      0xff, 0xd8,
+      0xff, 0xc2, 0x00, 0x0b, 0x08,
+      0x00, 0x10,
+      0x00, 0x20,
+    ]);
+    assert.deepEqual(imageSizeFromBuffer(progressive), { width: 32, height: 16 });
+
+    const exif = Buffer.from([
+      0xff, 0xd8,
+      0xff, 0xe1, 0x00, 0x22,
+      0x45, 0x78, 0x69, 0x66, 0x00, 0x00,
+      0x49, 0x49, 0x2a, 0x00,
+      0x08, 0x00, 0x00, 0x00,
+      0x01, 0x00,
+      0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0xff, 0xc0, 0x00, 0x0b, 0x08,
+      0x00, 0x10,
+      0x00, 0x20,
+    ]);
+    assert.deepEqual(imageSizeFromBuffer(exif), { width: 16, height: 32 });
+  });
 });
 
 describe('formatSdCliError', () => {
@@ -208,6 +234,23 @@ describe('formatSdCliError', () => {
       formatSdCliError(stderr, '', 3),
       'GGML_ASSERT(txt->ne[1] + img->ne[1] == pe->ne[3]) failed'
     );
+  });
+});
+
+describe('componentPath', () => {
+  it('returns a single weight file, a sharded directory, or null', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-sd-component-'));
+    assert.equal(componentPath(path.join(root, 'missing')), null);
+    const single = path.join(root, 'vae');
+    fs.mkdirSync(single);
+    fs.writeFileSync(path.join(single, 'diffusion_pytorch_model.safetensors'), '');
+    assert.equal(componentPath(single), path.join(single, 'diffusion_pytorch_model.safetensors'));
+    const sharded = path.join(root, 'text_encoder');
+    fs.mkdirSync(sharded);
+    fs.writeFileSync(path.join(sharded, 'model-00001-of-00002.safetensors'), '');
+    fs.writeFileSync(path.join(sharded, 'model-00002-of-00002.safetensors'), '');
+    fs.writeFileSync(path.join(sharded, 'model.safetensors.index.json'), '');
+    assert.equal(componentPath(sharded), sharded);
   });
 });
 

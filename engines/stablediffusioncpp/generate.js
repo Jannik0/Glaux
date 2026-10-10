@@ -131,6 +131,8 @@ function webpSize(buf) {
  */
 function jpegSize(buf) {
   let i = 2;
+  let size = null;
+  let orientation = null;
   while (i + 8 < buf.length) {
     if (buf[i] !== 0xff) {
       i += 1;
@@ -148,13 +150,84 @@ function jpegSize(buf) {
     if (len < 2) {
       return null;
     }
-    if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+    if (marker === 0xe1 && orientation == null) {
+      orientation = exifOrientation(buf, i + 4, i + 2 + len);
+    }
+    // SOF0–SOF15, except DHT (C4), JPG (C8), and DAC (CC).
+    if (isJpegStartOfFrame(marker)) {
       if (i + 8 >= buf.length) {
         return null;
       }
-      return positiveSize(buf.readUInt16BE(i + 7), buf.readUInt16BE(i + 5));
+      size = positiveSize(buf.readUInt16BE(i + 7), buf.readUInt16BE(i + 5));
+      break;
     }
     i += 2 + len;
+  }
+  if (!size) {
+    return null;
+  }
+  // Orientations 5–8 rotate the stored samples by 90 degrees.
+  if (orientation != null && orientation >= 5 && orientation <= 8) {
+    return { width: size.height, height: size.width };
+  }
+  return size;
+}
+
+/**
+ * @param {number} marker
+ * @returns {boolean}
+ */
+function isJpegStartOfFrame(marker) {
+  return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+}
+
+/**
+ * Orientation tag in an APP1 Exif segment, when the IFD0 entry is easy to read.
+ * @param {Buffer} buf
+ * @param {number} start
+ * @param {number} end
+ * @returns {number | null}
+ */
+function exifOrientation(buf, start, end) {
+  if (start < 0 || end > buf.length || end - start < 16) {
+    return null;
+  }
+  if (buf.toString('ascii', start, start + 4) !== 'Exif') {
+    return null;
+  }
+  const tiff = start + 6;
+  if (tiff + 8 > end) {
+    return null;
+  }
+  const little = buf.toString('ascii', tiff, tiff + 2) === 'II';
+  const big = buf.toString('ascii', tiff, tiff + 2) === 'MM';
+  if (!little && !big) {
+    return null;
+  }
+  const u16 = (offset) => (little ? buf.readUInt16LE(offset) : buf.readUInt16BE(offset));
+  const u32 = (offset) => (little ? buf.readUInt32LE(offset) : buf.readUInt32BE(offset));
+  if (u16(tiff + 2) !== 0x002a) {
+    return null;
+  }
+  const ifd = tiff + u32(tiff + 4);
+  if (ifd < tiff || ifd + 2 > end) {
+    return null;
+  }
+  const count = u16(ifd);
+  for (let n = 0; n < count; n += 1) {
+    const entry = ifd + 2 + n * 12;
+    if (entry + 12 > end) {
+      return null;
+    }
+    if (u16(entry) !== 0x0112) {
+      continue;
+    }
+    const type = u16(entry + 2);
+    const values = u32(entry + 4);
+    if (type !== 3 || values !== 1) {
+      return null;
+    }
+    return u16(entry + 8);
   }
   return null;
 }
