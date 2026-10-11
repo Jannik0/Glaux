@@ -960,61 +960,199 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
 
       const hungCancel = await beginHungResume('org/resume-cancel');
       const cancelIds = [];
-      hf.cancelDownloadModel = async (id) => {
+      let releaseCancelRpc = () => {};
+      hf.cancelDownloadModel = (id) => {
         cancelIds.push(id);
-        hungCancel.failResume(Object.assign(new Error('Download cancelled'), { code: 'DOWNLOAD_CANCELLED' }));
+        return new Promise((resolve) => {
+          releaseCancelRpc = resolve;
+        });
       };
       await engineManager.ejectModel();
       assert.equal(engineManager.getStatus().modelId, null);
       assert.equal(engineManager.getStatus().phase, 'idle');
+      let cancelSettled = false;
       const cancelled = hungCancel.download.then(
-        () => null,
-        (err) => err
+        () => {
+          cancelSettled = true;
+          return null;
+        },
+        (err) => {
+          cancelSettled = true;
+          return err;
+        }
       );
-      await engineManager.cancelModelDownload('org/resume-cancel', { modelsCacheDir: cache });
+      const cancelCall = engineManager.cancelModelDownload('org/resume-cancel', {
+        modelsCacheDir: cache,
+      });
+      await delay(20);
+      assert.equal(cancelSettled, false);
+      assert.deepEqual(cancelIds, ['org/resume-cancel']);
+      releaseCancelRpc();
+      await cancelCall;
+      await delay(15);
+      assert.equal(cancelSettled, false);
+      hungCancel.failResume(new Error('Engine closed'));
       const err = await cancelled;
       assert.equal(err.code, 'DOWNLOAD_CANCELLED');
-      assert.deepEqual(cancelIds, ['org/resume-cancel']);
       assert.equal(
         hungCancel.events.some((info) => info.status === 'error'),
         false
       );
       await delay(15);
       assert.equal(unhandled.length, 0);
-
-      hf.cancelDownloadModel = async () => {};
-      await engineManager.initialize(modelInit('org/diffusers'));
-      const killed = await beginHungResume('org/resume-second-kill');
-      const killedResult = killed.download.then(
-        () => null,
-        (err) => err
-      );
-      const again = await allocateSessionImagePath(sessions, 'second-kill.json');
-      const pending = engineManager.sendPrompt('a blue fox', {
-        outputPath: again.absolutePath,
-        reservationId: again.reservationId,
-      });
-      engineManager.cancelGeneration();
-      const raced = await racePrompt(pending);
-      assert.equal(raced.kind, 'prompt');
-      const killedErr = await awaitAlive(killedResult);
-      assert.match(killedErr.message, /Engine closed/);
-      await waitFor(() => engineManager.getStatus().phase === 'idle');
-      await delay(30);
-      assert.equal(killed.calls(), 2);
-      assert.equal(
-        killed.events.some((info) => info.status === 'error'),
-        false
-      );
       assert.equal(
         logged.some((line) => /Failed to resume downloads/.test(line)),
         false
       );
-      assert.equal(unhandled.length, 0);
+
+      hf.cancelDownloadModel = async () => {};
+      await engineManager.initialize(modelInit('org/diffusers'));
     } finally {
       console.error = origError;
       process.removeListener('unhandledRejection', onUnhandled);
     }
+  });
+
+  it('resumes a download across two hung stops and completes once', async () => {
+    let calls = 0;
+    let releaseFinal = () => {};
+    const events = [];
+    hf.downloadModel = () => {
+      calls += 1;
+      return new Promise((resolve, reject) => {
+        if (calls < 3) {
+          rejectDownload = () => reject(new Error('Engine closed'));
+          return;
+        }
+        releaseFinal = resolve;
+      });
+    };
+    const download = engineManager.downloadModel({
+      modelId: 'org/two-stops',
+      modelsCacheDir: cache,
+      onProgress: (info) => events.push(info),
+    });
+    const settled = download.then(
+      () => 'ok',
+      (err) => err
+    );
+    await waitFor(() => calls === 1);
+
+    async function hungStop(name) {
+      const allocated = await allocateSessionImagePath(sessions, `${name}.json`);
+      const pending = engineManager.sendPrompt('a red fox', {
+        outputPath: allocated.absolutePath,
+        reservationId: allocated.reservationId,
+      });
+      engineManager.cancelGeneration();
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      assert.equal(raced.value, STOP_MARKER);
+    }
+
+    await hungStop('two-stops-1');
+    await waitFor(() => calls === 2 && engineManager.getStatus().phase === 'idle');
+    assert.equal(await Promise.race([settled, delay(20).then(() => 'pending')]), 'pending');
+
+    await hungStop('two-stops-2');
+    await waitFor(() => calls === 3 && engineManager.getStatus().phase === 'idle');
+    assert.equal(await Promise.race([settled, delay(20).then(() => 'pending')]), 'pending');
+    releaseFinal();
+    assert.equal(await settled, 'ok');
+    assert.equal(calls, 3);
+    assert.equal(
+      events.some((info) => info.phase === 'download' && info.status === 'complete'),
+      true
+    );
+    assert.equal(
+      events.some((info) => info.status === 'error'),
+      false
+    );
+  });
+
+  it('parks a new download started during a second stop while a resume is active', async () => {
+    const inflight = [];
+    hf.downloadModel = (modelId) =>
+      new Promise((resolve, reject) => {
+        const slot = { modelId, resolve, reject, done: false };
+        inflight.push(slot);
+        rejectDownload = () => {
+          for (const item of inflight) {
+            if (!item.done) {
+              item.done = true;
+              item.reject(new Error('Engine closed'));
+            }
+          }
+        };
+      });
+    const events = { a: [], b: [] };
+    const downloadA = engineManager.downloadModel({
+      modelId: 'org/resume-a',
+      modelsCacheDir: cache,
+      onProgress: (info) => events.a.push(info),
+    });
+    const settledA = downloadA.then(
+      () => 'ok',
+      (err) => err
+    );
+    await waitFor(() => inflight.length === 1);
+    const first = await allocateSessionImagePath(sessions, 'second-grace-1.json');
+    const firstPrompt = engineManager.sendPrompt('a red fox', {
+      outputPath: first.absolutePath,
+      reservationId: first.reservationId,
+    });
+    engineManager.cancelGeneration();
+    const firstRace = await racePrompt(firstPrompt);
+    assert.equal(firstRace.kind, 'prompt');
+    await waitFor(() => inflight.length === 2 && engineManager.getStatus().phase === 'idle');
+
+    engineManager.setDiffusersStopGraceMs(350);
+    engineManager.setDiffusersWorkerExitMs(80);
+    const second = await allocateSessionImagePath(sessions, 'second-grace-2.json');
+    const secondPrompt = engineManager.sendPrompt('a blue fox', {
+      outputPath: second.absolutePath,
+      reservationId: second.reservationId,
+    });
+    engineManager.cancelGeneration();
+    assert.equal(engineManager.getStatus().phase, 'loading');
+    assert.equal(closes.length, 1);
+    const downloadB = engineManager.downloadModel({
+      modelId: 'org/during-second',
+      modelsCacheDir: cache,
+      onProgress: (info) => events.b.push(info),
+    });
+    const settledB = downloadB.then(
+      () => 'ok',
+      (err) => err
+    );
+    await waitFor(() => inflight.length === 3);
+    assert.equal(closes.length, 1);
+    assert.equal(await Promise.race([settledB, delay(15).then(() => 'pending')]), 'pending');
+
+    await waitFor(
+      () => engineManager.getStatus().phase === 'idle' && inflight.filter((item) => item.modelId === 'org/resume-a').length === 3,
+      2000
+    );
+    const thirdA = inflight.filter((item) => item.modelId === 'org/resume-a')[2];
+    thirdA.done = true;
+    thirdA.resolve();
+    await waitFor(
+      () => inflight.filter((item) => item.modelId === 'org/during-second').length === 2,
+      2000
+    );
+    const secondB = inflight.filter((item) => item.modelId === 'org/during-second')[1];
+    secondB.done = true;
+    secondB.resolve();
+    assert.equal(await settledA, 'ok');
+    assert.equal(await settledB, 'ok');
+    assert.equal(
+      events.a.some((info) => info.status === 'error') || events.b.some((info) => info.status === 'error'),
+      false
+    );
+    assert.equal(
+      events.b.some((info) => info.phase === 'download' && info.status === 'complete'),
+      true
+    );
   });
 
   it('rejects parked downloads when shutdown arrives during the worker exit wait', async () => {

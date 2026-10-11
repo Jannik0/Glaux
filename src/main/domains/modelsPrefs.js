@@ -125,6 +125,10 @@ async function clearPersistedModelIfNotCached() {
  * @param {string} modelId
  */
 async function trashModelCacheFolder(modelId) {
+  if (trashModelCacheOverride) {
+    await trashModelCacheOverride(modelId);
+    return;
+  }
   const abs = modelCacheFolderAbsPath(modelId);
   try {
     await fs.access(abs);
@@ -223,6 +227,27 @@ function rememberDownloadProgress(session, event) {
 
 /** @type {Map<string, { modelId: string, loaded: number, total: number }>} */
 const runCompanionDownloads = new Map();
+const MODEL_DOWNLOAD_CANCEL_WAIT_MS = 8000;
+let modelDownloadCancelWaitMs = MODEL_DOWNLOAD_CANCEL_WAIT_MS;
+/** @type {((modelId: string) => Promise<void>) | null} */
+let trashModelCacheOverride = null;
+
+/**
+ * @param {number} ms
+ */
+function setModelDownloadCancelWaitMs(ms) {
+  const next = Number(ms);
+  modelDownloadCancelWaitMs =
+    Number.isFinite(next) && next >= 0 ? next : MODEL_DOWNLOAD_CANCEL_WAIT_MS;
+}
+
+/**
+ * Test hook. Production trash uses the system trash and then fs.rm.
+ * @param {((modelId: string) => Promise<void>) | null} fn
+ */
+function setModelCacheTrashOverride(fn) {
+  trashModelCacheOverride = typeof fn === 'function' ? fn : null;
+}
 
 /**
  * Bytes for a VAE and text-encoder fetch started by running a diffusion GGUF.
@@ -464,48 +489,7 @@ function registerModelsPrefsIpc() {
 
   ipcMain.handle('models:cancelModelDownload', async (_event, payload) => {
     try {
-      const modelId = assertValidHfRepoId(payload && payload.modelId);
-      const active =
-        state.activePanelModelDownload && state.activePanelModelDownload.modelId === modelId
-          ? state.activePanelModelDownload
-          : null;
-      if (!active && runCompanionDownloads.has(modelId)) {
-        await engineManager.cancelCompanionDownload(modelId);
-        return ok({ modelId, cancelled: true });
-      }
-      let workerWasReset = false;
-      if (active) {
-        await engineManager.cancelModelDownload(modelId, { modelsCacheDir: getModelsRoot() });
-        let downloadSettled = false;
-        await Promise.race([
-          active.promise
-            .catch(() => {})
-            .finally(() => {
-              downloadSettled = true;
-            }),
-          new Promise((resolve) => setTimeout(resolve, 8000)),
-        ]);
-        if (!downloadSettled) {
-          await engineManager.resetInferenceWorker();
-          workerWasReset = true;
-          state.activePanelModelDownload = null;
-        }
-      }
-      await trashModelCacheFolder(modelId);
-      if (workerWasReset && state.engineBootstrapped && state.selectedModelId) {
-        try {
-          if (await modelIdHasCachedWeights(state.selectedModelId)) {
-            const loaded = await engineManager.reinitialize(getEngineInitOptions());
-            if (loaded && loaded.downloadRequired) {
-              await noteCompanionDownloadRequired(state.selectedModelId);
-            }
-          } else {
-            await enterNoModelState();
-          }
-        } catch {
-          await enterNoModelState({ emitProgress: false });
-        }
-      }
+      const modelId = await cancelPanelModelDownload(payload && payload.modelId);
       return ok({ modelId, cancelled: true });
     } catch (err) {
       return fail(err, 'E_DOWNLOAD_CANCEL');
@@ -513,8 +497,64 @@ function registerModelsPrefsIpc() {
   });
 }
 
+/**
+ * Cancel the panel download, then delete its cache folder only after the
+ * transfer has settled or the wait expires and the worker is reset.
+ * @param {unknown} rawModelId
+ * @returns {Promise<string>}
+ */
+async function cancelPanelModelDownload(rawModelId) {
+  const modelId = assertValidHfRepoId(rawModelId);
+  const active =
+    state.activePanelModelDownload && state.activePanelModelDownload.modelId === modelId
+      ? state.activePanelModelDownload
+      : null;
+  if (!active && runCompanionDownloads.has(modelId)) {
+    await engineManager.cancelCompanionDownload(modelId);
+    return modelId;
+  }
+  let workerWasReset = false;
+  if (active) {
+    await engineManager.cancelModelDownload(modelId, { modelsCacheDir: getModelsRoot() });
+    let downloadSettled = false;
+    await Promise.race([
+      active.promise
+        .catch(() => {})
+        .finally(() => {
+          downloadSettled = true;
+        }),
+      new Promise((resolve) => setTimeout(resolve, modelDownloadCancelWaitMs)),
+    ]);
+    if (!downloadSettled) {
+      await engineManager.resetInferenceWorker();
+      workerWasReset = true;
+      state.activePanelModelDownload = null;
+    }
+  }
+  await trashModelCacheFolder(modelId);
+  if (workerWasReset && state.engineBootstrapped && state.selectedModelId) {
+    try {
+      if (await modelIdHasCachedWeights(state.selectedModelId)) {
+        const loaded = await engineManager.reinitialize(getEngineInitOptions());
+        if (loaded && loaded.downloadRequired) {
+          await noteCompanionDownloadRequired(state.selectedModelId);
+        }
+      } else {
+        await enterNoModelState();
+      }
+    } catch {
+      await enterNoModelState({ emitProgress: false });
+    }
+  }
+  return modelId;
+}
+
 module.exports = {
   registerModelsPrefsIpc,
   modelIdHasCachedWeights,
   clearPersistedModelIfNotCached,
+  cancelPanelModelDownload,
+  setModelDownloadCancelWaitMs,
+  setModelCacheTrashOverride,
+  MODEL_DOWNLOAD_CANCEL_WAIT_MS,
 };

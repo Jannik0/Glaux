@@ -112,7 +112,6 @@ let diffusersOffloadBases = null;
 let parkedDownloads = [];
 /** Resumes already taken out of `parkedDownloads` and waiting on the worker. */
 let activeResumes = [];
-let resumingDownloads = false;
 
 /**
  * request id → run token. Settled ids are pruned down to the newest
@@ -1218,6 +1217,11 @@ function abandonCompanionRestore(modelId) {
   const job = id ? companionJobs.get(id) : null;
   if (id) {
     rejectParkedDownload(id);
+    for (const entry of activeResumes) {
+      if (!entry.settled && downloadEntryMatches(entry, id)) {
+        entry.cancelled = true;
+      }
+    }
   }
   if (!job) {
     return Promise.resolve();
@@ -1330,6 +1334,24 @@ async function modelCacheDirExists(modelId) {
   }
 }
 
+function downloadCancelledError() {
+  const err = new Error('Download cancelled');
+  err.code = 'DOWNLOAD_CANCELLED';
+  return err;
+}
+
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isDownloadCancelledError(err) {
+  return Boolean(
+    err &&
+      (/** @type {{ code?: string }} */ (err).code === 'DOWNLOAD_CANCELLED' ||
+        /cancelled/i.test(String(/** @type {{ message?: string }} */ (err).message || '')))
+  );
+}
+
 /**
  * @param {{ settled?: boolean, cancelled?: boolean, reject: (err: Error) => void }} entry
  * @param {Error} err
@@ -1355,34 +1377,80 @@ function settleDownloadResolve(entry) {
 }
 
 /**
+ * A parked download has no live RPC. Reject it now.
+ * An in-flight resume stays pending until that RPC settles; the caller marks
+ * `entry.cancelled` and lets the resume loop map the outcome.
  * @param {string} id
- * @returns {false | 'parked' | 'resume'}
+ * @returns {boolean}
  */
 function rejectParkedDownload(id) {
   const key = typeof id === 'string' ? id.trim() : '';
   if (!key) {
     return false;
   }
-  const err = new Error('Download cancelled');
-  err.code = 'DOWNLOAD_CANCELLED';
-  let kind = false;
+  const err = downloadCancelledError();
+  let found = false;
   parkedDownloads = parkedDownloads.filter((entry) => {
     if (entry.modelId !== key && entry.progressId !== key) {
       return true;
     }
-    kind = 'parked';
+    found = true;
     settleDownloadReject(entry, err);
     return false;
   });
-  activeResumes = activeResumes.filter((entry) => {
-    if (entry.modelId !== key && entry.progressId !== key) {
-      return true;
-    }
-    kind = 'resume';
-    settleDownloadReject(entry, err);
+  return found;
+}
+
+/**
+ * @param {{ modelId?: string, progressId?: string }} entry
+ * @param {string} key
+ * @returns {boolean}
+ */
+function downloadEntryMatches(entry, key) {
+  return entry.modelId === key || entry.progressId === key;
+}
+
+/**
+ * Park a transfer aborted by a worker kill while stop or reload is still active.
+ * The returned promise resolves when a later resume finishes it.
+ * @param {string} modelId
+ * @param {object} hfOptions
+ * @param {string} progressId
+ * @param {Error} error
+ * @param {{ cancelled?: boolean } | null} [owner]
+ * @returns {Promise<boolean>} False when `error` should be surfaced instead.
+ */
+async function parkDownloadIfStopKilled(modelId, hfOptions, progressId, error, owner) {
+  if (owner && owner.cancelled) {
+    throw downloadCancelledError();
+  }
+  if (shuttingDown || !isWorkerKillError(error) || !diffusersStopProcedureActive()) {
     return false;
+  }
+  const existed = await modelCacheDirExists(modelId);
+  if (owner && owner.cancelled) {
+    throw downloadCancelledError();
+  }
+  // stat() yields. Parking after the procedure has ended, or after shutdown,
+  // would leave a download that nobody resumes.
+  if (shuttingDown || !diffusersStopProcedureActive()) {
+    return false;
+  }
+  await new Promise((resolve, reject) => {
+    parkedDownloads.push({
+      modelId,
+      progressId: progressId || modelId,
+      hfOptions,
+      existed,
+      cancelled: false,
+      settled: false,
+      rpcInFlight: false,
+      error,
+      resolve,
+      reject,
+    });
   });
-  return kind;
+  return true;
 }
 
 /**
@@ -1393,39 +1461,93 @@ async function resumeParkedDownloads(reloadOk) {
   if (!batch.length) {
     return;
   }
-  // While this is set, a kill that aborts the resumed RPC is not parked again.
-  resumingDownloads = true;
-  try {
-    for (const entry of batch) {
-      if (entry.settled || entry.cancelled) {
-        continue;
-      }
-      if (!reloadOk || (entry.existed && !(await modelCacheDirExists(entry.modelId)))) {
-        settleDownloadReject(entry, entry.error);
-        continue;
-      }
-      activeResumes.push(entry);
-      try {
-        if (typeof entry.hfOptions.onProgress === 'function') {
-          entry.hfOptions.onProgress({
-            phase: 'download',
-            status: 'starting',
-            modelId: entry.progressId || entry.modelId,
-          });
-        }
-        await hfEngine.downloadModel(entry.modelId, entry.hfOptions);
-        settleDownloadResolve(entry);
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-        // A user cancel already rejected the caller with DOWNLOAD_CANCELLED.
-        settleDownloadReject(entry, error);
-      } finally {
-        activeResumes = activeResumes.filter((item) => item !== entry);
-      }
+  for (const entry of batch) {
+    if (entry.settled) {
+      continue;
     }
-  } finally {
-    resumingDownloads = false;
+    if (entry.cancelled) {
+      settleDownloadReject(entry, downloadCancelledError());
+      continue;
+    }
+    if (!reloadOk || (entry.existed && !(await modelCacheDirExists(entry.modelId)))) {
+      settleDownloadReject(entry, entry.error);
+      continue;
+    }
+    activeResumes.push(entry);
+    try {
+      if (typeof entry.hfOptions.onProgress === 'function') {
+        entry.hfOptions.onProgress({
+          phase: 'download',
+          status: 'starting',
+          modelId: entry.progressId || entry.modelId,
+        });
+      }
+      let finished = false;
+      try {
+        entry.rpcInFlight = true;
+        await hfEngine.downloadModel(entry.modelId, entry.hfOptions);
+        finished = true;
+      } catch (err) {
+        entry.rpcInFlight = false;
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (entry.cancelled || isDownloadCancelledError(error)) {
+          settleDownloadReject(entry, downloadCancelledError());
+        } else {
+          await settleResumeAfterKill(entry, error);
+        }
+      } finally {
+        entry.rpcInFlight = false;
+      }
+      if (finished && !entry.settled) {
+        if (entry.cancelled) {
+          settleDownloadReject(entry, downloadCancelledError());
+        } else {
+          settleDownloadResolve(entry);
+        }
+      }
+    } finally {
+      activeResumes = activeResumes.filter((item) => item !== entry);
+    }
   }
+}
+
+/**
+ * A second stop killed this resume. Park it again unless the user cancelled
+ * or the kill is not part of an active stop. Otherwise surface `error`.
+ * @param {{ modelId: string, progressId: string, hfOptions: object, cancelled?: boolean, settled?: boolean }} entry
+ * @param {Error} error
+ */
+async function settleResumeAfterKill(entry, error) {
+  let parked = false;
+  try {
+    parked = await parkDownloadIfStopKilled(
+      entry.modelId,
+      entry.hfOptions,
+      entry.progressId,
+      error,
+      entry
+    );
+  } catch (parkErr) {
+    if (entry.settled) {
+      return;
+    }
+    const mapped =
+      entry.cancelled || isDownloadCancelledError(parkErr)
+        ? downloadCancelledError()
+        : parkErr instanceof Error
+          ? parkErr
+          : new Error(String(parkErr));
+    settleDownloadReject(entry, mapped);
+    return;
+  }
+  if (entry.settled) {
+    return;
+  }
+  if (parked && !entry.cancelled) {
+    settleDownloadResolve(entry);
+    return;
+  }
+  settleDownloadReject(entry, entry.cancelled ? downloadCancelledError() : error);
 }
 
 /**
@@ -1441,32 +1563,15 @@ async function runHfDownload(modelId, hfOptions, progressId) {
     await hfEngine.downloadModel(modelId, hfOptions);
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
-    if (
-      resumingDownloads ||
-      shuttingDown ||
-      !isWorkerKillError(error) ||
-      !diffusersStopProcedureActive()
-    ) {
+    let parked = false;
+    try {
+      parked = await parkDownloadIfStopKilled(modelId, hfOptions, progressId, error, null);
+    } catch (parkErr) {
+      throw parkErr instanceof Error ? parkErr : new Error(String(parkErr));
+    }
+    if (!parked) {
       throw error;
     }
-    const existed = await modelCacheDirExists(modelId);
-    // stat() yields. Parking after the procedure has ended, or after shutdown,
-    // would leave a download that nobody resumes.
-    if (resumingDownloads || shuttingDown || !diffusersStopProcedureActive()) {
-      throw error;
-    }
-    await new Promise((resolve, reject) => {
-      parkedDownloads.push({
-        modelId,
-        progressId: progressId || modelId,
-        hfOptions,
-        existed,
-        cancelled: false,
-        error,
-        resolve,
-        reject,
-      });
-    });
   }
 }
 
@@ -1512,10 +1617,19 @@ async function cancelModelDownload(modelId, opts = {}) {
     throw new Error('Model id is required.');
   }
   const id = modelId.trim();
-  const hit = rejectParkedDownload(id);
-  if (hit) {
-    if (hit === 'resume') {
-      hfEngine.cancelDownloadModel(id).catch(() => {});
+  const parked = rejectParkedDownload(id);
+  const resumes = activeResumes.filter(
+    (entry) => !entry.settled && downloadEntryMatches(entry, id)
+  );
+  for (const entry of resumes) {
+    entry.cancelled = true;
+  }
+  const live = resumes.filter((entry) => entry.rpcInFlight);
+  if (parked || resumes.length) {
+    // A resumed RPC is still running in Python. Ask it to stop, but leave the
+    // caller pending until that RPC settles so cache deletion waits for it.
+    if (live.length) {
+      await hfEngine.cancelDownloadModel(id);
     }
     return;
   }
