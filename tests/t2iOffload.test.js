@@ -76,20 +76,19 @@ class DType:
     def __init__(self, itemsize):
         self.itemsize = itemsize
 
-assert t2i._offload_disk_bytes(100, DType(4)) == 200
-assert t2i._offload_disk_bytes(100, DType(2)) == 100
-assert t2i._weights_need_disk_offload("cuda", 1000, 600, DType(2)) is False
-assert t2i._weights_need_disk_offload("cuda", 1000, 701, DType(2)) is True
-assert t2i._weights_need_disk_offload("cuda", 1000, 700, DType(2)) is False
-assert t2i._weights_need_disk_offload("cpu", 1000, 400, DType(4)) is True
-assert t2i._weights_need_disk_offload("cpu", 1000, 400, DType(2)) is False
-assert t2i._weights_need_disk_offload("cpu", 1000, 500, DType(2)) is False
-# 600 of 1000 is over the CPU 0.55 share and under the CUDA 0.70 share.
-assert t2i._weights_need_disk_offload("cpu", 1000, 600, DType(2)) is True
+# Resident bytes are already numel * itemsize. CPU 0.55 vs CUDA 0.70:
+# 600 of 1000 is over the CPU share and under the CUDA share.
+assert t2i._resident_exceeds("cuda", 1000, 600) is False
+assert t2i._resident_exceeds("cuda", 1000, 701) is True
+assert t2i._resident_exceeds("cuda", 1000, 700) is False
+assert t2i._resident_exceeds("cpu", 1000, 400) is False
+assert t2i._resident_exceeds("cpu", 1000, 800) is True
+assert t2i._resident_exceeds("cpu", 1000, 500) is False
+assert t2i._resident_exceeds("cpu", 1000, 600) is True
 assert t2i._CPU_RAM_RESIDENT_FRACTION == 0.55
 assert t2i._CPU_ACCELERATE_RAM_FRACTION == 0.28
-assert t2i._weights_need_disk_offload("mps", 1000, 900, DType(2)) is False
-assert t2i._weights_need_disk_offload("cuda", None, 900, DType(2)) is False
+assert t2i._resident_exceeds("mps", 1000, 900) is False
+assert t2i._resident_exceeds("cuda", None, 900) is False
 
 load_kwargs = t2i._large_component_load_kwargs(DType(4), {"cpu": 1024, 0: 0}, "/var/tmp/offload")
 assert load_kwargs["low_cpu_mem_usage"] is True
@@ -198,8 +197,21 @@ try:
 finally:
     t2i.shutil.disk_usage = original_usage
 
-if not t2i._is_ram_disk(repo):
-    base = Path(tempfile.mkdtemp(prefix="glaux-offload-", dir=repo))
+def real_disk_mkdtemp(prefix):
+    # Offload files cannot live on tmpfs, and the test must not create a
+    # directory inside the repo. Prefer the default temp dir; if that is a
+    # RAM disk, use /var/tmp, which is the same fallback the loader uses.
+    candidate = Path(tempfile.mkdtemp(prefix=prefix))
+    if not t2i._is_ram_disk(candidate):
+        return candidate
+    shutil.rmtree(candidate, ignore_errors=True)
+    var_tmp = Path("/var/tmp")
+    if var_tmp.is_dir() and not t2i._is_ram_disk(var_tmp):
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(var_tmp)))
+    return None
+
+base = real_disk_mkdtemp("glaux-offload-")
+if base is not None:
     try:
         state["cache"] = base
         parent = base / ".glaux-t2i-offload"
@@ -374,36 +386,35 @@ fraction = t2i._RAM_RESIDENT_FRACTION
 dtype = DType(2)
 
 # Whole pipeline fits in free VRAM after the activation headroom.
-assert t2i.select_cuda_tier({"unet": head}, head + head, 10 * GiB, dtype) == "cuda"
+assert t2i.select_cuda_tier({"unet": head}, head + head, 10 * GiB) == "cuda"
 # Largest component fits, the total does not, and the total still fits in RAM.
 assert t2i.select_cuda_tier(
     {"transformer": head, "text_encoder": head},
     head + head,
     10 * GiB,
-    dtype,
 ) == "model_cpu_offload"
 # Largest would fit in VRAM, but the checkpoint does not fit the RAM budget,
 # so it must not be staged with from_pretrained.
-assert t2i.select_cuda_tier({"unet": 1000}, head + 5000, 1000, dtype) == "disk"
+assert t2i.select_cuda_tier({"unet": 1000}, head + 5000, 1000) == "disk"
 # Fits in RAM, not in VRAM, and usable VRAM can hold a prefetched block.
 assert t2i.select_cuda_tier(
     {"transformer": block_min + 1},
     head + block_min,
     10 * GiB,
-    dtype,
 ) == "group_offload"
 # Same, but the usable VRAM is below one prefetched block.
 assert t2i.select_cuda_tier(
     {"transformer": 10 * GiB},
     head + block_min - 1,
     100 * GiB,
-    dtype,
 ) == "group_offload_leaf"
 # No free VRAM left after the headroom, and the weights fit in RAM: leaf groups.
-assert t2i.select_cuda_tier({"unet": GiB}, head, 10 * GiB, dtype) == "group_offload_leaf"
+assert t2i.select_cuda_tier({"unet": GiB}, head, 10 * GiB) == "group_offload_leaf"
 # Unknown RAM does not force disk. Bytes outside component folders still count.
-assert t2i.select_cuda_tier({"unet": 100}, head + 10_000, None, dtype, extra_bytes=100) == "cuda"
-assert t2i.select_cuda_tier({}, 0, 1000, dtype, extra_bytes=800) == "disk"
+assert t2i.select_cuda_tier({"unet": 100}, head + 10_000, None, extra_bytes=100) == "cuda"
+assert t2i.select_cuda_tier({}, 0, 1000, extra_bytes=800) == "disk"
+# Nothing measured is not "fits on the GPU".
+assert t2i.select_cuda_tier({}, 24 * GiB, 64 * GiB) == "model_cpu_offload"
 assert t2i.select_group_offload_type(head + block_min) == "block_level"
 assert t2i.select_group_offload_type(head + block_min - 1) == "leaf_level"
 assert t2i.group_offload_pre_pin(100, 1000) is True
@@ -425,9 +436,13 @@ assert t2i._denoiser_gpu_budget(20 * GiB, GiB) == 16 * GiB
 assert t2i._denoiser_gpu_budget(4 * GiB, 0) == GiB
 assert t2i._denoiser_gpu_budget(2 * GiB, 0) == (2 * GiB - t2i._GPU_SLIVER_BYTES) // 2
 assert t2i._denoiser_gpu_budget(200 * 1024**2, 0) == 0
-assert t2i._denoiser_gpu_budget(t2i._MIN_GPU_OFFLOAD_BYTES + t2i._GPU_SLIVER_BYTES + 4096, 0) == (
-    t2i._MIN_GPU_OFFLOAD_BYTES
-)
+# A tight card is not raised to 512 MiB. That offer is still checked against
+# the real layer floor before anything is called a GPU shard.
+tight_offer = t2i._MIN_GPU_OFFLOAD_BYTES + t2i._GPU_SLIVER_BYTES + 4096
+assert t2i._denoiser_gpu_budget(tight_offer, 0) == (t2i._MIN_GPU_OFFLOAD_BYTES + 4096) // 2
+assert t2i.gpu_shard_floor(100, 100) == 200
+assert t2i.gpu_shard_floor(100, 0) == 200
+assert t2i.gpu_shard_floor(0, 0) == 0
 
 wide = t2i._component_disk_budgets(
     {"transformer": 12 * GiB, "text_encoder": 5 * GiB, "vae": 100},
@@ -435,6 +450,7 @@ wide = t2i._component_disk_budgets(
     available_ram=32 * GiB,
     free_vram=20 * GiB,
     cuda_visible=True,
+    gpu_floors={"transformer": 1, "text_encoder": 1, "vae": 1},
 )
 denoiser_spare = 20 * GiB - head - 100
 assert wide["text_encoder"][0] == 5 * GiB
@@ -450,11 +466,15 @@ tight = t2i._component_disk_budgets(
     available_ram=10 * GiB,
     free_vram=24 * GiB,
     cuda_visible=True,
+    gpu_floors={"transformer": 1, "text_encoder": 1},
 )
 assert tight["transformer"]["cpu"] == tight_budget - t2i._CPU_BUDGET_FLOOR
 assert tight["text_encoder"]["cpu"] == t2i._CPU_BUDGET_FLOOR
 assert tight["text_encoder"][0] == 2 * GiB
-assert tight["transformer"][0] == 24 * GiB - head - 2 * GiB
+# The remainder is larger than the transformer, so the grant is the cast size.
+# A grant below the floor would place nothing; a grant of the whole spare is
+# not required once the cast size already covers the floor.
+assert tight["transformer"][0] == 8 * GiB
 
 cpu_budgets = t2i._component_disk_budgets(
     {"unet": 4 * GiB},
@@ -494,15 +514,50 @@ assert split_cpu["text_encoder"]["cpu"] == each_cpu
 assert split_cpu["unet"][0] == 0
 assert split_cpu["text_encoder"][0] == 0
 
+# Spare is 5 GiB. The encoder's full size does not leave the denoiser its
+# floor, but a one-block floor does, so the encoder gets that floor only.
 partial_encoder = t2i._component_disk_budgets(
     {"transformer": 20 * GiB, "text_encoder": 30 * GiB},
     device="cuda",
     available_ram=80 * GiB,
     free_vram=8 * GiB,
     cuda_visible=True,
+    gpu_floors={"transformer": 2 * GiB, "text_encoder": GiB},
 )
-assert partial_encoder["text_encoder"][0] == t2i._MIN_GPU_OFFLOAD_BYTES
-assert partial_encoder["transformer"][0] == 5 * GiB - t2i._MIN_GPU_OFFLOAD_BYTES
+assert partial_encoder["text_encoder"][0] == GiB
+assert partial_encoder["transformer"][0] == 5 * GiB - GiB
+# Unknown layer sizes publish no GPU shard, including when spare VRAM is large.
+unknown_floor = t2i._component_disk_budgets(
+    {"transformer": 12 * GiB, "text_encoder": 5 * GiB},
+    device="cuda",
+    available_ram=32 * GiB,
+    free_vram=20 * GiB,
+    cuda_visible=True,
+)
+assert unknown_floor["text_encoder"][0] == 0
+assert unknown_floor["transformer"][0] == 0
+# 512 MiB of spare is below a 386 MiB block's floor (layer + one block).
+block = 386 * 1024 * 1024
+below_floor = t2i._component_disk_budgets(
+    {"transformer": 12 * GiB, "text_encoder": 9 * GiB},
+    device="cuda",
+    available_ram=64 * GiB,
+    free_vram=head + t2i._MIN_GPU_OFFLOAD_BYTES,
+    cuda_visible=True,
+    gpu_floors={"transformer": block * 2, "text_encoder": block * 2},
+)
+assert below_floor["text_encoder"][0] == 0
+assert below_floor["transformer"][0] == 0
+# A component smaller than its floor is granted the floor, not its byte size.
+# Otherwise Accelerate reserves the layer and places nothing.
+tiny_grant = t2i._disk_component_gpu_budgets(
+    {"text_encoder": 100, "transformer": 5000},
+    0,
+    20 * GiB,
+    {"text_encoder": 200, "transformer": 400},
+)
+assert tiny_grant["text_encoder"] == 200
+assert tiny_grant["transformer"] == 5000
 
 assert t2i.cuda_tiers_from("cuda") == [
     "cuda",
@@ -682,8 +737,18 @@ try:
 except t2i.DiffusionStopped:
     pass
 
-if not t2i._is_ram_disk(repo):
-    base = Path(tempfile.mkdtemp(prefix="glaux-tier-", dir=str(repo)))
+def real_disk_mkdtemp(prefix):
+    candidate = Path(tempfile.mkdtemp(prefix=prefix))
+    if not t2i._is_ram_disk(candidate):
+        return candidate
+    shutil.rmtree(candidate, ignore_errors=True)
+    var_tmp = Path("/var/tmp")
+    if var_tmp.is_dir() and not t2i._is_ram_disk(var_tmp):
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(var_tmp)))
+    return None
+
+base = real_disk_mkdtemp("glaux-tier-")
+if base is not None:
     try:
         state["cache"] = base
         holder = {}
@@ -707,7 +772,9 @@ if not t2i._is_ram_disk(repo):
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
-    base = Path(tempfile.mkdtemp(prefix="glaux-tier-keep-", dir=str(repo)))
+    base = real_disk_mkdtemp("glaux-tier-keep-")
+    if base is None:
+        raise SystemExit("no real disk for the tier-keep temp dir")
     try:
         state["cache"] = base
         kept = t2i._prepare_disk_offload(str(base / "org" / "repo"), 1)
@@ -743,8 +810,50 @@ def leaking_attempt(tier):
 assert t2i._run_placement_attempts(["cuda", "model_cpu_offload"], leaking_attempt) == "collected"
 
 t2i._cuda_tier_limits["/models/sticky"] = "disk"
+t2i._cuda_tier_limit_vram["/models/sticky"] = 3 * GiB
 t2i.clear_cuda_tier_limit("/models/sticky")
 assert "/models/sticky" not in t2i._cuda_tier_limits
+assert "/models/sticky" not in t2i._cuda_tier_limit_vram
+
+cap_path = "/models/sticky-cap"
+cap_resolved = str(Path(cap_path).resolve())
+assert t2i._note_tier_limit(cap_path, "cuda", free_vram=10 * GiB) == "model_cpu_offload"
+assert t2i._cuda_tier_limit_vram[cap_resolved] == 10 * GiB
+assert t2i._note_tier_limit(cap_path, "model_cpu_offload", free_vram=1) == "group_offload"
+assert t2i._cuda_tier_limit_vram[cap_resolved] == 10 * GiB
+growth = t2i._TIER_LIMIT_VRAM_GROWTH_BYTES
+assert t2i.cuda_tier_limit_for(cap_path, 10 * GiB + growth) == "group_offload"
+assert t2i.cuda_tier_limit_for(cap_path, 10 * GiB + growth + 1) is None
+assert cap_resolved not in t2i._cuda_tier_limits
+assert cap_resolved not in t2i._cuda_tier_limit_vram
+t2i._note_tier_limit(cap_path, "cuda", free_vram=4 * GiB)
+t2i.clear_cuda_tier_limit(cap_path)
+assert cap_resolved not in t2i._cuda_tier_limits
+t2i._cuda_tier_limits[cap_resolved] = "disk"
+assert t2i.cuda_tier_limit_for(cap_path, 100 * GiB) == "disk"
+t2i.clear_cuda_tier_limit(cap_path)
+
+class ForceVae:
+    def __init__(self):
+        self.config = types.SimpleNamespace(force_upcast=True)
+
+force_pipe = type("StableDiffusionXLPipeline", (), {})()
+force_pipe.vae = ForceVae()
+assert t2i._vae_needs_fp16_upcast(force_pipe) is True
+flux_pipe = type("FluxPipeline", (), {})()
+flux_pipe.vae = type("AutoencoderKL", (), {})()
+assert t2i._vae_needs_fp16_upcast(flux_pipe) is True
+sd3_pipe = type("StableDiffusion3Pipeline", (), {})()
+sd3_pipe.vae = type("AutoencoderKL", (), {})()
+assert t2i._vae_needs_fp16_upcast(sd3_pipe) is True
+qwen_pipe = type("QwenImagePipeline", (), {})()
+qwen_pipe.vae = type("AutoencoderKLQwenImage", (), {})()
+assert t2i._vae_needs_fp16_upcast(qwen_pipe) is True
+plain_pipe = type("CustomPipeline", (), {})()
+plain_pipe.vae = type("AutoencoderKL", (), {})()
+plain_pipe.vae.config = types.SimpleNamespace(force_upcast=False)
+assert t2i._vae_needs_fp16_upcast(plain_pipe) is False
+assert t2i._vae_needs_fp16_upcast(type("FluxPipeline", (), {})()) is False
 
 class Blockless:
     def named_children(self):
@@ -762,6 +871,7 @@ assert t2i._component_has_block_modules(Blocks()) is True
 `;
 
 const HEADER_SCRIPT = String.raw`
+import io
 import json
 import sys
 import tempfile
@@ -853,7 +963,7 @@ assert sdxl_sizes["unet"] == 20 * GiB, sdxl_sizes
 assert sdxl_sizes["text_encoder"] == 4 * GiB, sdxl_sizes
 assert sdxl_sizes["text_encoder_2"] == 4 * GiB, sdxl_sizes
 assert sdxl_sizes["vae"] == 1024 * 1024 * 2, sdxl_sizes
-sdxl_tier = t2i.select_cuda_tier(sdxl_sizes, 24 * GiB, 64 * GiB, fp16)
+sdxl_tier = t2i.select_cuda_tier(sdxl_sizes, 24 * GiB, 64 * GiB)
 assert sdxl_tier == "model_cpu_offload", (sdxl_tier, sdxl_sizes)
 
 flux = Path(tempfile.mkdtemp(prefix="glaux-flux-"))
@@ -901,9 +1011,8 @@ write_header(flux / "text_encoder_2" / "model-00001-of-00002.safetensors", [
 write_header(flux / "text_encoder_2" / "model-00002-of-00002.safetensors", [
     ("b", "F8_E4M3", [numel_for(4 * GiB, 2)]),
 ])
-write_header(flux / "text_encoder_2" / "model.safetensors", [
-    ("w", "F16", [numel_for(40 * GiB, 2)]),
-])
+# No model.safetensors here: transformers uses the index only when the single
+# file is absent. A sibling single file would be the one that loads.
 write_header(flux / "vae" / "diffusion_pytorch_model.safetensors", [
     ("w", "F16", [numel_for(GiB // 2, 2)]),
 ])
@@ -915,11 +1024,112 @@ assert flux_sizes["transformer"] == 16 * GiB, flux_sizes
 assert flux_sizes["text_encoder"] == GiB, flux_sizes
 assert flux_sizes["text_encoder_2"] == 8 * GiB, flux_sizes
 assert flux_sizes["vae"] == GiB // 2, flux_sizes
-flux_tier = t2i.select_cuda_tier(flux_sizes, 24 * GiB, 64 * GiB, fp16)
+flux_tier = t2i.select_cuda_tier(flux_sizes, 24 * GiB, 64 * GiB)
 assert flux_tier == "model_cpu_offload", (flux_tier, flux_sizes)
 fp32 = DType(4)
 flux_fp32 = t2i.measure_component_bytes(str(flux), fp32)
 assert flux_fp32["transformer"] == 32 * GiB, flux_fp32
+
+# Transformers prefers a single model.safetensors over a sibling index.
+prefer = Path(tempfile.mkdtemp(prefix="glaux-prefer-"))
+(prefer / "model_index.json").write_text(json.dumps({
+    "_class_name": "FluxPipeline",
+    "text_encoder_2": ["transformers", "T5EncoderModel"],
+}), encoding="utf-8")
+(prefer / "text_encoder_2").mkdir()
+(prefer / "text_encoder_2" / "model.safetensors.index.json").write_text(json.dumps({
+    "weight_map": {"a": "model-00001-of-00001.safetensors"},
+}), encoding="utf-8")
+write_header(prefer / "text_encoder_2" / "model-00001-of-00001.safetensors", [
+    ("a", "F16", [numel_for(40 * GiB, 2)]),
+])
+write_header(prefer / "text_encoder_2" / "model.safetensors", [
+    ("encoder.block.0.weight", "F16", [numel_for(GiB, 2)]),
+    ("encoder.block.1.weight", "F16", [numel_for(GiB, 2)]),
+])
+prefer_layouts = t2i.measure_component_layouts(str(prefer), fp16)
+assert prefer_layouts["text_encoder_2"][0] == 2 * GiB, prefer_layouts
+# Two equal blocks: floor is one block reserved plus one block placed.
+assert prefer_layouts["text_encoder_2"][1] == 2 * GiB, prefer_layouts
+
+def capture_sizes(root):
+    buf = io.StringIO()
+    old_err = sys.stderr
+    sys.stderr = buf
+    try:
+        sizes = t2i.measure_component_bytes(str(root), fp16)
+        layouts = t2i.measure_component_layouts(str(root), fp16)
+    finally:
+        sys.stderr = old_err
+    return sizes, layouts, buf.getvalue()
+
+def bad_repo(raw, filename="diffusion_pytorch_model.safetensors"):
+    root = Path(tempfile.mkdtemp(prefix="glaux-bad-"))
+    (root / "model_index.json").write_text(json.dumps({
+        "_class_name": "StableDiffusionPipeline",
+        "unet": ["diffusers", "UNet2DConditionModel"],
+    }), encoding="utf-8")
+    path = root / "unet" / filename
+    path.parent.mkdir()
+    path.write_bytes(raw)
+    return root, path
+
+huge_root, huge_path = bad_repo((200 * 1024 * 1024).to_bytes(8, "little"))
+huge_sizes, huge_layouts, huge_log = capture_sizes(huge_root)
+assert huge_sizes["unet"] == huge_path.stat().st_size, huge_sizes
+assert huge_layouts["unet"][1] == 0
+assert huge_log.count("Using the file size") == 2, huge_log
+
+trunc_root, trunc_path = bad_repo((100).to_bytes(8, "little") + b"{}")
+trunc_sizes, _, trunc_log = capture_sizes(trunc_root)
+assert trunc_sizes["unet"] == trunc_path.stat().st_size
+assert "Using the file size" in trunc_log
+
+payload = b"not-json"
+json_root, json_path = bad_repo(len(payload).to_bytes(8, "little") + payload)
+json_sizes, _, json_log = capture_sizes(json_root)
+assert json_sizes["unet"] == json_path.stat().st_size
+assert "Using the file size" in json_log
+
+negative = json.dumps({
+    "w": {"dtype": "F16", "shape": [-4, 8], "data_offsets": [0, 1]},
+}).encode()
+neg_root, neg_path = bad_repo(len(negative).to_bytes(8, "little") + negative)
+neg_sizes, neg_layouts, neg_log = capture_sizes(neg_root)
+assert neg_sizes["unet"] == neg_path.stat().st_size
+assert neg_layouts["unet"][1] == 0
+assert "Using the file size" in neg_log
+
+mixed = json.dumps({
+    "bad": {"dtype": "F16", "shape": [-1], "data_offsets": [0, 1]},
+    "good": {"dtype": "F16", "shape": [4, 4], "data_offsets": [0, 32]},
+}).encode()
+mixed_root, _mixed_path = bad_repo(len(mixed).to_bytes(8, "little") + mixed)
+mixed_sizes, mixed_layouts, mixed_log = capture_sizes(mixed_root)
+assert mixed_sizes["unet"] == 16 * 2, mixed_sizes
+assert mixed_layouts["unet"][1] == t2i.gpu_shard_floor(16, 0) * 2
+assert "Using the file size" not in mixed_log
+
+empty_root, _empty_path = bad_repo(b"")
+empty_sizes, _, empty_log = capture_sizes(empty_root)
+assert "unet" not in empty_sizes
+assert "Using the file size" in empty_log
+assert t2i.select_cuda_tier(empty_sizes, 24 * GiB, 64 * GiB) == "model_cpu_offload"
+
+bin_root = Path(tempfile.mkdtemp(prefix="glaux-bin-"))
+(bin_root / "model_index.json").write_text(json.dumps({
+    "_class_name": "StableDiffusionPipeline",
+    "unet": ["diffusers", "UNet2DConditionModel"],
+}), encoding="utf-8")
+bin_path = bin_root / "unet" / "diffusion_pytorch_model.bin"
+bin_path.parent.mkdir()
+bin_path.write_bytes(b"x" * 1000)
+bin_sizes, bin_layouts, bin_log = capture_sizes(bin_root)
+assert bin_sizes["unet"] == 1000, bin_sizes
+assert bin_layouts["unet"][1] == 0
+assert "file bytes" in bin_log
+assert t2i.select_cuda_tier(bin_sizes, 24 * GiB, 64 * GiB) == "cuda"
+assert t2i.select_cuda_tier({"unet": 40 * GiB}, 24 * GiB, 16 * GiB) == "disk"
 `;
 
 const APPLY_SCRIPT = String.raw`
@@ -1073,7 +1283,7 @@ assert t2i._place_cuda_tier(
 seen = []
 resolved_holder = {}
 
-def place_spy(model_path, dtype, tier, cast, *, available_ram, free_vram, pre_pin=None):
+def place_spy(model_path, dtype, tier, cast, *, available_ram, free_vram, pre_pin=None, layouts=None):
     resolved = str(Path(model_path).resolve())
     resolved_holder["path"] = resolved
     seen.append((tier, pre_pin, t2i._cuda_tier_limits.get(resolved)))
@@ -1082,7 +1292,7 @@ def place_spy(model_path, dtype, tier, cast, *, available_ram, free_vram, pre_pi
     return FakePipe()
 
 t2i._place_cuda_tier = place_spy
-t2i.measure_component_bytes = lambda path, dtype: {"unet": 100}
+t2i.measure_component_layouts = lambda path, dtype: {"unet": (100, 0)}
 t2i.select_cuda_tier = lambda *args, **kwargs: "cuda"
 model_path = "/models/pin-retry"
 resolved = str(Path(model_path).resolve())
@@ -1098,7 +1308,7 @@ assert seen == [
     ("group_offload", True, "group_offload"),
     ("group_offload", False, "group_offload"),
 ], seen
-assert resolved not in t2i._cuda_tier_limits
+assert t2i._cuda_tier_limits.get(resolved) == "group_offload"
 assert "low_cpu_mem_usage=True" in buf.getvalue()
 assert isinstance(loaded, FakePipe)
 host_calls.clear()
@@ -1107,6 +1317,7 @@ assert host_calls == ["host"]
 `;
 
 const CHAT_SCRIPT = String.raw`
+import io
 import sys
 import types
 import weakref
@@ -1208,9 +1419,17 @@ def generate_stop(pipe, prompt, output_path, image_path=None):
     raise RuntimeError("CUDA out of memory")
 
 chat.generate_text_to_image = generate_stop
-assert chat._generate_text_to_image_turn("a cat", None, None, None, "/tmp/out.png") == ""
+stop_log = io.StringIO()
+old_err = sys.stderr
+sys.stderr = stop_log
+try:
+    assert chat._generate_text_to_image_turn("a cat", None, None, None, "/tmp/out.png") == ""
+finally:
+    sys.stderr = old_err
 assert calls["n"] == 1
 assert creates == []
+assert "not retrying" in stop_log.getvalue(), stop_log.getvalue()
+assert "RuntimeError: CUDA out of memory" in stop_log.getvalue()
 
 creates.clear()
 calls["n"] = 0
@@ -1332,6 +1551,45 @@ encoded = pipe.vae.encode(latent)
 assert tuple(decoded.shape) == (1, 1, 4, 4)
 assert tuple(encoded.shape) == (1, 1, 4, 4)
 assert pipe.vae.conv.forward_devices == ["cpu", "cpu"], pipe.vae.conv.forward_devices
+
+from diffusers import AutoencoderKLFlux2
+
+flux2 = AutoencoderKLFlux2(
+    in_channels=3,
+    out_channels=3,
+    down_block_types=("DownEncoderBlock2D",),
+    up_block_types=("UpDecoderBlock2D",),
+    block_out_channels=(32,),
+    layers_per_block=1,
+    latent_channels=4,
+    norm_num_groups=4,
+    sample_size=32,
+    mid_block_add_attention=False,
+    use_quant_conv=False,
+    use_post_quant_conv=False,
+)
+flux_pipe = type("FluxPipeline", (), {})()
+flux_pipe.vae = flux2
+
+def flux_components(self):
+    return {"vae": self.vae}
+
+type(flux_pipe).components = property(flux_components)
+assert t2i._vae_needs_fp16_upcast(flux_pipe) is True
+t2i._apply_group_offload(flux_pipe, "block_level", pre_pin=False, onload_device=torch.device("cpu"))
+pixels = torch.zeros(1, 3, 32, 32)
+with torch.no_grad():
+    posterior = flux_pipe.vae.encode(pixels)
+    flux_decoded = flux_pipe.vae.decode(posterior.latent_dist.mode())
+assert tuple(flux_decoded.sample.shape) == (1, 3, 32, 32)
+
+fp16_vae = torch.nn.Conv2d(1, 1, 1).half()
+fp16_vae.config = types.SimpleNamespace(force_upcast=True)
+fp16_pipe = type("StableDiffusionPipeline", (), {})()
+fp16_pipe.vae = fp16_vae
+assert t2i._upcast_vae_for_fp16(fp16_pipe, torch.float16) is True
+assert fp16_vae.weight.dtype == torch.float32
+assert t2i._upcast_vae_for_fp16(fp16_pipe, torch.float32) is False
 `;
 
 function runPython(script, label, command = PYTHON) {
@@ -1354,13 +1612,13 @@ function runPython(script, label, command = PYTHON) {
  * PYTHON_SKIP, which is the existing convention in this file.
  * @returns {string | false}
  */
-function pythonWithTorch() {
+function pythonWithModules(statement) {
   const candidates = [PYTHON, process.platform === 'win32' ? 'python' : 'python3'];
   const seen = new Set();
   for (const command of candidates) {
     if (!command || seen.has(command)) continue;
     seen.add(command);
-    const result = spawnSync(command, ['-c', 'import torch, diffusers'], {
+    const result = spawnSync(command, ['-c', statement], {
       encoding: 'utf8',
       windowsHide: true,
       timeout: 30000,
@@ -1370,10 +1628,76 @@ function pythonWithTorch() {
   return false;
 }
 
+function pythonWithTorch() {
+  return pythonWithModules('import torch, diffusers');
+}
+
 const TORCH_PYTHON = pythonWithTorch();
 const TORCH_SKIP = TORCH_PYTHON
   ? false
   : 'No Python interpreter can import torch and diffusers. The VAE leaf-offload test needs both.';
+const ACCEL_PYTHON = pythonWithModules('import torch, accelerate');
+const ACCEL_SKIP = ACCEL_PYTHON
+  ? false
+  : 'No Python interpreter can import torch and accelerate. The GPU-budget test needs both.';
+
+const ACCEL_SCRIPT = String.raw`
+import sys
+import types
+from pathlib import Path
+
+repo = Path(sys.argv[1]).resolve()
+hf = repo / "engines" / "huggingface"
+sys.path.insert(0, str(hf))
+worker = types.ModuleType("worker")
+worker.__path__ = [str(hf / "worker")]
+worker.__package__ = "worker"
+sys.modules["worker"] = worker
+download = types.ModuleType("worker.download")
+download.models_cache_dir = lambda path=None: Path(path) if path else repo
+sys.modules["worker.download"] = download
+
+import torch
+import torch.nn as nn
+from accelerate import init_empty_weights
+from accelerate.utils.modeling import get_max_layer_size, infer_auto_device_map, compute_module_sizes
+import worker.t2i as t2i
+
+class Block(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.lin = nn.Linear(width, width, bias=False)
+
+class Toy(nn.Module):
+    _no_split_modules = ["Block"]
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([Block(64), Block(64)])
+
+with init_empty_weights():
+    model = Toy()
+
+module_sizes = compute_module_sizes(model, dtype=torch.float32)
+max_layer, _names = get_max_layer_size(list(model.named_modules()), module_sizes, ["Block"])
+floor = t2i.gpu_shard_floor(max_layer, max_layer)
+assert floor == max_layer * 2, (floor, max_layer)
+assert max_layer > 0
+
+def on_gpu(budget):
+    mapping = infer_auto_device_map(
+        model,
+        max_memory={0: budget, "cpu": 10**12},
+        no_split_module_classes=["Block"],
+        dtype=torch.float32,
+    )
+    return any(device == 0 for device in mapping.values()), mapping
+
+below, below_map = on_gpu(floor - 1)
+assert below is False, below_map
+placed, placed_map = on_gpu(floor)
+assert placed is True, placed_map
+`;
 
 describe('text-to-image disk offload', () => {
   it('offloads CUDA and CPU loads to a real disk and tiles the VAE', { skip: PYTHON_SKIP }, () => {
@@ -1419,7 +1743,7 @@ describe('text-to-image disk offload', () => {
     runPython(HEADER_SCRIPT, 'header sizing');
   });
 
-  it('places group offload, retries pinning, and clears a tier cap', { skip: PYTHON_SKIP }, () => {
+  it('places group offload, retries pinning, and keeps a tier cap', { skip: PYTHON_SKIP }, () => {
     runPython(APPLY_SCRIPT, 'placement hooks');
   });
 
@@ -1429,5 +1753,9 @@ describe('text-to-image disk offload', () => {
 
   it('leaf-offloads VAE decode and encode when block modules are absent', { skip: PYTHON_SKIP || TORCH_SKIP }, () => {
     runPython(VAE_SCRIPT, 'vae leaf offload', TORCH_PYTHON);
+  });
+
+  it('matches accelerate reservation with the GPU shard floor', { skip: PYTHON_SKIP || ACCEL_SKIP }, () => {
+    runPython(ACCEL_SCRIPT, 'accelerate device map', ACCEL_PYTHON);
   });
 });

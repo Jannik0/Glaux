@@ -422,7 +422,8 @@ def chatbot_destroy():
 
     An explicit unload clears a lowered CUDA tier for this model. The immediate
     retry after an out-of-memory error uses ``_chatbot_destroy_unlocked`` and
-    keeps that cap until the retry's load succeeds.
+    leaves the cap in place. A later successful load keeps it as well, until
+    this unload or until free VRAM has grown by more than 1 GiB.
     """
     with _chat_lock_guard():
         model_id = CHATBOT_MODEL_ID
@@ -1106,6 +1107,12 @@ def _generate_text_to_image_turn(
                 # that pipeline is still resident. A stop never becomes a retry
                 # or a second generation.
                 if CHAT_GENERATION_STOP:
+                    print(
+                        "Text-to-image stopped; not retrying "
+                        f"({type(exc).__name__}: {exc}).",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     stopped = True
                     break
                 can_lower = (

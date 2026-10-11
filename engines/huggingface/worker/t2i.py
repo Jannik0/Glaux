@@ -54,9 +54,20 @@ _CPU_ACCELERATE_RAM_FRACTION = 0.28
 _GROUP_BLOCK_MIN_VRAM_BYTES = 2 * 1024**3
 # CPU staging floor for a large component once the RAM share is spoken for.
 _CPU_BUDGET_FLOOR = 64 * 1024**2
-# Spare GPU below this is too tight for a disk-offload shard plus activations.
+# Below this spare, the disk-tier offer uses half of what remains on a small
+# card instead of free VRAM minus the activation headroom. It is not a
+# guarantee that anything stays on the GPU. Accelerate reserves the largest
+# no-split layer inside a main-device budget before it places a module, so
+# the useful minimum is that layer plus one block (see ``gpu_shard_floor``).
 _MIN_GPU_OFFLOAD_BYTES = 512 * 1024**2
 _GPU_SLIVER_BYTES = 256 * 1024**2
+# A lowered CUDA tier stays until an explicit unload, or until free VRAM at
+# a later load is more than this far above the free VRAM recorded when the
+# cap was set. A successful load does not clear it.
+_TIER_LIMIT_VRAM_GROWTH_BYTES = 1024**3
+# Safetensors refuses a header longer than this. Reading the claimed length
+# anyway is a MemoryError on a corrupt file.
+_SAFETENSORS_MAX_HEADER_BYTES = 100 * 1024 * 1024
 
 TIER_CUDA = "cuda"
 TIER_MODEL = "model_cpu_offload"
@@ -65,8 +76,12 @@ TIER_GROUP_LEAF = "group_offload_leaf"
 TIER_DISK = "disk"
 _CUDA_TIER_ORDER = (TIER_CUDA, TIER_MODEL, TIER_GROUP, TIER_GROUP_LEAF, TIER_DISK)
 # After a tier runs out of memory, later loads of that model directory in this
-# process start at the next tier down. A new worker starts with this empty.
+# process start at the next tier down until the user unloads it, or until free
+# VRAM has grown by more than ``_TIER_LIMIT_VRAM_GROWTH_BYTES`` since the cap
+# was set. A new worker starts with both maps empty. The VRAM map holds the
+# free-VRAM sample from the first time the cap was recorded.
 _cuda_tier_limits: dict[str, str] = {}
+_cuda_tier_limit_vram: dict[str, int] = {}
 _RAM_FILESYSTEMS = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 _active_offload_root: Path | None = None
 # Bumps every time this process creates an offload folder, so a failed tier
@@ -100,15 +115,27 @@ def assert_text_to_image_repo(model_path: str, *, allow_img2img: bool = False) -
     return class_name
 
 
-# Names ``from_pretrained`` resolves when ``variant`` is omitted and
-# ``use_safetensors`` stays at its default. Diffusers 0.41 ``_fetch_index_file``
-# looks for the non-variant index first and, on a hit, loads only the shards in
-# ``weight_map``. Otherwise it loads the non-variant single file. Sibling
-# ``*.fp16.safetensors`` files and a root single-file checkpoint are not selected.
+# Names ``from_pretrained`` resolves when ``variant`` is omitted.
+# Diffusers 0.41 ``_fetch_index_file`` looks for the non-variant safetensors
+# index first and, on a hit, loads only the shards in ``weight_map``.
+# Otherwise it loads the non-variant single file.
+# Transformers 5.19 does the opposite for a local folder: a single
+# ``model.safetensors`` wins when that file exists, and the index is used
+# only when the single file is absent (``modeling_utils`` checkpoint
+# resolution, ``use_safetensors is not False``).
+# Sibling ``*.fp16.safetensors`` files and a root single-file checkpoint are
+# not selected. The pipeline passes ``use_safetensors=True``, so a ``.bin``
+# file is not loaded (diffusers then leaves ``allow_pickle`` false, and
+# transformers never reaches ``pytorch_model.bin``). A ``.bin`` size is still
+# measured so that checkpoint is not treated as empty.
 _DIFFUSERS_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 _DIFFUSERS_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
+_DIFFUSERS_BIN_NAME = "diffusion_pytorch_model.bin"
+_DIFFUSERS_BIN_INDEX_NAME = "diffusion_pytorch_model.bin.index.json"
 _TRANSFORMERS_WEIGHTS_NAME = "model.safetensors"
 _TRANSFORMERS_INDEX_NAME = "model.safetensors.index.json"
+_TRANSFORMERS_BIN_NAME = "pytorch_model.bin"
+_TRANSFORMERS_BIN_INDEX_NAME = "pytorch_model.bin.index.json"
 # Safetensors header dtype → stored bytes per value. Runtime size is numel
 # times the dtype we cast to, not this width and not the file size.
 _SAFETENSORS_DTYPE_BYTES = {
@@ -133,109 +160,272 @@ _SAFETENSORS_DTYPE_BYTES = {
 }
 
 
-def _safetensors_header(path: Path) -> dict:
-    """JSON header of a safetensors file. The tensor body is not read."""
-    with path.open("rb") as handle:
-        raw_len = handle.read(8)
-        if len(raw_len) < 8:
-            raise ValueError(f"safetensors header is truncated: {path}")
-        length = int.from_bytes(raw_len, "little")
-        payload = handle.read(length)
-    if len(payload) < length:
-        raise ValueError(f"safetensors header is truncated: {path}")
-    header = json.loads(payload)
-    if not isinstance(header, dict):
-        raise ValueError(f"safetensors header is not an object: {path}")
+def _safetensors_header(path: Path) -> dict | None:
+    """JSON header of a safetensors file, or None when it cannot be read.
+
+    The tensor body is not read. A header longer than the safetensors limit
+    (100 MiB) is rejected before the payload is allocated. Any failure,
+    including a truncated or non-JSON header, logs once and returns None so
+    the caller can fall back to the file size. This must not raise: sizing
+    runs before the load's try, on every device.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw_len = handle.read(8)
+            if len(raw_len) < 8:
+                raise ValueError("header is truncated")
+            length = int.from_bytes(raw_len, "little")
+            if length > _SAFETENSORS_MAX_HEADER_BYTES:
+                raise ValueError(f"header length {length} exceeds 100 MiB")
+            payload = handle.read(length)
+        if len(payload) < length:
+            raise ValueError("header is truncated")
+        header = json.loads(payload)
+        if not isinstance(header, dict):
+            raise ValueError("header is not an object")
+    except Exception as exc:
+        print(
+            f"Text-to-image safetensors header unreadable ({path}): {exc}. "
+            "Using the file size.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
     return header
 
 
-def _header_numel(header: dict) -> int:
+def _shape_numel(shape) -> int | None:
+    """Product of a safetensors shape. None when a dim is not a non-negative int.
+
+    ``bool`` is an ``int`` subclass and is rejected. A negative dim would
+    shrink the measured size, so the whole tensor is skipped.
+    """
+    if not isinstance(shape, (list, tuple)):
+        return None
+    numel = 1
+    for dim in shape:
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 0:
+            return None
+        numel *= dim
+    return numel
+
+
+def _block_prefix(name: str) -> str | None:
+    """Module path through the first numeric segment, such as ``encoder.block.0``."""
+    parts = name.split(".")
+    for index, part in enumerate(parts):
+        if part.isdigit():
+            return ".".join(parts[: index + 1])
+    return None
+
+
+def gpu_shard_floor(max_layer: int, one_block: int) -> int:
+    """Minimum ``max_memory`` that places one block on Accelerate's main device.
+
+    ``infer_auto_device_map`` subtracts ``get_max_layer_size`` from a GPU or
+    CPU budget before it assigns any module. A budget below that reservation
+    plus one block places nothing, and ``dispatch_model`` then sets
+    ``main_device`` to CPU. *max_layer* and *one_block* are bytes in the
+    dtype the model will run.
+    """
+    layer = max(0, int(max_layer))
+    block = max(0, int(one_block))
+    if layer <= 0 and block <= 0:
+        return 0
+    step = block if block > 0 else layer
+    reserve = layer if layer > 0 else step
+    return reserve + step
+
+
+def _header_layout(header: dict) -> tuple[int, int, dict[str, int]] | None:
+    """``(numel, largest tensor numel, block-numel map)`` from one header.
+
+    Tensors whose dims are not non-negative ints are skipped. None when no
+    tensor was countable.
+    """
     total = 0
+    largest = 0
+    blocks: dict[str, int] = {}
+    counted = False
     for key, info in header.items():
         if key == "__metadata__" or not isinstance(info, dict):
             continue
-        shape = info.get("shape") or []
-        numel = 1
-        for dim in shape:
-            numel *= int(dim)
-        if numel:
-            total += numel
-    return total
+        numel = _shape_numel(info.get("shape"))
+        if numel is None:
+            continue
+        counted = True
+        total += numel
+        if numel > largest:
+            largest = numel
+        prefix = _block_prefix(str(key))
+        if prefix is not None:
+            blocks[prefix] = blocks.get(prefix, 0) + numel
+    if not counted:
+        return None
+    return total, largest, blocks
 
 
-def _weight_filenames(library: str) -> tuple[str, str]:
-    if library == "transformers":
-        return _TRANSFORMERS_WEIGHTS_NAME, _TRANSFORMERS_INDEX_NAME
-    return _DIFFUSERS_WEIGHTS_NAME, _DIFFUSERS_INDEX_NAME
+def _index_shards(index_path: Path) -> list[Path]:
+    """Unique ``weight_map`` files that exist next to *index_path*."""
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        return []
+    shards: list[Path] = []
+    seen: set[str] = set()
+    for shard in weight_map.values():
+        if not isinstance(shard, str) or shard in seen:
+            continue
+        seen.add(shard)
+        path = index_path.parent / shard
+        if path.is_file():
+            shards.append(path)
+    return shards
 
 
-def _component_checkpoint_files(folder: Path, library: str) -> list[Path]:
-    """Files one component loads from *folder* with ``variant=None``.
+def _component_checkpoint_files(folder: Path, library: str) -> tuple[list[Path], str]:
+    """Files one component would be sized from, and ``safetensors`` or ``bytes``.
 
-    An index wins over a sibling single file, matching ``_fetch_index_file``
-    then ``_get_checkpoint_shard_files``. Shard names come from ``weight_map``
-    and are counted once. A ``.fp16`` (or any other) variant is a different
-    filename and is left out.
+    ``safetensors`` files are measured as ``numel * `` the target itemsize.
+    ``bytes`` is a ``.bin`` checkpoint: the file size is the estimate and the
+    largest layer is unknown. See the filename constants above for which
+    library prefers the index.
     """
-    weights_name, index_name = _weight_filenames(library)
-    index_path = folder / index_name
-    if index_path.is_file():
-        try:
-            payload = json.loads(index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = None
-        weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
-        if isinstance(weight_map, dict) and weight_map:
-            shards: list[Path] = []
-            seen: set[str] = set()
-            for shard in weight_map.values():
-                if not isinstance(shard, str) or shard in seen:
-                    continue
-                seen.add(shard)
-                path = folder / shard
-                if path.is_file():
-                    shards.append(path)
-            if shards:
-                return shards
-    single = folder / weights_name
+    if library == "transformers":
+        single = folder / _TRANSFORMERS_WEIGHTS_NAME
+        if single.is_file():
+            return [single], "safetensors"
+        shards = _index_shards(folder / _TRANSFORMERS_INDEX_NAME)
+        if shards:
+            return shards, "safetensors"
+        bin_single = folder / _TRANSFORMERS_BIN_NAME
+        if bin_single.is_file():
+            return [bin_single], "bytes"
+        bin_shards = _index_shards(folder / _TRANSFORMERS_BIN_INDEX_NAME)
+        if bin_shards:
+            return bin_shards, "bytes"
+        return [], "safetensors"
+    shards = _index_shards(folder / _DIFFUSERS_INDEX_NAME)
+    if shards:
+        return shards, "safetensors"
+    single = folder / _DIFFUSERS_WEIGHTS_NAME
     if single.is_file():
-        return [single]
-    return []
+        return [single], "safetensors"
+    bin_shards = _index_shards(folder / _DIFFUSERS_BIN_INDEX_NAME)
+    if bin_shards:
+        return bin_shards, "bytes"
+    bin_single = folder / _DIFFUSERS_BIN_NAME
+    if bin_single.is_file():
+        return [bin_single], "bytes"
+    return [], "safetensors"
 
 
-def _runtime_tensor_bytes(files: list[Path], dtype) -> int:
-    """``numel * target itemsize`` across *files*. Headers only."""
+def _safetensors_layout(files: list[Path], dtype) -> tuple[int, int]:
+    """``(runtime bytes, GPU floor)`` for safetensors *files*.
+
+    A file whose header cannot be read, or that contains no countable tensor,
+    contributes its file size and forces the floor to 0: the largest layer
+    might be in the part we could not read. Otherwise the floor is the largest
+    tensor or repeated block, plus one block, in the target dtype.
+    """
     itemsize = int(getattr(dtype, "itemsize", 2) or 2)
     numel = 0
+    largest = 0
+    blocks: dict[str, int] = {}
+    fallback = 0
+    exact = True
     for path in files:
-        numel += _header_numel(_safetensors_header(path))
-    return numel * itemsize
+        header = _safetensors_header(path)
+        parsed = _header_layout(header) if header is not None else None
+        if parsed is None:
+            exact = False
+            if header is not None:
+                print(
+                    f"Text-to-image safetensors header has no countable tensors ({path}). "
+                    "Using the file size.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            try:
+                fallback += path.stat().st_size
+            except OSError:
+                pass
+            continue
+        file_numel, file_largest, file_blocks = parsed
+        numel += file_numel
+        if file_largest > largest:
+            largest = file_largest
+        for prefix, count in file_blocks.items():
+            blocks[prefix] = blocks.get(prefix, 0) + count
+    if not exact:
+        return numel * itemsize + fallback, 0
+    largest_block = max(blocks.values(), default=0)
+    max_layer = max(largest, largest_block)
+    one_block = largest_block or largest
+    return numel * itemsize, gpu_shard_floor(max_layer, one_block) * itemsize
 
 
-def measure_component_bytes(model_path: str, dtype) -> dict[str, int]:
-    """Runtime bytes of the checkpoint each ``model_index.json`` component loads.
+def _file_size_layout(files: list[Path], component: str) -> tuple[int, int]:
+    """File-byte estimate. The GPU floor is 0 because no layer size is known."""
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    if total > 0:
+        print(
+            f"Text-to-image sized {component} from file bytes ({total} bytes); "
+            "the largest layer is unknown, so it gets no GPU shard.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return total, 0
 
-    The size is the cast dtype, not the stored width: an fp32 or fp8 file loaded
-    as fp16 occupies ``numel * 2``. Components that are not a subdirectory are
-    skipped; ``from_pretrained`` would load those from the repo root and a root
-    single-file checkpoint is not one of them.
+
+def measure_component_layouts(model_path: str, dtype) -> dict[str, tuple[int, int]]:
+    """``name -> (runtime bytes, GPU floor)`` for each loaded component.
+
+    The size is the cast dtype, not the stored width: an fp32 or fp8 file
+    loaded as fp16 occupies ``numel * 2``. The floor is the Accelerate
+    reservation for one block on the GPU, or 0 when the layer size is
+    unknown. Components that are not a subdirectory are skipped.
     """
     index = _read_model_index(model_path)
     root = Path(model_path)
-    sizes: dict[str, int] = {}
+    layouts: dict[str, tuple[int, int]] = {}
     for name, value in index.items():
         if name.startswith("_") or not isinstance(value, list) or len(value) != 2:
             continue
         folder = root / name
         if not folder.is_dir():
             continue
-        files = _component_checkpoint_files(folder, str(value[0]))
+        files, kind = _component_checkpoint_files(folder, str(value[0]))
         if not files:
             continue
-        nbytes = _runtime_tensor_bytes(files, dtype)
+        if kind == "safetensors":
+            nbytes, floor = _safetensors_layout(files, dtype)
+        else:
+            nbytes, floor = _file_size_layout(files, name)
         if nbytes > 0:
-            sizes[name] = nbytes
-    return sizes
+            layouts[name] = (nbytes, floor)
+    return layouts
+
+
+def measure_component_bytes(model_path: str, dtype) -> dict[str, int]:
+    """Runtime bytes of the checkpoint each ``model_index.json`` component loads."""
+    return {name: size for name, (size, _floor) in measure_component_layouts(model_path, dtype).items()}
+
+
+def _sizes_from_layouts(layouts: dict[str, tuple[int, int]]) -> dict[str, int]:
+    return {name: int(size) for name, (size, _floor) in layouts.items()}
+
+
+def _floors_from_layouts(layouts: dict[str, tuple[int, int]]) -> dict[str, int]:
+    return {name: int(floor) for name, (_size, floor) in layouts.items()}
 
 
 def _available_ram_bytes() -> int | None:
@@ -453,33 +643,10 @@ def _prepare_disk_offload(model_path: str, nbytes: int) -> Path:
     return root
 
 
-def _offload_disk_bytes(weight_bytes: int, dtype) -> int:
-    """Scale a 2-byte-per-value estimate to *dtype*.
-
-    Callers that already measured ``numel * itemsize`` from safetensors headers
-    must not use this. It remains for a raw byte count that assumed fp16 storage.
-    """
-    itemsize = int(getattr(dtype, "itemsize", 2) or 2)
-    return max(weight_bytes, weight_bytes * itemsize // 2)
-
-
 def _resident_fraction(device: str) -> float:
     if device == "cpu":
         return _CPU_RAM_RESIDENT_FRACTION
     return _RAM_RESIDENT_FRACTION
-
-
-def _weights_need_disk_offload(device: str, available: int | None, weights: int, dtype) -> bool:
-    """True when a 2-byte checkpoint estimate would exceed the resident RAM share.
-
-    CPU uses ``_CPU_RAM_RESIDENT_FRACTION`` and doubles a float32 load. CUDA
-    compares the estimate to ``_RAM_RESIDENT_FRACTION``. Loads that can read
-    headers use :func:`measure_component_bytes` instead of this estimate.
-    """
-    if device not in ("cuda", "cpu") or available is None:
-        return False
-    resident = _offload_disk_bytes(weights, dtype) if device == "cpu" else weights
-    return resident > int(available * _resident_fraction(device))
 
 
 def _resident_exceeds(device: str, available: int | None, resident: int) -> bool:
@@ -534,22 +701,24 @@ def select_cuda_tier(
     component_bytes: dict[str, int],
     free_vram: int,
     available_ram: int | None,
-    dtype,
     extra_bytes: int = 0,
 ) -> str:
     """Pick a CUDA placement from runtime component sizes and free memory.
 
     *component_bytes* and *extra_bytes* are already ``numel * `` the target
-    itemsize (see :func:`measure_component_bytes`). *dtype* is unused; it is
-    kept so callers can show which cast the sizes belong to. ``extra_bytes``
-    count toward the RAM and VRAM totals but not toward the largest component.
-    The loader passes 0: a root single-file checkpoint is not loaded.
+    itemsize (see :func:`measure_component_bytes`), or a file-size estimate
+    when the checkpoint is not safetensors. ``extra_bytes`` count toward the
+    RAM and VRAM totals but not toward the largest component. The loader
+    passes 0: a root single-file checkpoint is not loaded.
+
+    An empty measurement (no safetensors and no file-size fallback) does not
+    mean the weights fit on the GPU. That load starts at ``model_cpu_offload``
+    so a ``.bin``-only repo we failed to size is not placed with ``pipe.to``.
 
     Non-denoiser modules are leaf-offloaded even when this returns
     ``group_offload``, so a text encoder larger than VRAM does not onload as
     one group. See :func:`_offload_type_for_component`.
     """
-    del dtype
     total = sum(component_bytes.values()) + max(0, int(extra_bytes))
     largest = max(component_bytes.values(), default=0)
     usable = int(free_vram) - _ACTIVATION_HEADROOM_BYTES
@@ -559,7 +728,9 @@ def select_cuda_tier(
     # from_pretrained stages weights in RAM even when the GPU could hold them.
     if total > 0 and exceeds_ram:
         return TIER_DISK
-    if total <= 0 or (usable > 0 and total <= usable):
+    if total <= 0:
+        return TIER_MODEL
+    if usable > 0 and total <= usable:
         return TIER_CUDA
     if usable > 0 and largest <= usable:
         return TIER_MODEL
@@ -583,26 +754,65 @@ def _next_cuda_tier(tier: str) -> str | None:
     return order[1]
 
 
-def _note_tier_limit(model_path: str, failed_tier: str) -> str | None:
-    """Remember the next lower tier for *model_path*. None at the disk tier."""
+def _note_tier_limit(
+    model_path: str,
+    failed_tier: str,
+    free_vram: int | None = None,
+) -> str | None:
+    """Remember the next lower tier for *model_path*. None at the disk tier.
+
+    The first call records *free_vram* (or a live sample when it is omitted).
+    Later drops do not overwrite that sample: the growth check compares
+    against the free VRAM from when the cap was set.
+    """
+    model_path = str(Path(model_path).resolve())
     nxt = _next_cuda_tier(failed_tier)
     if nxt is None:
         return None
     current = _cuda_tier_limits.get(model_path)
     if current is None or _CUDA_TIER_ORDER.index(nxt) > _CUDA_TIER_ORDER.index(current):
         _cuda_tier_limits[model_path] = nxt
+    if model_path not in _cuda_tier_limit_vram:
+        if free_vram is None:
+            free_vram = _free_vram_bytes()
+        if free_vram is not None:
+            _cuda_tier_limit_vram[model_path] = int(free_vram)
     return nxt
 
 
 def clear_cuda_tier_limit(model_path: str) -> None:
     """Forget a lowered tier for *model_path*.
 
-    The cap is read once at the start of a load, so the immediate retry still
-    uses it. A successful load of that model clears it, and so does an explicit
-    unload. A later load measures free memory again instead of keeping a cap
-    that was only true during GPU contention.
+    An explicit unload calls this. A successful load does not: an
+    activation-sized out-of-memory error would otherwise pay for a full
+    reload on every later load of the same model. Free VRAM that has grown
+    by more than ``_TIER_LIMIT_VRAM_GROWTH_BYTES`` also clears it, in
+    :func:`cuda_tier_limit_for`.
     """
-    _cuda_tier_limits.pop(str(Path(model_path).resolve()), None)
+    resolved = str(Path(model_path).resolve())
+    _cuda_tier_limits.pop(resolved, None)
+    _cuda_tier_limit_vram.pop(resolved, None)
+
+
+def cuda_tier_limit_for(model_path: str, free_vram: int | None) -> str | None:
+    """The tier cap for *model_path*, or None when it no longer applies.
+
+    The cap is kept when no free-VRAM sample was stored. It is dropped when
+    *free_vram* is more than 1 GiB above the sample from when the cap was set.
+    """
+    resolved = str(Path(model_path).resolve())
+    cap = _cuda_tier_limits.get(resolved)
+    if cap is None:
+        return None
+    recorded = _cuda_tier_limit_vram.get(resolved)
+    if (
+        free_vram is not None
+        and recorded is not None
+        and int(free_vram) > int(recorded) + _TIER_LIMIT_VRAM_GROWTH_BYTES
+    ):
+        clear_cuda_tier_limit(resolved)
+        return None
+    return cap
 
 
 def lower_cuda_tier_after_oom(pipe) -> bool:
@@ -615,12 +825,14 @@ def lower_cuda_tier_after_oom(pipe) -> bool:
 
 
 def _denoiser_gpu_budget(free_vram: int | None, small_bytes: int) -> int:
-    """GPU bytes for the denoiser on the Accelerate disk path.
+    """Spare GPU bytes offered to large components on the Accelerate disk path.
 
     Most of free VRAM, after the activation headroom and the small components
     that are moved onto the GPU whole. When that spare is below
-    ``_MIN_GPU_OFFLOAD_BYTES``, use half of free VRAM so a small card still
-    runs, leaving a sliver for activations.
+    ``_MIN_GPU_OFFLOAD_BYTES``, use half of what remains after a sliver so a
+    small card still has an offer. The offer is not itself a placement: a
+    component whose floor (largest layer plus one block) is above the offer
+    gets no GPU budget. See :func:`_gpu_budget_grant`.
     """
     if not free_vram or free_vram <= 0:
         return 0
@@ -630,18 +842,11 @@ def _denoiser_gpu_budget(free_vram: int | None, small_bytes: int) -> int:
     if spare >= _MIN_GPU_OFFLOAD_BYTES:
         return spare
     # The headroom does not fit. Keep the small components and a sliver, and
-    # give the denoiser at most half of what is left so the first step can run.
+    # offer the denoiser at most half of what is left so the first step can run.
     remain = free - small - _GPU_SLIVER_BYTES
     if remain < _MIN_GPU_OFFLOAD_BYTES:
-        budget = max(0, remain)
-    else:
-        budget = min(int(remain * 0.5), remain)
-    # A few mebibytes does not fit a denoiser block, and a zero budget makes
-    # Accelerate set ``main_device`` to CPU so the whole forward stays there.
-    # When the card can hold the minimum shard, use that instead of the remainder.
-    if budget < _MIN_GPU_OFFLOAD_BYTES <= free:
-        return _MIN_GPU_OFFLOAD_BYTES
-    return budget
+        return max(0, remain)
+    return min(int(remain * 0.5), remain)
 
 
 def _split_cpu_budgets(sizes: dict[str, int], total_budget: int) -> dict[str, int]:
@@ -673,33 +878,61 @@ def _split_cpu_budgets(sizes: dict[str, int], total_budget: int) -> dict[str, in
     return budgets
 
 
+def _gpu_budget_grant(spare: int, size: int, floor: int, keep: int) -> int:
+    """GPU ``max_memory`` for one component, or 0 when it would not be placed.
+
+    *floor* is :func:`gpu_shard_floor` for this component. A positive grant
+    is never below that floor: Accelerate would reserve the largest layer
+    and then place nothing. When the component is smaller than the floor
+    (the whole module is one block), the grant is the floor rather than the
+    component size. *keep* is the floor that must remain for the denoiser
+    before this component may take a slice. A floor of 0 means the largest
+    layer is unknown, so no shard is published.
+    """
+    spare = max(0, int(spare))
+    floor = max(0, int(floor))
+    keep = max(0, int(keep))
+    if floor <= 0 or spare < floor or spare - floor < keep:
+        return 0
+    full = max(int(size), floor)
+    if spare - full >= keep:
+        return min(spare, full)
+    # The denoiser (keep == 0) takes every remaining byte once one block fits.
+    # An encoder leaves the rest for the denoiser and takes only its floor.
+    if keep == 0:
+        return spare
+    return floor
+
+
 def _disk_component_gpu_budgets(
     large: dict[str, int],
     small_bytes: int,
     free_vram: int | None,
+    gpu_floors: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """GPU ``max_memory`` for each large component on the CUDA disk tier.
 
     Accelerate's device map is static. A component whose budget is only CPU
     and disk has no parameter on the GPU, so ``dispatch_model`` sets
-    ``main_device`` to CPU and the forward runs there — a bf16 text encoder
-    then encodes the prompt on the CPU. A non-zero GPU budget keeps execution
-    on the GPU, and that slice stays resident for the whole denoise because
-    the map is not streamed.
+    ``main_device`` to CPU and the forward runs there. A non-zero GPU budget
+    keeps execution on the GPU only when it is at least the largest no-split
+    layer plus one block, and that slice stays resident for the whole denoise
+    because the map is not streamed.
 
-    Each text encoder therefore takes its full cast size when the denoiser
-    still keeps at least ``_MIN_GPU_OFFLOAD_BYTES``, and otherwise one minimum
-    shard so prompt encoding stays on the GPU without parking the whole
-    encoder beside the denoiser. The denoiser gets what remains. A remainder
-    below the minimum shard is raised when free VRAM can hold the shard;
-    otherwise the entry stays 0 and the loader logs that the denoiser forward
-    stays on the CPU.
+    Text encoders, smallest first, take their full cast size when the
+    denoiser still keeps its own floor, and otherwise that floor alone.
+    Anything the card cannot afford is 0. The loader logs where each
+    component will run. Unknown floors (a ``.bin`` file-size estimate, or a
+    header we could not read) are 0: a fixed 512 MiB shard does not place a
+    T5 or Flux block.
     """
+    floors = gpu_floors or {}
     assigned = {name: 0 for name in large}
     denoiser = _preferred_gpu_component(large)
     if denoiser is None:
         return assigned
-    budget = _denoiser_gpu_budget(free_vram, small_bytes)
+    spare = _denoiser_gpu_budget(free_vram, small_bytes)
+    denoiser_floor = int(floors.get(denoiser, 0) or 0)
     encoders = sorted(
         (
             name
@@ -709,16 +942,10 @@ def _disk_component_gpu_budgets(
         key=lambda name: large[name],
     )
     for name in encoders:
-        size = large[name]
-        if budget - size >= _MIN_GPU_OFFLOAD_BYTES:
-            assigned[name] = size
-            budget -= size
-        elif budget - _MIN_GPU_OFFLOAD_BYTES >= _MIN_GPU_OFFLOAD_BYTES:
-            assigned[name] = _MIN_GPU_OFFLOAD_BYTES
-            budget -= _MIN_GPU_OFFLOAD_BYTES
-    if 0 < budget < _MIN_GPU_OFFLOAD_BYTES and int(free_vram or 0) >= _MIN_GPU_OFFLOAD_BYTES:
-        budget = _MIN_GPU_OFFLOAD_BYTES
-    assigned[denoiser] = max(0, budget)
+        grant = _gpu_budget_grant(spare, large[name], int(floors.get(name, 0) or 0), denoiser_floor)
+        assigned[name] = grant
+        spare -= grant
+    assigned[denoiser] = _gpu_budget_grant(spare, large[denoiser], denoiser_floor, 0)
     return assigned
 
 
@@ -748,11 +975,12 @@ def _component_disk_budgets(
     available_ram: int,
     free_vram: int | None = None,
     cuda_visible: bool = False,
+    gpu_floors: dict[str, int] | None = None,
 ) -> dict[str, dict]:
     """Per-component Accelerate ``max_memory`` for the disk path.
 
-    CUDA gives the denoiser most of the spare VRAM and a text encoder enough
-    to run prompt encoding on the GPU (see :func:`_disk_component_gpu_budgets`).
+    CUDA offers spare VRAM and then drops any grant that cannot hold the
+    largest layer plus one block (see :func:`_disk_component_gpu_budgets`).
     CPU loads use the equal 0.28 split and publish a zero GPU budget when CUDA
     is visible, so a fallback after an out-of-memory error does not place
     weights on the GPU.
@@ -763,7 +991,7 @@ def _component_disk_budgets(
     if device != "cuda":
         return _cpu_disk_budgets(large, available_ram, cuda_visible)
     cpu_budgets = _split_cpu_budgets(large, int(available_ram * _RAM_RESIDENT_FRACTION))
-    gpu_budgets = _disk_component_gpu_budgets(large, small, free_vram)
+    gpu_budgets = _disk_component_gpu_budgets(large, small, free_vram, gpu_floors)
     budgets: dict[str, dict] = {}
     for name, cpu_bytes in cpu_budgets.items():
         budgets[name] = {"cpu": cpu_bytes, 0: gpu_budgets.get(name, 0)}
@@ -1080,6 +1308,82 @@ def _enable_vae_tiling(pipe) -> bool:
     return True
 
 
+# Pipelines whose ``__call__`` decodes in ``vae.dtype`` and does not upcast.
+# SDXL (and SD1.5 via ``force_upcast``) already does ``pipe.vae.to(float32)``
+# inside the deprecated ``upcast_vae``. Flux, SD3, and Qwen do not.
+_FP16_VAE_UPCAST_MARKERS = ("flux", "stablediffusion3", "qwen")
+
+
+def _vae_needs_fp16_upcast(pipe) -> bool:
+    """True when an fp16 VAE should be moved to fp32 before placement.
+
+    ``vae.config.force_upcast`` is what SDXL checks. Flux, Stable Diffusion 3,
+    and Qwen pipelines are matched by class name because their decode path
+    uses ``vae.dtype`` and never upcasts. The VAE class counts too, so a
+    wrapper around ``AutoencoderKLFlux2`` still matches.
+    """
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        return False
+    config = getattr(vae, "config", None)
+    if isinstance(config, dict):
+        force = bool(config.get("force_upcast"))
+    else:
+        force = bool(getattr(config, "force_upcast", False)) if config is not None else False
+    if force:
+        return True
+    blob = f"{type(pipe).__name__} {type(vae).__name__}".lower()
+    return any(marker in blob for marker in _FP16_VAE_UPCAST_MARKERS)
+
+
+def _upcast_vae_for_fp16(pipe, dtype) -> bool:
+    """Move the VAE to fp32 for an fp16 load that is known to need it.
+
+    Called after the pipeline exists and before offload hooks or ``.to``, so
+    those hooks store fp32 VAE weights. Diffusers' own advice for the SDXL
+    helper is ``pipe.vae.to(torch.float32)`` (the ``upcast_vae`` deprecation).
+    Doing it here also covers Flux, SD3, and Qwen, which decode in
+    ``vae.dtype`` and would otherwise run the VAE in fp16.
+
+    fp16 on compute capability below 8 can overflow those VAEs (inferred from
+    the missing upcast, not from a GPU run). Emulated bf16 for the whole
+    model was not chosen: ``is_bf16_supported(including_emulation=True)`` is
+    what Turing reports, and it is slower than the hardware dtype these
+    pipelines ship with. This only changes the VAE.
+
+    Residual risk: the denoiser and the text encoders stay fp16. A NaN from
+    the transformer is not repaired by an fp32 decode.
+    """
+    if _dtype_name(dtype) != "float16":
+        return False
+    if not _vae_needs_fp16_upcast(pipe):
+        return False
+    vae = getattr(pipe, "vae", None)
+    to = getattr(vae, "to", None)
+    if not callable(to):
+        return False
+    import torch
+
+    try:
+        to(dtype=torch.float32)
+    except Exception as exc:
+        print(
+            f"Text-to-image could not upcast the VAE to fp32: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    print(
+        "Text-to-image VAE is fp32 for this fp16 run "
+        "(force_upcast, or a Flux, SD3, or Qwen pipeline). "
+        "The denoiser and text encoders stay fp16; on compute capability "
+        "below 8 those can still produce NaNs.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
+
+
 def _large_component_load_kwargs(dtype, budgets: dict, offload_folder: str) -> dict:
     """Keyword arguments for one component loaded through Accelerate.
 
@@ -1099,6 +1403,23 @@ def _large_component_load_kwargs(dtype, budgets: dict, offload_folder: str) -> d
     }
 
 
+def _disk_gpu_run_note(name: str, gpu_budget: int, floor: int) -> str:
+    """Where one disk-tier component will execute, matching the budget we pass."""
+    if gpu_budget > 0:
+        return (
+            f"{name} runs on GPU "
+            f"(budget {_format_gib(gpu_budget)}, floor {_format_gib(floor)})"
+        )
+    if floor <= 0:
+        return (
+            f"{name} runs on CPU (largest layer is unknown, so no GPU shard is assigned)"
+        )
+    return (
+        f"{name} runs on CPU (free VRAM cannot hold the largest layer plus one block; "
+        f"floor {_format_gib(floor)})"
+    )
+
+
 def _load_disk_offloaded(
     model_path: str,
     dtype,
@@ -1106,6 +1427,7 @@ def _load_disk_offloaded(
     *,
     available_ram: int | None = None,
     free_vram: int | None = None,
+    layouts: dict[str, tuple[int, int]] | None = None,
 ):
     """Load components that do not fit in RAM with Accelerate disk offload.
 
@@ -1119,16 +1441,20 @@ def _load_disk_offloaded(
     ``device_map`` memmap does free the overflow. CPU loads keep this path:
     group-offload streams require a CUDA onload device.
 
-    On CUDA the denoiser gets free VRAM minus the activation headroom, and each
-    text encoder gets a GPU budget so prompt encoding is not a bf16 CPU
-    forward. That GPU slice stays resident during denoising. See
+    On CUDA a component gets a GPU budget only when that budget can hold its
+    largest layer plus one block. The slice stays resident during denoising.
+    A smaller budget would leave ``main_device`` on CPU, so it is published
+    as 0 and the log says the component runs on CPU. See
     ``_disk_component_gpu_budgets``.
     """
     from diffusers import DiffusionPipeline
 
     index = _read_model_index(model_path)
     root = Path(model_path)
-    cast = measure_component_bytes(model_path, dtype)
+    if layouts is None:
+        layouts = measure_component_layouts(model_path, dtype)
+    cast = _sizes_from_layouts(layouts)
+    floors = _floors_from_layouts(layouts)
     large, _small = _partition_components(cast)
     if available_ram is None:
         available_ram = _available_ram_bytes() or (6 * 1024**3)
@@ -1140,28 +1466,18 @@ def _load_disk_offloaded(
         available_ram=available_ram,
         free_vram=free_vram,
         cuda_visible=device == "cuda" or _cuda_is_visible(),
+        gpu_floors=floors,
     )
     offload_bytes = sum(large.values())
     offload_root = _prepare_disk_offload(model_path, offload_bytes)
     try:
-        gpu_name = _preferred_gpu_component(large) if device == "cuda" else None
-        gpu_budget = budgets.get(gpu_name or "", {}).get(0, 0)
         gpu_note = ""
-        if device == "cuda":
-            if gpu_budget < _MIN_GPU_OFFLOAD_BYTES:
-                gpu_note = (
-                    " Free VRAM is below the minimum denoiser shard, so the "
-                    "denoiser forward stays on CPU."
-                )
-            else:
-                gpu_note = f" Denoiser GPU budget {_format_gib(gpu_budget)}."
-            encoder_notes = [
-                f"{name} {_format_gib(entry.get(0, 0))}"
-                for name, entry in sorted(budgets.items())
-                if name.startswith("text_encoder") and entry.get(0, 0) > 0
+        if device == "cuda" and large:
+            notes = [
+                _disk_gpu_run_note(name, budgets.get(name, {}).get(0, 0), floors.get(name, 0))
+                for name in sorted(large)
             ]
-            if encoder_notes:
-                gpu_note += " Text encoder GPU budget " + ", ".join(encoder_notes) + "."
+            gpu_note = " " + ". ".join(notes) + "."
         print(
             "Text-to-image weights are larger than available RAM; "
             f"offloading them to {offload_root}.{gpu_note}",
@@ -1184,6 +1500,7 @@ def _load_disk_offloaded(
             local_files_only=True,
             **preloaded,
         )
+        _upcast_vae_for_fp16(pipe, dtype)
         _place_unmapped_modules(pipe, device)
         if device != "cuda":
             _keep_sampling_off_meta(pipe)
@@ -1321,6 +1638,7 @@ def _place_cuda_tier(
     available_ram: int | None,
     free_vram: int | None,
     pre_pin: bool | None = None,
+    layouts: dict[str, tuple[int, int]] | None = None,
 ):
     """Load *model_path* and apply one CUDA tier. The caller retries on failure.
 
@@ -1339,12 +1657,16 @@ def _place_cuda_tier(
                 "cuda",
                 available_ram=available_ram,
                 free_vram=free_vram,
+                layouts=layouts,
             )
         pipe = DiffusionPipeline.from_pretrained(
             model_path,
             torch_dtype=dtype,
             local_files_only=True,
         )
+        # Before hooks and ``.to``, so a group-offload or CPU-offload copy of
+        # the VAE is already fp32. See ``_upcast_vae_for_fp16``.
+        _upcast_vae_for_fp16(pipe, dtype)
         if tier == TIER_CUDA:
             moved = pipe.to("cuda")
             if moved is not None:
@@ -1367,27 +1689,30 @@ def _place_cuda_tier(
         raise
 
 
-def _load_cuda_pipeline(model_path: str, dtype, available_ram: int | None, free_vram: int | None):
+def _load_cuda_pipeline(
+    model_path: str,
+    dtype,
+    available_ram: int | None,
+    free_vram: int | None,
+    layouts: dict[str, tuple[int, int]] | None = None,
+):
     """Load a CUDA pipeline, dropping a tier when the choice does not fit.
 
     A group-offload tier that pinned host memory and then ran out of GPU memory
     is retried once on the same tier with ``pre_pin=False`` before the next
     tier. Pinning failures are reported as CUDA out of memory. The retry pins
     on the fly (``low_cpu_mem_usage=True``), which costs the stream overlap a
-    pre-pinned duplicate would have given. The tier cap recorded for an
-    out-of-memory drop is cleared after this load succeeds so a later load of
-    the same model measures again. The cap still applies to this call: it was
-    read into ``tiers`` before the attempts.
+    pre-pinned duplicate would have given. A tier cap from an earlier
+    out-of-memory error is kept after this load succeeds. It is cleared by an
+    explicit unload, or when free VRAM has grown by more than 1 GiB since the
+    cap was set (see :func:`cuda_tier_limit_for`).
     """
     resolved = str(Path(model_path).resolve())
-    cast = measure_component_bytes(model_path, dtype)
-    preferred = select_cuda_tier(
-        cast,
-        free_vram or 0,
-        available_ram,
-        dtype,
-    )
-    tiers = cuda_tiers_from(preferred, _cuda_tier_limits.get(resolved))
+    if layouts is None:
+        layouts = measure_component_layouts(model_path, dtype)
+    cast = _sizes_from_layouts(layouts)
+    preferred = select_cuda_tier(cast, free_vram or 0, available_ram)
+    tiers = cuda_tiers_from(preferred, cuda_tier_limit_for(resolved, free_vram))
     dtype_name = _dtype_name(dtype)
 
     def publish(pipe, tier: str):
@@ -1412,6 +1737,7 @@ def _load_cuda_pipeline(model_path: str, dtype, available_ram: int | None, free_
                 available_ram=available_ram,
                 free_vram=free_vram,
                 pre_pin=pre_pin,
+                layouts=layouts,
             )
         except Exception as exc:
             if not pre_pin or not _is_cuda_oom_error(exc):
@@ -1437,15 +1763,14 @@ def _load_cuda_pipeline(model_path: str, dtype, available_ram: int | None, free_
             available_ram=available_ram,
             free_vram=free_vram,
             pre_pin=False,
+            layouts=layouts,
         )
         return publish(pipe, tier)
 
     def on_drop(failed: str, _nxt: str) -> None:
-        _note_tier_limit(resolved, failed)
+        _note_tier_limit(resolved, failed, free_vram)
 
-    pipe = _run_placement_attempts(tiers, attempt, on_drop)
-    clear_cuda_tier_limit(resolved)
-    return pipe
+    return _run_placement_attempts(tiers, attempt, on_drop)
 
 
 def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: bool = False):
@@ -1484,17 +1809,24 @@ def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: 
 
     available = _available_ram_bytes()
     generation = _active_offload_generation
-    resident = sum(measure_component_bytes(model_path, dtype).values())
+    # One header pass. The CUDA and disk loaders reuse it.
+    layouts = measure_component_layouts(model_path, dtype)
+    resident = sum(_sizes_from_layouts(layouts).values())
     if device == "cuda":
-        pipe = _load_cuda_pipeline(model_path, dtype, available, _free_vram_bytes())
+        pipe = _load_cuda_pipeline(
+            model_path, dtype, available, _free_vram_bytes(), layouts
+        )
     elif _resident_exceeds(device, available, resident):
-        pipe = _load_disk_offloaded(model_path, dtype, device, available_ram=available)
+        pipe = _load_disk_offloaded(
+            model_path, dtype, device, available_ram=available, layouts=layouts
+        )
     else:
         pipe = DiffusionPipeline.from_pretrained(
             model_path,
             torch_dtype=dtype,
             local_files_only=True,
         )
+        _upcast_vae_for_fp16(pipe, dtype)
         pipe = pipe.to(device)
     loaded_name = type(pipe).__name__
     if _class_name_rejected(loaded_name, allow_img2img=allow_img2img):
