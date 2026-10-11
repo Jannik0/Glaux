@@ -1279,20 +1279,25 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       await assertStillPending(settledB);
       // The resumed download and the one started during this stop each stat
       // before they park. The exit wait stays open until both have.
+      // Resume order is park-finish order, which follows whichever stat
+      // returns first. Resolve each new RPC as it appears.
+      const beforeKill = inflight.length;
       await releaseKillAfterPark(secondWatch, 2);
-
-      await waitFor(
-        () => engineManager.getStatus().phase === 'idle' && inflight.filter((item) => item.modelId === 'org/resume-a').length === 3
+      const resolved = new Set();
+      await waitFor(() => {
+        for (const item of inflight.slice(beforeKill)) {
+          if (!item.done && !resolved.has(item)) {
+            resolved.add(item);
+            item.done = true;
+            item.resolve();
+          }
+        }
+        return resolved.size === 2;
+      });
+      assert.deepEqual(
+        [...resolved].map((item) => item.modelId).sort(),
+        ['org/during-second', 'org/resume-a']
       );
-      const thirdA = inflight.filter((item) => item.modelId === 'org/resume-a')[2];
-      thirdA.done = true;
-      thirdA.resolve();
-      await waitFor(
-        () => inflight.filter((item) => item.modelId === 'org/during-second').length === 2
-      );
-      const secondB = inflight.filter((item) => item.modelId === 'org/during-second')[1];
-      secondB.done = true;
-      secondB.resolve();
       assert.equal(await settledA, 'ok');
       assert.equal(await settledB, 'ok');
       assert.equal(

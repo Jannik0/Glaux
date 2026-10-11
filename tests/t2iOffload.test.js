@@ -2194,6 +2194,81 @@ assert "VAE is fp32" not in partial_text, partial_text
 for param in partial.parameters():
     assert param.dtype == torch.float16, param.dtype
 
+class TypelessPartialVae:
+    """No ``dtype`` attribute. The failed upcast restores the pipeline dtype."""
+
+    def __init__(self):
+        self.keep = nn.Linear(2, 2, bias=False).to(dtype=torch.float16)
+        self.moved = nn.Linear(2, 2, bias=False).to(dtype=torch.float16)
+        self.decode = plain_decode
+        self.encode = plain_encode
+        self.calls = []
+
+    def to(self, *args, **kwargs):
+        dtype = kwargs.get("dtype")
+        self.calls.append(dtype)
+        self.moved.to(dtype=dtype)
+        if dtype == torch.float32:
+            raise RuntimeError("upcast stopped after one parameter")
+        self.keep.to(dtype=dtype)
+        return self
+
+typeless = TypelessPartialVae()
+assert not hasattr(typeless, "dtype")
+typeless_pipe = type("TypelessPipe", (), {})()
+typeless_pipe.vae = typeless
+typeless_log = io.StringIO()
+sys.stderr = typeless_log
+try:
+    assert t2i._prepare_fp16_vae(typeless_pipe, torch.float16) is False
+finally:
+    sys.stderr = _err
+typeless_text = typeless_log.getvalue()
+assert "could not upcast the VAE to fp32" in typeless_text, typeless_text
+assert "original dtype was not available" not in typeless_text, typeless_text
+assert typeless.calls == [torch.float32, torch.float16], typeless.calls
+assert typeless.moved.weight.dtype == torch.float16
+assert typeless.keep.weight.dtype == torch.float16
+
+class RestoreFailsVae(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.keep = nn.Linear(2, 2, bias=False)
+        self.moved = nn.Linear(2, 2, bias=False)
+        self.keep.to(dtype=torch.float16)
+        self.moved.to(dtype=torch.float16)
+        self.decode = plain_decode
+        self.encode = plain_encode
+
+    @property
+    def dtype(self):
+        return self.keep.weight.dtype
+
+    def to(self, *args, **kwargs):
+        dtype = kwargs.get("dtype")
+        if dtype == torch.float32:
+            self.moved.to(dtype=dtype)
+            raise RuntimeError("upcast stopped after one parameter")
+        raise RuntimeError("restore failed\nsecond line")
+
+restore_fail = RestoreFailsVae()
+restore_pipe = type("RestoreFailPipe", (), {})()
+restore_pipe.vae = restore_fail
+restore_log = io.StringIO()
+sys.stderr = restore_log
+try:
+    assert t2i._prepare_fp16_vae(restore_pipe, torch.float16) is False
+finally:
+    sys.stderr = _err
+restore_text = restore_log.getvalue()
+assert "could not upcast the VAE to fp32" in restore_text, restore_text
+assert "could not restore the VAE dtype after a failed fp32 upcast" in restore_text, restore_text
+assert "RuntimeError: restore failed" in restore_text, restore_text
+assert "second line" not in restore_text, restore_text
+assert "VAE is fp32" not in restore_text, restore_text
+assert restore_fail.moved.weight.dtype == torch.float32
+assert restore_fail.keep.weight.dtype == torch.float16
+
 class HookBoom:
     def maybe_free_model_hooks(self):
         raise RuntimeError("hook release failed\nsecond line")

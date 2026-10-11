@@ -1599,19 +1599,13 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
             flush=True,
         )
         # ``to`` may have moved some parameters before raising. Put the whole
-        # VAE back on the dtype it had, so decode does not mix fp16 and fp32.
-        if original_dtype is None:
-            print(
-                "Text-to-image could not restore the VAE dtype after the failed "
-                "upcast: the original dtype was not available.",
-                file=sys.stderr,
-                flush=True,
-            )
-        else:
-            try:
-                to(dtype=original_dtype)
-            except Exception as restore_exc:
-                _log_ignored("restore the VAE dtype after a failed fp32 upcast", restore_exc)
+        # VAE back on one dtype so decode does not mix fp16 and fp32. A VAE
+        # with no ``dtype`` was loaded as the pipeline dtype.
+        restore_dtype = original_dtype if original_dtype is not None else dtype
+        try:
+            to(dtype=restore_dtype)
+        except Exception as restore_exc:
+            _log_ignored("restore the VAE dtype after a failed fp32 upcast", restore_exc)
         return False
     extra = _fp32_vae_extra_bytes(vae)
     extra_note = (
