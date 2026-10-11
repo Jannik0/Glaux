@@ -28,6 +28,7 @@ const {
   handleEngineStreamStart,
   requestWorkerReload,
 } = require('../src/main/domains/engineBridge');
+const { buildEngineStatusForRenderer } = require('../src/main/domains/engineCore');
 
 const WORKER_PID = 4321;
 
@@ -40,6 +41,9 @@ const original = {
   chatStop: hf.chatStop,
   workerPid: hf.workerPid,
   downloadModel: hf.downloadModel,
+  cancelDownloadModel: hf.cancelDownloadModel,
+  chatbotSupportsThinking: hf.chatbotSupportsThinking,
+  chatbotHasChatTemplate: hf.chatbotHasChatTemplate,
 };
 
 function delay(ms) {
@@ -96,6 +100,18 @@ function contextShape(messages) {
       text,
       image: image ? image.relativePath : null,
     };
+  });
+}
+
+function referencedTimeouts() {
+  if (typeof process._getActiveHandles !== 'function') {
+    return [];
+  }
+  return process._getActiveHandles().filter((handle) => {
+    if (!handle || typeof handle.hasRef !== 'function' || !handle.hasRef()) {
+      return false;
+    }
+    return Boolean(handle.constructor && handle.constructor.name === 'Timeout');
   });
 }
 
@@ -190,6 +206,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     hf.downloadModel = async () => {
       throw new Error('unexpected download');
     };
+    hf.cancelDownloadModel = async () => {};
+    hf.chatbotSupportsThinking = async () => false;
+    hf.chatbotHasChatTemplate = async () => false;
     hf.close = (options = {}) => {
       const final = options.final !== false;
       closes.push({ final });
@@ -225,6 +244,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     hf.chatStop = original.chatStop;
     hf.workerPid = original.workerPid;
     hf.downloadModel = original.downloadModel;
+    hf.cancelDownloadModel = original.cancelDownloadModel;
+    hf.chatbotSupportsThinking = original.chatbotSupportsThinking;
+    hf.chatbotHasChatTemplate = original.chatbotHasChatTemplate;
     engineManager.setDiffusersOffloadBaseDirs(null);
     engineManager.setDiffusersWorkerExitMs(engineManager.DIFFUSERS_WORKER_EXIT_MS);
     engineManager.setDiffusersStopGraceMs(engineManager.DIFFUSERS_STOP_GRACE_MS);
@@ -842,6 +864,426 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     assert.equal(hf.activeDownloadRpcId(), 9);
     await original.close({ final: false });
     assert.equal(hf.activeDownloadRpcId(), null);
+  });
+
+  async function beginHungResume(modelId) {
+    let calls = 0;
+    const events = [];
+    let resumeResolve = null;
+    let resumeReject = null;
+    hf.downloadModel = () => {
+      calls += 1;
+      return new Promise((resolve, reject) => {
+        if (calls === 1) {
+          rejectDownload = () => reject(new Error('Engine closed'));
+          return;
+        }
+        resumeResolve = resolve;
+        resumeReject = reject;
+        rejectDownload = () => reject(new Error('Engine closed'));
+      });
+    };
+    const download = engineManager.downloadModel({
+      modelId,
+      modelsCacheDir: cache,
+      onProgress: (info) => events.push(info),
+    });
+    await waitFor(() => calls === 1);
+    let markEntered;
+    const entered = new Promise((resolve) => {
+      markEntered = resolve;
+    });
+    engineManager.setDiffusersKillRecovery(() => {
+      markEntered();
+    });
+    const allocated = await allocateSessionImagePath(sessions, `${modelId.split('/').pop()}.json`);
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    await awaitAlive(entered);
+    const raced = await racePrompt(pending);
+    assert.equal(raced.kind, 'prompt');
+    assert.equal(raced.value, STOP_MARKER);
+    await waitFor(() => engineManager.getStatus().phase === 'idle' && calls >= 2);
+    return {
+      calls: () => calls,
+      events,
+      download,
+      finish: () => resumeResolve(),
+      failResume: (err) => resumeReject(err),
+    };
+  }
+
+  it('drops the busy gate while a resumed download is still running', async () => {
+    const unhandled = [];
+    const onUnhandled = (err) => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
+    const logged = [];
+    const origError = console.error;
+    console.error = (...args) => {
+      logged.push(args.map((part) => String(part && part.message ? part.message : part)).join(' '));
+    };
+    try {
+      const hung = await beginHungResume('org/resume-hang');
+      const rendered = await buildEngineStatusForRenderer();
+      assert.equal(rendered.phase, 'idle');
+      assert.equal(rendered.ready, true);
+      assert.equal(rendered.modelId, 'org/diffusers');
+      let settled = false;
+      hung.download.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        }
+      );
+
+      await engineManager.reinitialize(modelInit('org/diffusers'));
+      assert.equal(engineManager.getStatus().modelId, 'org/diffusers');
+      assert.equal(engineManager.getStatus().phase, 'idle');
+      await delay(15);
+      assert.equal(settled, false);
+
+      hung.finish();
+      await hung.download;
+      assert.equal(
+        hung.events.some((info) => info.phase === 'download' && info.status === 'complete'),
+        true
+      );
+      assert.equal(
+        hung.events.some((info) => info.status === 'error'),
+        false
+      );
+
+      const hungCancel = await beginHungResume('org/resume-cancel');
+      const cancelIds = [];
+      hf.cancelDownloadModel = async (id) => {
+        cancelIds.push(id);
+        hungCancel.failResume(Object.assign(new Error('Download cancelled'), { code: 'DOWNLOAD_CANCELLED' }));
+      };
+      await engineManager.ejectModel();
+      assert.equal(engineManager.getStatus().modelId, null);
+      assert.equal(engineManager.getStatus().phase, 'idle');
+      const cancelled = hungCancel.download.then(
+        () => null,
+        (err) => err
+      );
+      await engineManager.cancelModelDownload('org/resume-cancel', { modelsCacheDir: cache });
+      const err = await cancelled;
+      assert.equal(err.code, 'DOWNLOAD_CANCELLED');
+      assert.deepEqual(cancelIds, ['org/resume-cancel']);
+      assert.equal(
+        hungCancel.events.some((info) => info.status === 'error'),
+        false
+      );
+      await delay(15);
+      assert.equal(unhandled.length, 0);
+
+      hf.cancelDownloadModel = async () => {};
+      await engineManager.initialize(modelInit('org/diffusers'));
+      const killed = await beginHungResume('org/resume-second-kill');
+      const killedResult = killed.download.then(
+        () => null,
+        (err) => err
+      );
+      const again = await allocateSessionImagePath(sessions, 'second-kill.json');
+      const pending = engineManager.sendPrompt('a blue fox', {
+        outputPath: again.absolutePath,
+        reservationId: again.reservationId,
+      });
+      engineManager.cancelGeneration();
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      const killedErr = await awaitAlive(killedResult);
+      assert.match(killedErr.message, /Engine closed/);
+      await waitFor(() => engineManager.getStatus().phase === 'idle');
+      await delay(30);
+      assert.equal(killed.calls(), 2);
+      assert.equal(
+        killed.events.some((info) => info.status === 'error'),
+        false
+      );
+      assert.equal(
+        logged.some((line) => /Failed to resume downloads/.test(line)),
+        false
+      );
+      assert.equal(unhandled.length, 0);
+    } finally {
+      console.error = origError;
+      process.removeListener('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('rejects parked downloads when shutdown arrives during the worker exit wait', async () => {
+    await delay(0);
+    const timersBefore = referencedTimeouts().length;
+    engineManager.setDiffusersStopGraceMs(40);
+    engineManager.setDiffusersWorkerExitMs(600);
+    let calls = 0;
+    let reloaded = false;
+    hf.downloadModel = () => {
+      calls += 1;
+      return new Promise((_resolve, reject) => {
+        rejectDownload = () => reject(new Error('Engine closed'));
+      });
+    };
+    engineManager.setDiffusersKillRecovery(() => {
+      reloaded = true;
+    });
+    const events = [];
+    const download = engineManager.downloadModel({
+      modelId: 'org/quit-during-exit',
+      modelsCacheDir: cache,
+      onProgress: (info) => events.push(info),
+    });
+    const settled = download.then(
+      () => ({ kind: 'resolved' }),
+      (err) => ({ kind: 'rejected', err })
+    );
+    await waitFor(() => calls === 1);
+    const offloadDirs = await plantOffload();
+    const allocated = await allocateSessionImagePath(sessions, 'quit-exit.json');
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    await waitFor(() => closes.length === 1);
+    await delay(40);
+    const early = await Promise.race([settled, delay(20).then(() => ({ kind: 'pending' }))]);
+    assert.equal(early.kind, 'pending');
+    for (const dir of offloadDirs) {
+      assert.equal(await fs.readFile(path.join(dir, 'weight.bin'), 'utf8'), 'w');
+    }
+    assert.equal(exitSettled, false);
+
+    const outcome = await Promise.race([
+      engineManager.shutdown({ hfDestroyTimeoutMs: 20 }).then(() => 'done'),
+      delay(1000).then(() => 'hung'),
+    ]);
+    assert.equal(outcome, 'done');
+    assert.equal(exitSettled, false);
+    assert.equal(reloaded, false);
+    assert.equal(engineManager.getStatus().phase, 'idle');
+    assert.equal(engineManager.getStatus().modelId, null);
+    const result = await settled;
+    assert.equal(result.kind, 'rejected');
+    assert.match(result.err.message, /Engine closed/);
+    assert.equal(calls, 1);
+    assert.equal(
+      events.some((info) => info.status === 'error'),
+      false
+    );
+    for (const dir of offloadDirs) {
+      assert.equal(await fs.readFile(path.join(dir, 'weight.bin'), 'utf8'), 'w');
+    }
+
+    const removalStart = Date.now();
+    let removed = false;
+    while (!removed) {
+      if (Date.now() - removalStart > 1500) {
+        throw new Error('offload was not removed after shutdown');
+      }
+      try {
+        await fs.stat(offloadDirs[0]);
+        await delay(15);
+      } catch {
+        removed = true;
+      }
+    }
+    for (const dir of offloadDirs) {
+      await assert.rejects(fs.stat(dir));
+    }
+    assert.equal(reloaded, false);
+    assert.equal(engineManager.getStatus().phase, 'idle');
+    await delay(30);
+    assert.ok(referencedTimeouts().length <= timersBefore);
+
+    await engineManager.initialize(modelInit('org/diffusers'));
+    state.engineBootstrapped = true;
+    assert.equal(engineManager.getStatus().modelId, 'org/diffusers');
+    assert.equal(engineManager.getStatus().phase, 'idle');
+  });
+
+  it('parks a download started during the grace and resumes it after reload', async () => {
+    engineManager.setDiffusersStopGraceMs(400);
+    let calls = 0;
+    hf.downloadModel = (_modelId, options) => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise((_resolve, reject) => {
+          rejectDownload = () => reject(new Error('Engine closed'));
+        });
+      }
+      if (options && typeof options.onProgress === 'function') {
+        options.onProgress({ status: 'progress', loaded: 1, total: 2, file: 'grace' });
+      }
+      return Promise.resolve();
+    };
+    const allocated = await allocateSessionImagePath(sessions, 'during-grace.json');
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    assert.equal(engineManager.getStatus().phase, 'loading');
+    const events = [];
+    const download = engineManager.downloadModel({
+      modelId: 'org/during-grace',
+      modelsCacheDir: cache,
+      onProgress: (info) => events.push(info),
+    });
+    await waitFor(() => calls === 1);
+    assert.equal(closes.length, 0);
+    await awaitAlive(download, 2000);
+    const raced = await racePrompt(pending);
+    assert.equal(raced.kind, 'prompt');
+    assert.equal(calls, 2);
+    assert.equal(
+      events.some((info) => info.phase === 'download' && info.status === 'complete'),
+      true
+    );
+    assert.equal(
+      events.some((info) => info.status === 'error'),
+      false
+    );
+    await waitFor(() => engineManager.getStatus().phase === 'idle');
+  });
+
+  it('parks a kill-error download started during reload and resumes it', async () => {
+    let releaseReload = () => {};
+    let markEntered;
+    const entered = new Promise((resolve) => {
+      markEntered = resolve;
+    });
+    engineManager.setDiffusersKillRecovery(() => {
+      markEntered();
+      return new Promise((resolve) => {
+        releaseReload = resolve;
+      });
+    });
+    const allocated = await allocateSessionImagePath(sessions, 'during-reload.json');
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    await awaitAlive(entered);
+    assert.equal(engineManager.getStatus().phase, 'loading');
+    let calls = 0;
+    hf.downloadModel = (_modelId, options) => {
+      calls += 1;
+      if (calls === 1) {
+        return Promise.reject(new Error('Engine closed'));
+      }
+      if (options && typeof options.onProgress === 'function') {
+        options.onProgress({ status: 'progress', loaded: 2, total: 2, file: 'reload' });
+      }
+      return Promise.resolve();
+    };
+    const events = [];
+    const download = engineManager.downloadModel({
+      modelId: 'org/during-reload',
+      modelsCacheDir: cache,
+      onProgress: (info) => events.push(info),
+    });
+    const settled = download.then(
+      () => 'resolved',
+      (err) => err
+    );
+    await delay(40);
+    const early = await Promise.race([settled, delay(20).then(() => 'pending')]);
+    assert.equal(early, 'pending');
+    assert.equal(calls, 1);
+    releaseReload();
+    assert.equal(await awaitAlive(settled, 2000), 'resolved');
+    const raced = await racePrompt(pending);
+    assert.equal(raced.kind, 'prompt');
+    assert.equal(calls, 2);
+    assert.equal(
+      events.some((info) => info.phase === 'download' && info.status === 'complete'),
+      true
+    );
+    assert.equal(
+      events.some((info) => info.status === 'error'),
+      false
+    );
+  });
+
+  it('rejects a download that is still parking when the stop procedure ends', async () => {
+    let releaseReload = () => {};
+    let markEntered;
+    const entered = new Promise((resolve) => {
+      markEntered = resolve;
+    });
+    engineManager.setDiffusersKillRecovery(() => {
+      markEntered();
+      return new Promise((resolve) => {
+        releaseReload = resolve;
+      });
+    });
+    const allocated = await allocateSessionImagePath(sessions, 'late-park.json');
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    await awaitAlive(entered);
+    const fsPromises = require('fs').promises;
+    const originalStat = fsPromises.stat;
+    let releaseStat = () => {};
+    let markStat;
+    const statHeld = new Promise((resolve) => {
+      markStat = resolve;
+    });
+    fsPromises.stat = async (target, ...rest) => {
+      if (String(target).includes('race-dl')) {
+        markStat();
+        await new Promise((resolve) => {
+          releaseStat = resolve;
+        });
+      }
+      return originalStat.call(fsPromises, target, ...rest);
+    };
+    let calls = 0;
+    hf.downloadModel = () => {
+      calls += 1;
+      return Promise.reject(new Error('Engine closed'));
+    };
+    try {
+      const events = [];
+      const download = engineManager.downloadModel({
+        modelId: 'org/race-dl',
+        modelsCacheDir: cache,
+        onProgress: (info) => events.push(info),
+      });
+      const settled = download.then(
+        () => null,
+        (err) => err
+      );
+      await awaitAlive(statHeld);
+      releaseReload();
+      await waitFor(() => engineManager.getStatus().phase === 'idle');
+      assert.equal(calls, 1);
+      releaseStat();
+      const err = await settled;
+      assert.match(err.message, /Engine closed/);
+      await delay(30);
+      assert.equal(calls, 1);
+      assert.equal(
+        events.some((info) => info.status === 'error'),
+        false
+      );
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+    } finally {
+      fsPromises.stat = originalStat;
+      releaseStat();
+      releaseReload();
+    }
   });
 
   it('returns from shutdown during reload without waiting for worker exit', async () => {

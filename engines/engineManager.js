@@ -110,6 +110,8 @@ let diffusersOffloadBases = null;
  * @type {Array<{ modelId: string, progressId: string, hfOptions: object, existed: boolean, cancelled: boolean, error: Error, resolve: (value?: unknown) => void, reject: (err: Error) => void }>}
  */
 let parkedDownloads = [];
+/** Resumes already taken out of `parkedDownloads` and waiting on the worker. */
+let activeResumes = [];
 let resumingDownloads = false;
 
 /**
@@ -240,9 +242,18 @@ function diffusersStopProcedureActive() {
   return Boolean(diffusersStopPending || diffusersReloadPromise);
 }
 
+/**
+ * Overlapping generation uses this same unlocalized message. The IPC layer
+ * classifies any message containing "busy" as E_BUSY. There is no locale key.
+ * @returns {Error}
+ */
+function engineBusyError() {
+  return new Error('Engine is busy.');
+}
+
 function assertDiffusersStopIdle() {
   if (diffusersStopProcedureActive()) {
-    throw new Error('Engine is busy.');
+    throw engineBusyError();
   }
 }
 
@@ -480,7 +491,7 @@ function joinModelReload(fn) {
 function startDiffusersReload() {
   if (shuttingDown) {
     endDiffusersStopProcedure();
-    void resumeParkedDownloads(false);
+    resumeParkedDownloadsInBackground(false);
     return;
   }
   const token = ++diffusersReloadToken;
@@ -504,11 +515,8 @@ function startDiffusersReload() {
       console.error('Failed to reload the model after stopping image generation:', err);
       reloadOk = false;
     } finally {
-      try {
-        await resumeParkedDownloads(reloadOk);
-      } catch (err) {
-        console.error('Failed to resume downloads after stopping image generation:', err);
-      }
+      // Drop the busy gate before resuming downloads. A multi-GB resume must
+      // not keep phase at loading or reject model changes.
       release();
       if (token === diffusersReloadToken && diffusersReloadPromise === gate) {
         diffusersReloadPromise = null;
@@ -516,9 +524,19 @@ function startDiffusersReload() {
       if (!generationInFlight && !diffusersStopPending && phase === 'loading') {
         phase = 'idle';
       }
+      resumeParkedDownloadsInBackground(reloadOk);
     }
   })();
   job.catch(() => {});
+}
+
+/**
+ * @param {boolean} reloadOk
+ */
+function resumeParkedDownloadsInBackground(reloadOk) {
+  void resumeParkedDownloads(reloadOk).catch((err) => {
+    console.error('Failed to resume downloads after stopping image generation:', err);
+  });
 }
 
 /**
@@ -1058,6 +1076,7 @@ function imageResultFromPaths(imagePaths, text) {
  * @param {object} opts
  */
 async function initialize(opts) {
+  // Only the stop-recovery reload and enterNoModelState may set allowDuringDiffusersStop.
   const privileged = Boolean(opts && opts.allowDuringDiffusersStop);
   if (!privileged) {
     assertDiffusersStopIdle();
@@ -1312,27 +1331,58 @@ async function modelCacheDirExists(modelId) {
 }
 
 /**
+ * @param {{ settled?: boolean, cancelled?: boolean, reject: (err: Error) => void }} entry
+ * @param {Error} err
+ */
+function settleDownloadReject(entry, err) {
+  if (entry.settled) {
+    return;
+  }
+  entry.settled = true;
+  entry.cancelled = err && err.code === 'DOWNLOAD_CANCELLED';
+  entry.reject(err);
+}
+
+/**
+ * @param {{ settled?: boolean, resolve: (value?: unknown) => void }} entry
+ */
+function settleDownloadResolve(entry) {
+  if (entry.settled) {
+    return;
+  }
+  entry.settled = true;
+  entry.resolve();
+}
+
+/**
  * @param {string} id
- * @returns {boolean}
+ * @returns {false | 'parked' | 'resume'}
  */
 function rejectParkedDownload(id) {
   const key = typeof id === 'string' ? id.trim() : '';
   if (!key) {
     return false;
   }
-  let found = false;
+  const err = new Error('Download cancelled');
+  err.code = 'DOWNLOAD_CANCELLED';
+  let kind = false;
   parkedDownloads = parkedDownloads.filter((entry) => {
     if (entry.modelId !== key && entry.progressId !== key) {
       return true;
     }
-    found = true;
-    entry.cancelled = true;
-    const err = new Error('Download cancelled');
-    err.code = 'DOWNLOAD_CANCELLED';
-    entry.reject(err);
+    kind = 'parked';
+    settleDownloadReject(entry, err);
     return false;
   });
-  return found;
+  activeResumes = activeResumes.filter((entry) => {
+    if (entry.modelId !== key && entry.progressId !== key) {
+      return true;
+    }
+    kind = 'resume';
+    settleDownloadReject(entry, err);
+    return false;
+  });
+  return kind;
 }
 
 /**
@@ -1340,16 +1390,21 @@ function rejectParkedDownload(id) {
  */
 async function resumeParkedDownloads(reloadOk) {
   const batch = parkedDownloads.splice(0, parkedDownloads.length);
+  if (!batch.length) {
+    return;
+  }
+  // While this is set, a kill that aborts the resumed RPC is not parked again.
   resumingDownloads = true;
   try {
     for (const entry of batch) {
-      if (entry.cancelled) {
+      if (entry.settled || entry.cancelled) {
         continue;
       }
       if (!reloadOk || (entry.existed && !(await modelCacheDirExists(entry.modelId)))) {
-        entry.reject(entry.error);
+        settleDownloadReject(entry, entry.error);
         continue;
       }
+      activeResumes.push(entry);
       try {
         if (typeof entry.hfOptions.onProgress === 'function') {
           entry.hfOptions.onProgress({
@@ -1359,9 +1414,13 @@ async function resumeParkedDownloads(reloadOk) {
           });
         }
         await hfEngine.downloadModel(entry.modelId, entry.hfOptions);
-        entry.resolve();
+        settleDownloadResolve(entry);
       } catch (err) {
-        entry.reject(err instanceof Error ? err : new Error(String(err)));
+        const error = err instanceof Error ? err : new Error(String(err));
+        // A user cancel already rejected the caller with DOWNLOAD_CANCELLED.
+        settleDownloadReject(entry, error);
+      } finally {
+        activeResumes = activeResumes.filter((item) => item !== entry);
       }
     }
   } finally {
@@ -1391,6 +1450,11 @@ async function runHfDownload(modelId, hfOptions, progressId) {
       throw error;
     }
     const existed = await modelCacheDirExists(modelId);
+    // stat() yields. Parking after the procedure has ended, or after shutdown,
+    // would leave a download that nobody resumes.
+    if (resumingDownloads || shuttingDown || !diffusersStopProcedureActive()) {
+      throw error;
+    }
     await new Promise((resolve, reject) => {
       parkedDownloads.push({
         modelId,
@@ -1448,7 +1512,11 @@ async function cancelModelDownload(modelId, opts = {}) {
     throw new Error('Model id is required.');
   }
   const id = modelId.trim();
-  if (rejectParkedDownload(id)) {
+  const hit = rejectParkedDownload(id);
+  if (hit) {
+    if (hit === 'resume') {
+      hfEngine.cancelDownloadModel(id).catch(() => {});
+    }
     return;
   }
   await ensureDownloadEnginePaths(opts);
@@ -1477,6 +1545,7 @@ async function listHubModelFiles(modelId, opts = {}) {
  * @param {object} opts
  */
 async function reinitialize(opts) {
+  // Only the stop-recovery reload and enterNoModelState may set allowDuringDiffusersStop.
   const privileged = Boolean(opts && opts.allowDuringDiffusersStop);
   if (!privileged) {
     assertDiffusersStopIdle();
@@ -1506,6 +1575,7 @@ async function reinitialize(opts) {
  * Unload the active chat model (keeps workers alive when possible).
  */
 async function ejectModel(opts) {
+  // Only the stop-recovery reload and enterNoModelState may set allowDuringDiffusersStop.
   if (!(opts && opts.allowDuringDiffusersStop)) {
     assertDiffusersStopIdle();
   }
@@ -1568,10 +1638,7 @@ async function shutdown(options = {}) {
   clearStopGrace(diffusersStopRun);
   clearStopGrace(activeGeneration);
   diffusersStopRun = null;
-  const abandoned = parkedDownloads.splice(0, parkedDownloads.length);
-  for (const entry of abandoned) {
-    entry.reject(entry.error || new Error('Engine closed'));
-  }
+  await resumeParkedDownloads(false);
   for (const engine of Object.values(engines)) {
     try {
       await engine.chatStop();
@@ -1702,7 +1769,7 @@ async function sendPrompt(message, options = {}) {
     throw new Error('Engine not initialized.');
   }
   if (generationInFlight || diffusersStopPending || diffusersReloadPromise) {
-    throw new Error('Engine is busy.');
+    throw engineBusyError();
   }
 
   if (isDiffusionPipelineTag(activePipelineTag)) {
