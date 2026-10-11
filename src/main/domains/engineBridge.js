@@ -97,6 +97,46 @@ function normalizeFilesPayload(rawFiles) {
   return normalized;
 }
 
+/**
+ * Same recovery as a stream idle timeout: reset the worker, reload the
+ * selected model, and emit the loading progress that reload already uses.
+ * A failure drops to the no-model state. Quit abandons the reload.
+ *
+ * @param {string} logLabel
+ */
+async function recoverLoadedModelAfterWorkerReset(logLabel) {
+  try {
+    if (engineManager.isShuttingDown()) {
+      return;
+    }
+    await engineManager.resetInferenceWorker();
+    await clearPersistedModelIfNotCached();
+    const modelId = getEngineInitModelId();
+    if (modelId && (await modelIdHasCachedWeights(modelId))) {
+      if (engineManager.isShuttingDown()) {
+        return;
+      }
+      const loaded = await engineManager.reinitialize(getEngineInitOptions());
+      if (loaded && loaded.downloadRequired) {
+        await noteCompanionDownloadRequired(modelId);
+      } else {
+        state.engineBootstrapped = true;
+      }
+    } else {
+      await enterNoModelState();
+    }
+  } catch (reinitErr) {
+    console.error(logLabel, reinitErr);
+    try {
+      if (!engineManager.isShuttingDown()) {
+        await enterNoModelState();
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function persistTurnSession(logLabel, deps) {
   try {
     await persistActiveSession(deps);
@@ -409,28 +449,9 @@ function handleEngineStreamStart(event, payload) {
         (err && err.code === 'E_TIMEOUT') ||
         /stream timed out/i.test(String(err && err.message ? err.message : err));
       if (isStreamIdleTimeout) {
-        try {
-          await engineManager.resetInferenceWorker();
-          await clearPersistedModelIfNotCached();
-          const modelId = getEngineInitModelId();
-          if (modelId && (await modelIdHasCachedWeights(modelId))) {
-            const loaded = await engineManager.reinitialize(getEngineInitOptions());
-            if (loaded && loaded.downloadRequired) {
-              await noteCompanionDownloadRequired(modelId);
-            } else {
-              state.engineBootstrapped = true;
-            }
-          } else {
-            await enterNoModelState();
-          }
-        } catch (reinitErr) {
-          console.error('Failed to reinitialize inference engine after stream timeout:', reinitErr);
-          try {
-            await enterNoModelState();
-          } catch {
-            /* ignore */
-          }
-        }
+        await recoverLoadedModelAfterWorkerReset(
+          'Failed to reinitialize inference engine after stream timeout:'
+        );
       } else {
         engineManager.cancelRequestGeneration({ requestId });
       }
@@ -581,6 +602,10 @@ function registerEngineBridgeIpc() {
 
   ipcMain.handle('engine:cancel', async () => handleEngineCancel());
 }
+
+engineManager.setDiffusersKillRecovery(() =>
+  recoverLoadedModelAfterWorkerReset('Failed to reload the model after stopping image generation:')
+);
 
 module.exports = {
   registerEngineBridgeIpc,

@@ -73,6 +73,23 @@ let activeGeneration = null;
 let generationRun = 0;
 
 /**
+ * How long a Diffusers stop waits for the next denoising step before the
+ * worker is killed. Tests replace it with {@link setDiffusersStopGraceMs}.
+ */
+const DIFFUSERS_STOP_GRACE_MS = 5000;
+let diffusersStopGraceMs = DIFFUSERS_STOP_GRACE_MS;
+/** True from the cooperative stop until that run settles or the reload begins. */
+let diffusersStopPending = false;
+/** @type {{ stopGraceTimer?: ReturnType<typeof setTimeout> | null, killStarted?: boolean, settled?: boolean } | null} */
+let diffusersStopRun = null;
+/** @type {Promise<void> | null} */
+let diffusersReloadPromise = null;
+let diffusersReloadToken = 0;
+let shuttingDown = false;
+/** @type {(() => Promise<void> | void) | null} */
+let diffusersKillRecovery = null;
+
+/**
  * request id → run token. Settled ids are pruned down to the newest
  * MAX_TRACKED_REQUEST_RUNS so the map cannot grow without bound. A missing id
  * is unknown and must not cancel whatever run is active now.
@@ -158,10 +175,23 @@ function generationOwns(run) {
 }
 
 /**
+ * @param {{ stopGraceTimer?: ReturnType<typeof setTimeout> | null } | null | undefined} run
+ */
+function clearStopGrace(run) {
+  if (run && run.stopGraceTimer) {
+    clearTimeout(run.stopGraceTimer);
+    run.stopGraceTimer = null;
+  }
+}
+
+/**
  * The owning run has returned. A later cancel must not seal this turn.
- * @param {{ token: number, settled?: boolean } | null | undefined} run
+ * @param {{ token: number, settled?: boolean, killStarted?: boolean, stopGraceTimer?: ReturnType<typeof setTimeout> | null } | null | undefined} run
  */
 function settleOwnedRun(run) {
+  if (run) {
+    clearStopGrace(run);
+  }
   if (!run || !generationOwns(run)) {
     return;
   }
@@ -171,6 +201,150 @@ function settleOwnedRun(run) {
   if (activeGeneration === run) {
     activeGeneration = null;
   }
+  if (diffusersStopRun === run && !run.killStarted) {
+    diffusersStopPending = false;
+    diffusersStopRun = null;
+  }
+}
+
+function isHuggingFaceDiffusion() {
+  return activeEngineId === 'huggingface' && isDiffusionPipelineTag(activePipelineTag);
+}
+
+function huggingfaceWorkerPid() {
+  const engine = engines.huggingface;
+  if (!engine || typeof engine.workerPid !== 'function') {
+    return null;
+  }
+  const pid = engine.workerPid();
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/**
+ * The next Diffusers load deletes a dead pid folder. Remove this one now so
+ * the killed worker's offload files do not wait for that prepare.
+ *
+ * @param {number | null} pid
+ */
+async function removeKilledDiffusersOffload(pid) {
+  if (!pid) {
+    return;
+  }
+  const folder = path.join('.glaux-t2i-offload', `pid-${pid}`);
+  const dirs = new Set();
+  const cache = initOptions && initOptions.modelsCacheDir;
+  if (typeof cache === 'string' && cache) {
+    dirs.add(path.resolve(cache, folder));
+    if (activeModelId) {
+      const modelDir = path.join(cache, ...String(activeModelId).split('/'));
+      dirs.add(path.resolve(path.dirname(modelDir), folder));
+    }
+  }
+  dirs.add(path.resolve('/var/tmp', folder));
+  await Promise.all(
+    [...dirs].map((dir) => fs.rm(dir, { recursive: true, force: true }).catch(() => {}))
+  );
+}
+
+function armDiffusersStopGrace(run) {
+  if (!isHuggingFaceDiffusion() || !run || run.stopGraceTimer || run.killStarted) {
+    return;
+  }
+  diffusersStopPending = true;
+  diffusersStopRun = run;
+  run.stopGraceTimer = setTimeout(() => {
+    run.stopGraceTimer = null;
+    void killHungDiffusersRun(run);
+  }, diffusersStopGraceMs);
+}
+
+/**
+ * @param {{ settled?: boolean, killStarted?: boolean, stopGraceTimer?: ReturnType<typeof setTimeout> | null }} run
+ */
+async function killHungDiffusersRun(run) {
+  if (!run || run.settled || run.killStarted || shuttingDown) {
+    return;
+  }
+  if (diffusersStopRun !== run) {
+    return;
+  }
+  run.killStarted = true;
+  clearStopGrace(run);
+  const pid = huggingfaceWorkerPid();
+  try {
+    const closing = engines.huggingface.close({ final: false });
+    if (closing && typeof closing.then === 'function') {
+      closing.catch(() => {});
+    }
+  } catch {
+    /* worker already gone */
+  }
+  await removeKilledDiffusersOffload(pid);
+  const deadline = Date.now() + 1000;
+  while (!run.settled && Date.now() < deadline) {
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  }
+  if (shuttingDown) {
+    diffusersStopPending = false;
+    diffusersStopRun = null;
+    return;
+  }
+  startDiffusersReload();
+}
+
+function startDiffusersReload() {
+  if (shuttingDown) {
+    diffusersStopPending = false;
+    diffusersStopRun = null;
+    return;
+  }
+  const token = ++diffusersReloadToken;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  diffusersReloadPromise = gate;
+  diffusersStopPending = false;
+  diffusersStopRun = null;
+  const job = (async () => {
+    try {
+      if (shuttingDown || token !== diffusersReloadToken) {
+        return;
+      }
+      if (typeof diffusersKillRecovery === 'function') {
+        await diffusersKillRecovery();
+      }
+    } catch (err) {
+      console.error('Failed to reload the model after stopping image generation:', err);
+    } finally {
+      release();
+      if (token === diffusersReloadToken && diffusersReloadPromise === gate) {
+        diffusersReloadPromise = null;
+      }
+    }
+  })();
+  job.catch(() => {});
+}
+
+/**
+ * @param {number} ms
+ */
+function setDiffusersStopGraceMs(ms) {
+  const next = Number(ms);
+  diffusersStopGraceMs = Number.isFinite(next) && next >= 0 ? next : DIFFUSERS_STOP_GRACE_MS;
+}
+
+/**
+ * @param {(() => Promise<void> | void) | null} fn
+ */
+function setDiffusersKillRecovery(fn) {
+  diffusersKillRecovery = typeof fn === 'function' ? fn : null;
+}
+
+function isShuttingDown() {
+  return shuttingDown;
 }
 
 /**
@@ -666,6 +840,7 @@ function imageResultFromPaths(imagePaths, text) {
  * @param {object} opts
  */
 async function initialize(opts) {
+  shuttingDown = false;
   if (!opts || typeof opts.modelId !== 'string' || !opts.modelId.trim()) {
     throw new Error('Model id is required.');
   }
@@ -1013,6 +1188,13 @@ async function unloadHuggingFacePipeline(timeoutMs = HF_DESTROY_TIMEOUT_MS) {
 }
 
 async function shutdown(options = {}) {
+  shuttingDown = true;
+  diffusersReloadToken += 1;
+  diffusersReloadPromise = null;
+  diffusersStopPending = false;
+  clearStopGrace(diffusersStopRun);
+  clearStopGrace(activeGeneration);
+  diffusersStopRun = null;
   for (const engine of Object.values(engines)) {
     try {
       await engine.chatStop();
@@ -1073,6 +1255,10 @@ function cancelActiveGeneration() {
   if (phase === 'generating') {
     phase = 'idle';
   }
+  // The stop marker is already in place. Diffusers may not notice chat_stop
+  // until the next denoising step, so kill the worker if this run is still
+  // going when the 5 second grace expires. Chat, ASR, and sd-cli do not arm it.
+  armDiffusersStopGrace(run);
 }
 
 function cancelGeneration() {
@@ -1138,7 +1324,7 @@ async function sendPrompt(message, options = {}) {
   if (!activeModelId || !activeEngineId) {
     throw new Error('Engine not initialized.');
   }
-  if (generationInFlight) {
+  if (generationInFlight || diffusersStopPending || diffusersReloadPromise) {
     throw new Error('Engine is busy.');
   }
 
@@ -1174,6 +1360,7 @@ async function sendPrompt(message, options = {}) {
         await pendingCompanions;
       }
       if (!generationOwns(run) || run.cancelled) {
+        clearStopGrace(run);
         return await stopThisRun();
       }
       const response = await engines[activeEngineId].runChat(activeModelId, false, prompt, {
@@ -1186,6 +1373,7 @@ async function sendPrompt(message, options = {}) {
         videoPaths: [],
       });
       if (!generationOwns(run) || run.cancelled) {
+        clearStopGrace(run);
         return await stopThisRun();
       }
       const rawPaths =
@@ -1206,6 +1394,7 @@ async function sendPrompt(message, options = {}) {
       return { text: packed.text, imagePaths: packed.imagePaths, images: packed.images };
     } catch (err) {
       if (!generationOwns(run) || run.cancelled) {
+        clearStopGrace(run);
         return await stopThisRun();
       }
       // Drop this turn and settle before the await. A Stop during the discard
@@ -1398,6 +1587,10 @@ module.exports = {
   ejectModel,
   shutdown,
   resetInferenceWorker,
+  setDiffusersStopGraceMs,
+  setDiffusersKillRecovery,
+  isShuttingDown,
+  DIFFUSERS_STOP_GRACE_MS,
   sendPrompt,
   cancelGeneration,
   cancelRequestGeneration,

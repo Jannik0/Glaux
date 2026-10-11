@@ -655,4 +655,7 @@ module.exports = {
 
   /** Requests the current `runChat()` to stop: next token for chat and ASR, next denoising step for diffusion. */
   chatStop: () => (isChildAlive(child) ? rpcVoid('chat_stop', {}) : Promise.resolve()),
+
+  /** Pid of the live worker, used to drop its disk-offload folder after a kill. */
+  workerPid: () => (isChildAlive(child) && child.pid ? child.pid : null),
 };
