@@ -28,6 +28,7 @@ from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_lo
 from .t2i import (
     DiffusionStopped,
     _CUDA_TIER_ORDER,
+    _log_ignored,
     _release_pipeline_hooks,
     clear_cuda_tier_limit,
     generate_text_to_image,
@@ -373,8 +374,8 @@ def chatbot_create(model_id: str):
         gc.collect()
         try:
             _release_torch_cache()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored("release the torch cache", exc)
         print(
             f"CUDA failed while loading the model ({summary}); retrying on CPU.",
             file=sys.stderr,
@@ -417,8 +418,8 @@ def _release_torch_cache() -> None:
     if callable(empty_host):
         try:
             empty_host()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_ignored("release the pinned host cache", exc)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()

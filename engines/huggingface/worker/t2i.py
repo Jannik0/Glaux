@@ -1460,15 +1460,30 @@ def _install_vae_io_cast(vae, pipeline_dtype) -> bool:
     method's ``__self__`` is the VAE, and a closure that stored it would
     cycle through ``vae.decode`` until ``gc.collect()``. The next load
     measures free VRAM only after the previous pipeline is dropped, so that
-    cycle would keep the old weights resident. The unbound ``__func__`` plus
-    a weak reference lets refcount free the pipeline on its own.
+    cycle would keep the old weights resident. A bound method is called
+    through its unbound ``__func__``. A plain function attribute has no
+    ``__func__`` and is called as ``fn(tensor)``. Either way the closure
+    holds only a weak reference to the VAE.
+
+    ``copy.deepcopy`` of a pipeline that carries these wrappers is
+    unsupported. The copy's ``decode`` would still point at a weak
+    reference to the original VAE.
     """
     if getattr(vae, "_glaux_vae_io_cast", False):
         return False
+    decode = getattr(vae, "decode", None)
+    encode = getattr(vae, "encode", None)
+    if not callable(decode) or not callable(encode):
+        return False
     import torch
 
-    decode_func = vae.decode.__func__
-    encode_func = vae.encode.__func__
+    # None when the attribute is a plain function, not a bound method.
+    # Reading ``__func__`` on that function raises AttributeError.
+    decode_func = getattr(decode, "__func__", None)
+    encode_func = getattr(encode, "__func__", None)
+    # Captured before the nested defs rebind the names ``decode`` and ``encode``.
+    plain_decode = decode if decode_func is None else None
+    plain_encode = encode if encode_func is None else None
     vae_ref = weakref.ref(vae)
 
     def decode(z, *args, **kwargs):
@@ -1479,7 +1494,9 @@ def _install_vae_io_cast(vae, pipeline_dtype) -> bool:
             target = getattr(module, "dtype", pipeline_dtype)
             if z.dtype != target:
                 z = z.to(dtype=target)
-        return decode_func(module, z, *args, **kwargs)
+        if decode_func is not None:
+            return decode_func(module, z, *args, **kwargs)
+        return plain_decode(z, *args, **kwargs)
 
     def encode(x, *args, **kwargs):
         module = vae_ref()
@@ -1489,7 +1506,11 @@ def _install_vae_io_cast(vae, pipeline_dtype) -> bool:
             target = getattr(module, "dtype", pipeline_dtype)
             if x.dtype != target:
                 x = x.to(dtype=target)
-        return _cast_encode_output(encode_func(module, x, *args, **kwargs), pipeline_dtype)
+        if encode_func is not None:
+            produced = encode_func(module, x, *args, **kwargs)
+        else:
+            produced = plain_encode(x, *args, **kwargs)
+        return _cast_encode_output(produced, pipeline_dtype)
 
     vae.decode = decode
     vae.encode = encode
@@ -1550,7 +1571,16 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
         return False
     vae = getattr(pipe, "vae", None)
     to = getattr(vae, "to", None)
-    if not callable(to) or not callable(getattr(vae, "decode", None)):
+    if (
+        not callable(to)
+        or not callable(getattr(vae, "decode", None))
+        or not callable(getattr(vae, "encode", None))
+    ):
+        return False
+    # Install before the dtype change. A wrapper that cannot be built must
+    # leave the VAE in fp16. An fp32 VAE without the cast raises on fp16
+    # latents, and that error is not an out-of-memory error.
+    if not getattr(vae, "_glaux_vae_io_cast", False) and not _install_vae_io_cast(vae, dtype):
         return False
     import torch
 
@@ -1563,12 +1593,11 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
             flush=True,
         )
         return False
-    _install_vae_io_cast(vae, dtype)
     extra = _fp32_vae_extra_bytes(vae)
     extra_note = (
-        f"about {extra} extra parameter bytes versus fp16"
+        f"about {_format_byte_size(extra)} extra"
         if extra is not None
-        else "extra parameter bytes versus fp16 were not measured"
+        else "extra parameter memory was not measured"
     )
     print(
         "Text-to-image VAE is fp32 for this fp16 run "
@@ -1583,6 +1612,15 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
         flush=True,
     )
     return True
+
+
+def _format_byte_size(num: int) -> str:
+    """``num`` as MiB, or GiB once it reaches 1 GiB."""
+    mib = 1024 * 1024
+    gib = mib * 1024
+    if num >= gib:
+        return f"{num / gib:.2f} GiB"
+    return f"{num / mib:.2f} MiB"
 
 
 def _fp32_vae_extra_bytes(vae) -> int | None:

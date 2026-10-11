@@ -1662,6 +1662,40 @@ seen["alive"] = "not-measured"
 assert chat.chat_generation_starts_in_thinking("org/third", False, "hi") is False
 assert seen["alive"] is False, seen
 assert held["ref"]() is None
+
+try:
+    import torch
+except ImportError:
+    torch = types.ModuleType("torch")
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+    torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
+    sys.modules["torch"] = torch
+
+def pinned_host_boom():
+    raise RuntimeError("pinned host failed\nsecond line")
+
+accelerator = getattr(torch, "accelerator", None)
+previous_empty = getattr(accelerator, "empty_host_cache", None) if accelerator is not None else None
+created_accelerator = accelerator is None
+if created_accelerator:
+    torch.accelerator = types.SimpleNamespace(empty_host_cache=pinned_host_boom)
+else:
+    accelerator.empty_host_cache = pinned_host_boom
+pinned_log = io.StringIO()
+sys.stderr = pinned_log
+try:
+    chat._release_torch_cache()
+finally:
+    sys.stderr = old_err
+    if created_accelerator:
+        del torch.accelerator
+    elif previous_empty is None:
+        del accelerator.empty_host_cache
+    else:
+        accelerator.empty_host_cache = previous_empty
+assert "could not release the pinned host cache" in pinned_log.getvalue(), pinned_log.getvalue()
+assert "RuntimeError: pinned host failed" in pinned_log.getvalue()
+assert "second line" not in pinned_log.getvalue()
 `;
 
 const VAE_SCRIPT = String.raw`
@@ -1989,11 +2023,14 @@ finally:
     sys.stderr = _err
 vae_text = vae_log.getvalue()
 assert "VAE is fp32" in vae_text, vae_text
-assert "extra parameter bytes versus fp16" in vae_text, vae_text
+assert "versus fp16" not in vae_text
 assert "No structural flag separates an SD1.x VAE" in vae_text, vae_text
 extra = t2i._fp32_vae_extra_bytes(sd3.vae)
 assert extra is not None and extra > 0
-assert str(extra) in vae_text, (extra, vae_text)
+assert t2i._format_byte_size(extra) in vae_text, (extra, vae_text)
+assert t2i._format_byte_size(1024 * 1024) == "1.00 MiB"
+assert t2i._format_byte_size(1024 * 1024 * 1024) == "1.00 GiB"
+assert "MiB" in t2i._format_byte_size(extra) or "GiB" in t2i._format_byte_size(extra)
 with torch.no_grad():
     sd3_image = sd3.vae.decode(fp16_latents, return_dict=False)[0]
 assert sd3_image.dtype == torch.float32
@@ -2050,6 +2087,48 @@ def assert_wrapper_is_refcount_collectable():
         gc.enable()
 
 assert_wrapper_is_refcount_collectable()
+
+def plain_decode(z, *args, **kwargs):
+    return z.to(dtype=torch.float32)
+
+def plain_encode(x, *args, **kwargs):
+    return x
+
+class PlainAttrVae(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+        self.decode = plain_decode
+        self.encode = plain_encode
+        self.to_calls = []
+
+    @property
+    def dtype(self):
+        return self.proj.weight.dtype
+
+    def to(self, *args, **kwargs):
+        self.to_calls.append(bool(getattr(self, "_glaux_vae_io_cast", False)))
+        return super().to(*args, **kwargs)
+
+plain_vae = PlainAttrVae()
+plain_vae.proj = nn.Linear(4, 4, bias=False).to(dtype=torch.float16)
+plain_pipe = type("PlainPipe", (), {})()
+plain_pipe.vae = plain_vae
+assert getattr(plain_vae.decode, "__func__", None) is None
+assert t2i._prepare_fp16_vae(plain_pipe, torch.float16) is True
+assert plain_vae.to_calls == [True], plain_vae.to_calls
+assert plain_vae.dtype == torch.float32
+assert plain_vae._glaux_vae_io_cast is True
+with torch.no_grad():
+    plain_out = plain_vae.decode(torch.zeros(1, 4, dtype=torch.float16))
+assert plain_out.dtype == torch.float32
+gc.disable()
+try:
+    plain_ref = weakref.ref(plain_pipe)
+    del plain_pipe, plain_vae
+    assert plain_ref() is None, "plain-function VAE wrapper kept the pipeline alive"
+finally:
+    gc.enable()
 
 class HookBoom:
     def maybe_free_model_hooks(self):

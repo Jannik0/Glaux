@@ -50,6 +50,18 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** True when *promise* is still pending after one event-loop turn. A timer that is already due can fire during that turn. */
+async function assertStillPending(promise) {
+  await new Promise((resolve) => setImmediate(resolve));
+  let settled = false;
+  const mark = () => {
+    settled = true;
+  };
+  promise.then(mark, mark);
+  await Promise.resolve();
+  assert.equal(settled, false);
+}
+
 /** Keep the event loop alive while an unref'd stop timer settles `promise`. */
 async function awaitAlive(promise, ms = 15000) {
   let timer;
@@ -329,6 +341,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
   it('does not kill the worker when the cooperative stop settles within the grace', async () => {
     const allocated = await allocateSessionImagePath(sessions, 'coop.json');
     await fs.writeFile(allocated.absolutePath, 'png');
+    engineManager.setDiffusersStopGraceMs(60_000);
     const pending = engineManager.sendPrompt('a red fox', {
       outputPath: allocated.absolutePath,
       reservationId: allocated.reservationId,
@@ -336,7 +349,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     engineManager.cancelGeneration();
     resolveRun({ text: 'late pixels', imagePaths: [allocated.absolutePath] });
     assert.equal(await pending, STOP_MARKER);
-    await delay(80);
+    await engineManager.expireDiffusersStopGrace();
     assert.equal(closes.length, 0);
     assert.equal(stops, 1);
     assert.equal(exitSettled, false);
@@ -365,10 +378,13 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     const raced = await racePrompt(pending);
     assert.equal(raced.kind, 'prompt');
     assert.equal(raced.value, STOP_MARKER);
-    await delay(80);
     assert.deepEqual(closes, [{ final: false }]);
     assert.equal(stops, 1);
     assert.equal(exitSettled, false);
+    // The close that settled the prompt is only the start of the kill. The
+    // worker-exit timer is unref'd, so wait until reload finishes before the
+    // next test sends a prompt.
+    await waitFor(() => engineManager.getStatus().phase === 'idle');
   });
 
   it('rejects a new prompt during the grace window and during reload', async () => {
@@ -386,6 +402,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       });
     });
 
+    engineManager.setDiffusersStopGraceMs(60_000);
     const pending = engineManager.sendPrompt('a red fox', {
       outputPath: allocated.absolutePath,
       reservationId: allocated.reservationId,
@@ -401,6 +418,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     );
     assert.deepEqual(await engineManager.contextSnapshot(), await duringGrace);
 
+    await awaitAlive(engineManager.expireDiffusersStopGrace());
     const raced = await racePrompt(pending);
     assert.equal(raced.kind, 'prompt');
     await awaitAlive(enteredReload);
@@ -445,7 +463,10 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     const before = await engineManager.contextSnapshot();
     assert.equal(before.length, 2);
     engineManager.cancelGeneration();
-    await delay(80);
+    assert.equal(stops, 0);
+    assert.equal(closes.length, 0);
+    // A grace armed by this cancel would kill on expire. A finished run must not arm one.
+    await engineManager.expireDiffusersStopGrace();
     assert.equal(stops, 0);
     assert.equal(closes.length, 0);
     assert.deepEqual(await engineManager.contextSnapshot(), before);
@@ -585,7 +606,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
   });
 
   it('removes offload only after a late worker exit', async () => {
-    engineManager.setDiffusersWorkerExitMs(500);
+    // The close promise is what ends the wait. A short exit timer can fire
+    // during the file reads under CPU load and delete the offload first.
+    engineManager.setDiffusersWorkerExitMs(60_000);
     const allocated = await allocateSessionImagePath(sessions, 'late-exit.json');
     const offloadDirs = await plantOffload();
     let reloaded = false;
@@ -813,7 +836,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       assert.equal(err.code, 'DOWNLOAD_CANCELLED');
       releaseReload();
       await racePrompt(pending);
-      await delay(40);
+      await waitFor(() => engineManager.getStatus().phase === 'idle');
       assert.equal(tracked.calls(), 1);
     } finally {
       releaseReload();
@@ -948,7 +971,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       await engineManager.reinitialize(modelInit('org/diffusers'));
       assert.equal(engineManager.getStatus().modelId, 'org/diffusers');
       assert.equal(engineManager.getStatus().phase, 'idle');
-      await delay(15);
+      await assertStillPending(hung.download);
       assert.equal(settled, false);
 
       hung.finish();
@@ -988,12 +1011,12 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       const cancelCall = engineManager.cancelModelDownload('org/resume-cancel', {
         modelsCacheDir: cache,
       });
-      await delay(20);
+      await assertStillPending(cancelled);
       assert.equal(cancelSettled, false);
       assert.deepEqual(cancelIds, ['org/resume-cancel']);
       releaseCancelRpc();
       await cancelCall;
-      await delay(15);
+      await assertStillPending(hungCancel.download);
       assert.equal(cancelSettled, false);
       hungCancel.failResume(new Error('Engine closed'));
       const err = await cancelled;
@@ -1002,7 +1025,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
         hungCancel.events.some((info) => info.status === 'error'),
         false
       );
-      await delay(15);
+      await new Promise((resolve) => setImmediate(resolve));
       assert.equal(unhandled.length, 0);
       assert.equal(
         logged.some((line) => /Failed to resume downloads/.test(line)),
@@ -1056,11 +1079,11 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
 
     await hungStop('two-stops-1');
     await waitFor(() => calls === 2 && engineManager.getStatus().phase === 'idle');
-    assert.equal(await Promise.race([settled, delay(20).then(() => 'pending')]), 'pending');
+    await assertStillPending(settled);
 
     await hungStop('two-stops-2');
     await waitFor(() => calls === 3 && engineManager.getStatus().phase === 'idle');
-    assert.equal(await Promise.race([settled, delay(20).then(() => 'pending')]), 'pending');
+    await assertStillPending(settled);
     releaseFinal();
     assert.equal(await settled, 'ok');
     assert.equal(calls, 3);
@@ -1110,8 +1133,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     assert.equal(firstRace.kind, 'prompt');
     await waitFor(() => inflight.length === 2 && engineManager.getStatus().phase === 'idle');
 
-    engineManager.setDiffusersStopGraceMs(350);
-    engineManager.setDiffusersWorkerExitMs(80);
+    engineManager.setDiffusersStopGraceMs(60_000);
     const second = await allocateSessionImagePath(sessions, 'second-grace-2.json');
     const secondPrompt = engineManager.sendPrompt('a blue fox', {
       outputPath: second.absolutePath,
@@ -1131,18 +1153,17 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     );
     await waitFor(() => inflight.length === 3);
     assert.equal(closes.length, 1);
-    assert.equal(await Promise.race([settledB, delay(15).then(() => 'pending')]), 'pending');
+    await assertStillPending(settledB);
+    await awaitAlive(engineManager.expireDiffusersStopGrace());
 
     await waitFor(
-      () => engineManager.getStatus().phase === 'idle' && inflight.filter((item) => item.modelId === 'org/resume-a').length === 3,
-      2000
+      () => engineManager.getStatus().phase === 'idle' && inflight.filter((item) => item.modelId === 'org/resume-a').length === 3
     );
     const thirdA = inflight.filter((item) => item.modelId === 'org/resume-a')[2];
     thirdA.done = true;
     thirdA.resolve();
     await waitFor(
-      () => inflight.filter((item) => item.modelId === 'org/during-second').length === 2,
-      2000
+      () => inflight.filter((item) => item.modelId === 'org/during-second').length === 2
     );
     const secondB = inflight.filter((item) => item.modelId === 'org/during-second')[1];
     secondB.done = true;
@@ -1162,8 +1183,8 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
   it('rejects parked downloads when shutdown arrives during the worker exit wait', async () => {
     await delay(0);
     const timersBefore = referencedTimeouts().length;
-    engineManager.setDiffusersStopGraceMs(40);
-    engineManager.setDiffusersWorkerExitMs(600);
+    engineManager.setDiffusersStopGraceMs(60_000);
+    engineManager.setDiffusersWorkerExitMs(60_000);
     let calls = 0;
     let reloaded = false;
     hf.downloadModel = () => {
@@ -1193,10 +1214,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       reservationId: allocated.reservationId,
     });
     engineManager.cancelGeneration();
+    const killing = engineManager.expireDiffusersStopGrace();
     await waitFor(() => closes.length === 1);
-    await delay(40);
-    const early = await Promise.race([settled, delay(20).then(() => ({ kind: 'pending' }))]);
-    assert.equal(early.kind, 'pending');
+    await assertStillPending(settled);
     for (const dir of offloadDirs) {
       assert.equal(await fs.readFile(path.join(dir, 'weight.bin'), 'utf8'), 'w');
     }
@@ -1204,7 +1224,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
 
     const outcome = await Promise.race([
       engineManager.shutdown({ hfDestroyTimeoutMs: 20 }).then(() => 'done'),
-      delay(1000).then(() => 'hung'),
+      delay(15000).then(() => 'hung'),
     ]);
     assert.equal(outcome, 'done');
     assert.equal(exitSettled, false);
@@ -1223,26 +1243,18 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       assert.equal(await fs.readFile(path.join(dir, 'weight.bin'), 'utf8'), 'w');
     }
 
-    const removalStart = Date.now();
-    let removed = false;
-    while (!removed) {
-      if (Date.now() - removalStart > 1500) {
-        throw new Error('offload was not removed after shutdown');
-      }
-      try {
-        await fs.stat(offloadDirs[0]);
-        await delay(15);
-      } catch {
-        removed = true;
-      }
-    }
+    // Shutdown returns while killHungDiffusersRun is still inside the exit
+    // wait. The offload delete happens after that wait. Resolving the close
+    // promise ends it. Leaving the 60s timer armed would let the kill reload
+    // after initialize() clears shuttingDown.
+    exitResolve();
+    await awaitAlive(killing);
     for (const dir of offloadDirs) {
       await assert.rejects(fs.stat(dir));
     }
     assert.equal(reloaded, false);
     assert.equal(engineManager.getStatus().phase, 'idle');
-    await delay(30);
-    assert.ok(referencedTimeouts().length <= timersBefore);
+    await waitFor(() => referencedTimeouts().length <= timersBefore);
 
     await engineManager.initialize(modelInit('org/diffusers'));
     state.engineBootstrapped = true;
@@ -1283,7 +1295,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     });
     await waitFor(() => calls === 1);
     assert.equal(closes.length, 0);
-    await engineManager.expireDiffusersStopGrace();
+    await awaitAlive(engineManager.expireDiffusersStopGrace());
     await awaitAlive(download, 15000);
     const raced = await racePrompt(pending);
     assert.equal(raced.kind, 'prompt');
@@ -1330,33 +1342,47 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       }
       return Promise.resolve();
     };
+    // Parking awaits a stat of the model directory. Releasing the reload
+    // before that stat returns surfaces the kill error instead of resuming.
+    const originalStat = fs.stat;
+    let parkStatDone = false;
+    fs.stat = async function statUntilParked(target, ...rest) {
+      try {
+        return await originalStat.call(fs, target, ...rest);
+      } finally {
+        if (String(target).includes('during-reload')) parkStatDone = true;
+      }
+    };
     const events = [];
-    const download = engineManager.downloadModel({
-      modelId: 'org/during-reload',
-      modelsCacheDir: cache,
-      onProgress: (info) => events.push(info),
-    });
-    const settled = download.then(
-      () => 'resolved',
-      (err) => err
-    );
-    await delay(40);
-    const early = await Promise.race([settled, delay(20).then(() => 'pending')]);
-    assert.equal(early, 'pending');
-    assert.equal(calls, 1);
-    releaseReload();
-    assert.equal(await awaitAlive(settled, 2000), 'resolved');
-    const raced = await racePrompt(pending);
-    assert.equal(raced.kind, 'prompt');
-    assert.equal(calls, 2);
-    assert.equal(
-      events.some((info) => info.phase === 'download' && info.status === 'complete'),
-      true
-    );
-    assert.equal(
-      events.some((info) => info.status === 'error'),
-      false
-    );
+    try {
+      const download = engineManager.downloadModel({
+        modelId: 'org/during-reload',
+        modelsCacheDir: cache,
+        onProgress: (info) => events.push(info),
+      });
+      const settled = download.then(
+        () => 'resolved',
+        (err) => err
+      );
+      await waitFor(() => parkStatDone);
+      await assertStillPending(settled);
+      assert.equal(calls, 1);
+      releaseReload();
+      assert.equal(await awaitAlive(settled, 15000), 'resolved');
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      assert.equal(calls, 2);
+      assert.equal(
+        events.some((info) => info.phase === 'download' && info.status === 'complete'),
+        true
+      );
+      assert.equal(
+        events.some((info) => info.status === 'error'),
+        false
+      );
+    } finally {
+      fs.stat = originalStat;
+    }
   });
 
   it('rejects a download that is still parking when the stop procedure ends', async () => {
@@ -1417,7 +1443,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       releaseStat();
       const err = await settled;
       assert.match(err.message, /Engine closed/);
-      await delay(30);
+      await new Promise((resolve) => setImmediate(resolve));
       assert.equal(calls, 1);
       assert.equal(
         events.some((info) => info.status === 'error'),
@@ -1442,7 +1468,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     engineManager.setDiffusersKillRecovery(async () => {
       releaseEntered();
       const start = Date.now();
-      while (!engineManager.isShuttingDown() && Date.now() - start < 2000) {
+      while (!engineManager.isShuttingDown() && Date.now() - start < 15000) {
         await delay(5);
       }
       sawShutdown = engineManager.isShuttingDown();
@@ -1460,7 +1486,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
 
     const outcome = await Promise.race([
       engineManager.shutdown({ hfDestroyTimeoutMs: 20 }).then(() => 'done'),
-      delay(1000).then(() => 'hung'),
+      delay(15000).then(() => 'hung'),
     ]);
     assert.equal(outcome, 'done');
     assert.equal(exitSettled, false);
