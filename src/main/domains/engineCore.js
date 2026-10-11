@@ -29,8 +29,13 @@ async function persistSelectedModelId(modelId) {
 async function enterNoModelState(opts = {}) {
   const { emitProgress = true } = opts;
   try {
-    await engineManager.ejectModel();
-  } catch {
+    await engineManager.ejectModel(
+      opts.allowDuringDiffusersStop ? { allowDuringDiffusersStop: true } : undefined
+    );
+  } catch (err) {
+    if (!opts.allowDuringDiffusersStop && err && err.message === 'Engine is busy.') {
+      throw err;
+    }
     /* worker may not be running */
   }
   await persistSelectedModelId(null);

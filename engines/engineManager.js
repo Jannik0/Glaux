@@ -78,16 +78,39 @@ let generationRun = 0;
  */
 const DIFFUSERS_STOP_GRACE_MS = 5000;
 let diffusersStopGraceMs = DIFFUSERS_STOP_GRACE_MS;
+/**
+ * How long to wait for the killed worker to exit before deleting its offload
+ * folder. Tests replace it with {@link setDiffusersWorkerExitMs}.
+ */
+const DIFFUSERS_WORKER_EXIT_MS = 5000;
+let diffusersWorkerExitMs = DIFFUSERS_WORKER_EXIT_MS;
 /** True from the cooperative stop until that run settles or the reload begins. */
 let diffusersStopPending = false;
-/** @type {{ stopGraceTimer?: ReturnType<typeof setTimeout> | null, killStarted?: boolean, settled?: boolean } | null} */
+/** @type {{ stopGraceTimer?: ReturnType<typeof setTimeout> | null, killStarted?: boolean, settled?: boolean, armedEngineId?: string | null, armedModelId?: string | null } | null} */
 let diffusersStopRun = null;
 /** @type {Promise<void> | null} */
 let diffusersReloadPromise = null;
 let diffusersReloadToken = 0;
+/** One in-flight model reload, shared by the stop kill and the stream idle timeout. */
+/** @type {Promise<void> | null} */
+let modelReloadJob = null;
 let shuttingDown = false;
-/** @type {(() => Promise<void> | void) | null} */
+/** @type {(() => Promise<unknown> | unknown) | null} */
 let diffusersKillRecovery = null;
+/**
+ * Offload folder parents. Null uses the production defaults (models cache,
+ * the model directory's parent, and /var/tmp except on Windows).
+ * @type {string[] | null}
+ */
+let diffusersOffloadBases = null;
+/**
+ * Downloads whose worker RPC was rejected by the stop kill. Resumed after a
+ * successful reload; rejected if the user cancels, the model is deleted, or
+ * the reload fails.
+ * @type {Array<{ modelId: string, progressId: string, hfOptions: object, existed: boolean, cancelled: boolean, error: Error, resolve: (value?: unknown) => void, reject: (err: Error) => void }>}
+ */
+let parkedDownloads = [];
+let resumingDownloads = false;
 
 /**
  * request id → run token. Settled ids are pruned down to the newest
@@ -197,14 +220,54 @@ function settleOwnedRun(run) {
   }
   run.settled = true;
   generationInFlight = false;
-  phase = 'idle';
   if (activeGeneration === run) {
     activeGeneration = null;
   }
   if (diffusersStopRun === run && !run.killStarted) {
     diffusersStopPending = false;
     diffusersStopRun = null;
+    phase = 'idle';
+    return;
   }
+  if (diffusersStopPending || diffusersReloadPromise) {
+    phase = 'loading';
+    return;
+  }
+  phase = 'idle';
+}
+
+function diffusersStopProcedureActive() {
+  return Boolean(diffusersStopPending || diffusersReloadPromise);
+}
+
+function assertDiffusersStopIdle() {
+  if (diffusersStopProcedureActive()) {
+    throw new Error('Engine is busy.');
+  }
+}
+
+/**
+ * @param {ReturnType<typeof setTimeout>} timer
+ */
+function unrefTimer(timer) {
+  if (timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  return timer;
+}
+
+/**
+ * @param {Promise<void>} promise
+ * @param {number} ms
+ */
+function raceUnrefTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = unrefTimer(setTimeout(resolve, ms));
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function isHuggingFaceDiffusion() {
@@ -221,29 +284,98 @@ function huggingfaceWorkerPid() {
 }
 
 /**
- * The next Diffusers load deletes a dead pid folder. Remove this one now so
- * the killed worker's offload files do not wait for that prepare.
- *
- * @param {number | null} pid
+ * Relative offload folder for one worker pid. Anything else is ignored.
+ * @param {number | null | undefined} pid
+ * @returns {string | null}
  */
-async function removeKilledDiffusersOffload(pid) {
-  if (!pid) {
-    return;
+function offloadRelativeDir(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
   }
-  const folder = path.join('.glaux-t2i-offload', `pid-${pid}`);
-  const dirs = new Set();
+  const rel = path.join('.glaux-t2i-offload', `pid-${pid}`);
+  if (!/^\.glaux-t2i-offload[\\/]pid-[1-9]\d*$/.test(rel)) {
+    return null;
+  }
+  return rel;
+}
+
+/**
+ * Parents of `.glaux-t2i-offload/pid-<pid>`. Production uses the models cache,
+ * the armed model directory's parent, and `/var/tmp` on Linux and macOS.
+ * Windows skips `/var/tmp`. Tests inject temp directories instead.
+ *
+ * @param {string | null | undefined} modelId Model id recorded when the grace was armed
+ * @param {NodeJS.Platform} [platform]
+ * @returns {string[]}
+ */
+function resolveOffloadBaseDirs(modelId, platform = process.platform) {
+  if (diffusersOffloadBases) {
+    return [...diffusersOffloadBases];
+  }
+  const bases = [];
   const cache = initOptions && initOptions.modelsCacheDir;
   if (typeof cache === 'string' && cache) {
-    dirs.add(path.resolve(cache, folder));
-    if (activeModelId) {
-      const modelDir = path.join(cache, ...String(activeModelId).split('/'));
-      dirs.add(path.resolve(path.dirname(modelDir), folder));
+    bases.push(path.resolve(cache));
+    if (modelId) {
+      const modelDir = path.join(cache, ...String(modelId).split('/'));
+      bases.push(path.resolve(path.dirname(modelDir)));
     }
   }
-  dirs.add(path.resolve('/var/tmp', folder));
-  await Promise.all(
-    [...dirs].map((dir) => fs.rm(dir, { recursive: true, force: true }).catch(() => {}))
-  );
+  if (platform !== 'win32') {
+    bases.push(path.resolve('/var/tmp'));
+  }
+  return bases;
+}
+
+/**
+ * Absolute offload directories for a killed worker. Empty when pid is not a
+ * positive integer.
+ *
+ * @param {number | null | undefined} pid
+ * @param {string | null | undefined} modelId
+ * @param {NodeJS.Platform} [platform]
+ * @returns {string[]}
+ */
+function killedOffloadPaths(pid, modelId, platform = process.platform) {
+  const rel = offloadRelativeDir(pid);
+  if (!rel) {
+    return [];
+  }
+  const targets = [];
+  for (const base of resolveOffloadBaseDirs(modelId, platform)) {
+    const root = path.resolve(base);
+    const target = path.resolve(root, rel);
+    const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+    if (!target.startsWith(prefix)) {
+      continue;
+    }
+    targets.push(target);
+  }
+  return targets;
+}
+
+/**
+ * @param {string} dir
+ */
+async function removeOffloadDir(dir) {
+  try {
+    await fs.rm(dir, { recursive: true, force: true });
+  } catch {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * The next Diffusers load deletes a dead pid folder. Remove this one now so
+ * the killed worker's offload files do not wait for that prepare.
+ * `modelId` is the id captured when the grace was armed.
+ *
+ * @param {number | null} pid
+ * @param {string | null | undefined} modelId
+ */
+async function removeKilledDiffusersOffload(pid, modelId) {
+  const dirs = killedOffloadPaths(pid, modelId);
+  await Promise.all(dirs.map((dir) => removeOffloadDir(dir)));
 }
 
 function armDiffusersStopGrace(run) {
@@ -252,15 +384,28 @@ function armDiffusersStopGrace(run) {
   }
   diffusersStopPending = true;
   diffusersStopRun = run;
-  run.stopGraceTimer = setTimeout(() => {
-    run.stopGraceTimer = null;
-    void killHungDiffusersRun(run);
-  }, diffusersStopGraceMs);
+  run.armedEngineId = activeEngineId;
+  run.armedModelId = activeModelId;
+  phase = 'loading';
+  run.stopGraceTimer = unrefTimer(
+    setTimeout(() => {
+      run.stopGraceTimer = null;
+      void killHungDiffusersRun(run);
+    }, diffusersStopGraceMs)
+  );
 }
 
 /**
  * @param {{ settled?: boolean, killStarted?: boolean, stopGraceTimer?: ReturnType<typeof setTimeout> | null }} run
  */
+function endDiffusersStopProcedure() {
+  diffusersStopPending = false;
+  diffusersStopRun = null;
+  if (!generationInFlight && !diffusersReloadPromise && phase === 'loading') {
+    phase = 'idle';
+  }
+}
+
 async function killHungDiffusersRun(run) {
   if (!run || run.settled || run.killStarted || shuttingDown) {
     return;
@@ -268,18 +413,30 @@ async function killHungDiffusersRun(run) {
   if (diffusersStopRun !== run) {
     return;
   }
+  if (run.armedEngineId !== activeEngineId || run.armedModelId !== activeModelId) {
+    endDiffusersStopProcedure();
+    return;
+  }
   run.killStarted = true;
   clearStopGrace(run);
   const pid = huggingfaceWorkerPid();
+  const armedModelId = run.armedModelId;
+  let closing = Promise.resolve();
   try {
-    const closing = engines.huggingface.close({ final: false });
-    if (closing && typeof closing.then === 'function') {
-      closing.catch(() => {});
+    const result = engines.huggingface.close({ final: false });
+    if (result && typeof result.then === 'function') {
+      closing = result;
     }
   } catch {
     /* worker already gone */
   }
-  await removeKilledDiffusersOffload(pid);
+  // The stream settles from rejectAll inside close(). Cleanup waits for the
+  // process to exit, bounded, so a Windows handle is not still open.
+  await raceUnrefTimeout(
+    Promise.resolve(closing).catch(() => {}),
+    diffusersWorkerExitMs
+  );
+  await removeKilledDiffusersOffload(pid, armedModelId);
   const deadline = Date.now() + 1000;
   while (!run.settled && Date.now() < deadline) {
     await new Promise((resolve) => {
@@ -287,17 +444,43 @@ async function killHungDiffusersRun(run) {
     });
   }
   if (shuttingDown) {
-    diffusersStopPending = false;
-    diffusersStopRun = null;
+    endDiffusersStopProcedure();
+    await resumeParkedDownloads(false);
     return;
   }
   startDiffusersReload();
 }
 
+/**
+ * Run `fn` unless a model reload is already in flight, in which case wait for
+ * that one. The stop-kill recovery and the stream idle-timeout recovery both
+ * use this so two triggers produce one reload.
+ *
+ * @param {() => Promise<unknown> | unknown} fn
+ * @returns {Promise<unknown>}
+ */
+function joinModelReload(fn) {
+  if (shuttingDown) {
+    return Promise.resolve();
+  }
+  if (modelReloadJob) {
+    return modelReloadJob;
+  }
+  const job = Promise.resolve()
+    .then(() => fn())
+    .finally(() => {
+      if (modelReloadJob === job) {
+        modelReloadJob = null;
+      }
+    });
+  modelReloadJob = job;
+  return job;
+}
+
 function startDiffusersReload() {
   if (shuttingDown) {
-    diffusersStopPending = false;
-    diffusersStopRun = null;
+    endDiffusersStopProcedure();
+    void resumeParkedDownloads(false);
     return;
   }
   const token = ++diffusersReloadToken;
@@ -308,20 +491,30 @@ function startDiffusersReload() {
   diffusersReloadPromise = gate;
   diffusersStopPending = false;
   diffusersStopRun = null;
+  phase = 'loading';
   const job = (async () => {
+    let reloadOk = false;
     try {
-      if (shuttingDown || token !== diffusersReloadToken) {
-        return;
-      }
-      if (typeof diffusersKillRecovery === 'function') {
-        await diffusersKillRecovery();
+      if (!shuttingDown && token === diffusersReloadToken && typeof diffusersKillRecovery === 'function') {
+        const result = await diffusersKillRecovery();
+        const failed = Boolean(result && /** @type {{ ok?: boolean }} */ (result).ok === false);
+        reloadOk = !failed && !shuttingDown && Boolean(activeModelId);
       }
     } catch (err) {
       console.error('Failed to reload the model after stopping image generation:', err);
+      reloadOk = false;
     } finally {
+      try {
+        await resumeParkedDownloads(reloadOk);
+      } catch (err) {
+        console.error('Failed to resume downloads after stopping image generation:', err);
+      }
       release();
       if (token === diffusersReloadToken && diffusersReloadPromise === gate) {
         diffusersReloadPromise = null;
+      }
+      if (!generationInFlight && !diffusersStopPending && phase === 'loading') {
+        phase = 'idle';
       }
     }
   })();
@@ -337,7 +530,26 @@ function setDiffusersStopGraceMs(ms) {
 }
 
 /**
- * @param {(() => Promise<void> | void) | null} fn
+ * @param {number} ms
+ */
+function setDiffusersWorkerExitMs(ms) {
+  const next = Number(ms);
+  diffusersWorkerExitMs = Number.isFinite(next) && next >= 0 ? next : DIFFUSERS_WORKER_EXIT_MS;
+}
+
+/**
+ * @param {string[] | null} dirs Null restores the production defaults.
+ */
+function setDiffusersOffloadBaseDirs(dirs) {
+  if (dirs == null) {
+    diffusersOffloadBases = null;
+    return;
+  }
+  diffusersOffloadBases = dirs.map((dir) => path.resolve(String(dir)));
+}
+
+/**
+ * @param {(() => Promise<unknown> | unknown) | null} fn
  */
 function setDiffusersKillRecovery(fn) {
   diffusersKillRecovery = typeof fn === 'function' ? fn : null;
@@ -407,8 +619,14 @@ async function ensureEnginePaths(opts) {
 }
 
 function getStatus() {
+  let reportedPhase = phase;
+  if (generationInFlight) {
+    reportedPhase = 'generating';
+  } else if (diffusersStopProcedureActive()) {
+    reportedPhase = 'loading';
+  }
   return {
-    phase: generationInFlight ? 'generating' : phase,
+    phase: reportedPhase,
     modelId: activeModelId,
     pipelineTag: activePipelineTag,
     engineId: activeEngineId,
@@ -840,6 +1058,14 @@ function imageResultFromPaths(imagePaths, text) {
  * @param {object} opts
  */
 async function initialize(opts) {
+  const privileged = Boolean(opts && opts.allowDuringDiffusersStop);
+  if (!privileged) {
+    assertDiffusersStopIdle();
+  }
+  if (opts && Object.prototype.hasOwnProperty.call(opts, 'allowDuringDiffusersStop')) {
+    opts = { ...opts };
+    delete opts.allowDuringDiffusersStop;
+  }
   shuttingDown = false;
   if (!opts || typeof opts.modelId !== 'string' || !opts.modelId.trim()) {
     throw new Error('Model id is required.');
@@ -924,11 +1150,15 @@ async function downloadBaseCompanions(baseModelId, progressModelId, report) {
   process.stderr.write(`[glaux] Fetching VAE and text encoder into ${baseModelId}.\n`);
   baseCompanionDownloadId = progressModelId;
   try {
-    await hfEngine.downloadModel(baseModelId, {
+  await runHfDownload(
+    baseModelId,
+    {
       allowPatterns: COMPANION_ALLOW_PATTERNS,
       progressId: progressModelId,
       onProgress: typeof report === 'function' ? (event) => report(event) : undefined,
-    });
+    },
+    progressModelId
+  );
   } finally {
     if (baseCompanionDownloadId === progressModelId) {
       baseCompanionDownloadId = null;
@@ -967,6 +1197,9 @@ async function ensureT2iBaseCompanions(modelId, modelsCacheDir, report) {
 function abandonCompanionRestore(modelId) {
   const id = typeof modelId === 'string' ? modelId.trim() : '';
   const job = id ? companionJobs.get(id) : null;
+  if (id) {
+    rejectParkedDownload(id);
+  }
   if (!job) {
     return Promise.resolve();
   }
@@ -1050,6 +1283,129 @@ async function restoreMissingBaseCompanions(modelId, job) {
   report({ phase: 'download', status: 'complete', modelId });
 }
 
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isWorkerKillError(err) {
+  const message = String(err && /** @type {{ message?: string }} */ (err).message ? err.message : err || '');
+  return /Engine closed|Python process killed|Python process exited|Python process is not running|Python worker is shutting down/i.test(
+    message
+  );
+}
+
+/**
+ * @param {string} modelId
+ * @returns {Promise<boolean>}
+ */
+async function modelCacheDirExists(modelId) {
+  const cache = initOptions && initOptions.modelsCacheDir;
+  if (!cache || !modelId) {
+    return false;
+  }
+  try {
+    const stats = await fs.stat(path.join(cache, ...String(modelId).split('/')));
+    return stats.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {string} id
+ * @returns {boolean}
+ */
+function rejectParkedDownload(id) {
+  const key = typeof id === 'string' ? id.trim() : '';
+  if (!key) {
+    return false;
+  }
+  let found = false;
+  parkedDownloads = parkedDownloads.filter((entry) => {
+    if (entry.modelId !== key && entry.progressId !== key) {
+      return true;
+    }
+    found = true;
+    entry.cancelled = true;
+    const err = new Error('Download cancelled');
+    err.code = 'DOWNLOAD_CANCELLED';
+    entry.reject(err);
+    return false;
+  });
+  return found;
+}
+
+/**
+ * @param {boolean} reloadOk
+ */
+async function resumeParkedDownloads(reloadOk) {
+  const batch = parkedDownloads.splice(0, parkedDownloads.length);
+  resumingDownloads = true;
+  try {
+    for (const entry of batch) {
+      if (entry.cancelled) {
+        continue;
+      }
+      if (!reloadOk || (entry.existed && !(await modelCacheDirExists(entry.modelId)))) {
+        entry.reject(entry.error);
+        continue;
+      }
+      try {
+        if (typeof entry.hfOptions.onProgress === 'function') {
+          entry.hfOptions.onProgress({
+            phase: 'download',
+            status: 'starting',
+            modelId: entry.progressId || entry.modelId,
+          });
+        }
+        await hfEngine.downloadModel(entry.modelId, entry.hfOptions);
+        entry.resolve();
+      } catch (err) {
+        entry.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+  } finally {
+    resumingDownloads = false;
+  }
+}
+
+/**
+ * Hugging Face download that stays pending when the stop kill rejects it, then
+ * resumes on the existing path after the model reload.
+ *
+ * @param {string} modelId
+ * @param {object} hfOptions
+ * @param {string} progressId
+ */
+async function runHfDownload(modelId, hfOptions, progressId) {
+  try {
+    await hfEngine.downloadModel(modelId, hfOptions);
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (
+      resumingDownloads ||
+      shuttingDown ||
+      !isWorkerKillError(error) ||
+      !diffusersStopProcedureActive()
+    ) {
+      throw error;
+    }
+    const existed = await modelCacheDirExists(modelId);
+    await new Promise((resolve, reject) => {
+      parkedDownloads.push({
+        modelId,
+        progressId: progressId || modelId,
+        hfOptions,
+        existed,
+        cancelled: false,
+        error,
+        resolve,
+        reject,
+      });
+    });
+  }
+}
+
 async function downloadModel(opts) {
   if (!opts || typeof opts.modelId !== 'string' || !opts.modelId.trim()) {
     throw new Error('Model id is required.');
@@ -1071,11 +1427,15 @@ async function downloadModel(opts) {
   if (isGgufDownload(opts)) {
     await ensureT2iBaseCompanions(modelId, modelsCacheDir, report);
   }
-  await hfEngine.downloadModel(modelId, {
-    onProgress: (event) => report(event),
-    allowPatterns: opts.allowPatterns,
-    ggufVariant: opts.ggufVariant,
-  });
+  await runHfDownload(
+    modelId,
+    {
+      onProgress: (event) => report(event),
+      allowPatterns: opts.allowPatterns,
+      ggufVariant: opts.ggufVariant,
+    },
+    modelId
+  );
   report({ phase: 'download', status: 'complete', modelId });
 }
 
@@ -1087,8 +1447,12 @@ async function cancelModelDownload(modelId, opts = {}) {
   if (!modelId || typeof modelId !== 'string' || !modelId.trim()) {
     throw new Error('Model id is required.');
   }
+  const id = modelId.trim();
+  if (rejectParkedDownload(id)) {
+    return;
+  }
   await ensureDownloadEnginePaths(opts);
-  return hfEngine.cancelDownloadModel(modelId.trim());
+  return hfEngine.cancelDownloadModel(id);
 }
 
 /**
@@ -1113,6 +1477,10 @@ async function listHubModelFiles(modelId, opts = {}) {
  * @param {object} opts
  */
 async function reinitialize(opts) {
+  const privileged = Boolean(opts && opts.allowDuringDiffusersStop);
+  if (!privileged) {
+    assertDiffusersStopIdle();
+  }
   const next = opts || initOptions;
   if (!next || typeof next.modelId !== 'string' || !next.modelId.trim()) {
     throw new Error('Model id is required.');
@@ -1127,15 +1495,20 @@ async function reinitialize(opts) {
     }
   }
 
-  initOptions = { ...initOptions, ...next, modelId: nextId };
+  const stored = { ...initOptions, ...next, modelId: nextId };
+  delete stored.allowDuringDiffusersStop;
+  initOptions = stored;
   await ensureEnginePaths(initOptions);
-  return initialize(initOptions);
+  return initialize(privileged ? { ...initOptions, allowDuringDiffusersStop: true } : initOptions);
 }
 
 /**
  * Unload the active chat model (keeps workers alive when possible).
  */
-async function ejectModel() {
+async function ejectModel(opts) {
+  if (!(opts && opts.allowDuringDiffusersStop)) {
+    assertDiffusersStopIdle();
+  }
   if (generationInFlight) {
     throw new Error('Wait until generation finishes before ejecting the model.');
   }
@@ -1195,6 +1568,10 @@ async function shutdown(options = {}) {
   clearStopGrace(diffusersStopRun);
   clearStopGrace(activeGeneration);
   diffusersStopRun = null;
+  const abandoned = parkedDownloads.splice(0, parkedDownloads.length);
+  for (const entry of abandoned) {
+    entry.reject(entry.error || new Error('Engine closed'));
+  }
   for (const engine of Object.values(engines)) {
     try {
       await engine.chatStop();
@@ -1588,9 +1965,14 @@ module.exports = {
   shutdown,
   resetInferenceWorker,
   setDiffusersStopGraceMs,
+  setDiffusersWorkerExitMs,
+  setDiffusersOffloadBaseDirs,
+  killedOffloadPaths,
   setDiffusersKillRecovery,
+  joinModelReload,
   isShuttingDown,
   DIFFUSERS_STOP_GRACE_MS,
+  DIFFUSERS_WORKER_EXIT_MS,
   sendPrompt,
   cancelGeneration,
   cancelRequestGeneration,

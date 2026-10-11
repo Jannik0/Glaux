@@ -229,6 +229,9 @@ function terminateProcess(proc) {
 }
 
 function rejectAll(reason) {
+  // A killed worker rejects every RPC, including a model download. Drop the id
+  // so a later download is not treated as the one that just died.
+  activeDownloadRpcId = null;
   for (const [, { reject }] of pending) {
     reject(reason);
   }
@@ -658,4 +661,15 @@ module.exports = {
 
   /** Pid of the live worker, used to drop its disk-offload folder after a kill. */
   workerPid: () => (isChildAlive(child) && child.pid ? child.pid : null),
+
+  /** @returns {number | null} */
+  activeDownloadRpcId: () => activeDownloadRpcId,
+
+  /**
+   * Test hook. Production downloads set this when the RPC is sent.
+   * @param {number | null} id
+   */
+  setActiveDownloadRpcId: (id) => {
+    activeDownloadRpcId = id;
+  },
 };

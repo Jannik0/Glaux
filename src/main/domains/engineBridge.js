@@ -107,34 +107,50 @@ function normalizeFilesPayload(rawFiles) {
 async function recoverLoadedModelAfterWorkerReset(logLabel) {
   try {
     if (engineManager.isShuttingDown()) {
-      return;
+      return { ok: false };
     }
     await engineManager.resetInferenceWorker();
     await clearPersistedModelIfNotCached();
     const modelId = getEngineInitModelId();
     if (modelId && (await modelIdHasCachedWeights(modelId))) {
       if (engineManager.isShuttingDown()) {
-        return;
+        return { ok: false };
       }
-      const loaded = await engineManager.reinitialize(getEngineInitOptions());
+      const loaded = await engineManager.reinitialize({
+        ...getEngineInitOptions(),
+        allowDuringDiffusersStop: true,
+      });
       if (loaded && loaded.downloadRequired) {
         await noteCompanionDownloadRequired(modelId);
       } else {
         state.engineBootstrapped = true;
       }
-    } else {
-      await enterNoModelState();
+      return { ok: true };
     }
+    await enterNoModelState({ allowDuringDiffusersStop: true });
+    return { ok: false };
   } catch (reinitErr) {
     console.error(logLabel, reinitErr);
     try {
       if (!engineManager.isShuttingDown()) {
-        await enterNoModelState();
+        await enterNoModelState({ allowDuringDiffusersStop: true });
       }
     } catch {
       /* ignore */
     }
+    return { ok: false };
   }
+}
+
+/**
+ * One shared reload for the Diffusers stop kill and a stream idle timeout.
+ * A second caller waits for the reload already in flight.
+ *
+ * @param {string} logLabel
+ * @returns {Promise<unknown>}
+ */
+function requestWorkerReload(logLabel) {
+  return engineManager.joinModelReload(() => recoverLoadedModelAfterWorkerReset(logLabel));
 }
 
 async function persistTurnSession(logLabel, deps) {
@@ -449,7 +465,7 @@ function handleEngineStreamStart(event, payload) {
         (err && err.code === 'E_TIMEOUT') ||
         /stream timed out/i.test(String(err && err.message ? err.message : err));
       if (isStreamIdleTimeout) {
-        await recoverLoadedModelAfterWorkerReset(
+        await requestWorkerReload(
           'Failed to reinitialize inference engine after stream timeout:'
         );
       } else {
@@ -604,7 +620,7 @@ function registerEngineBridgeIpc() {
 }
 
 engineManager.setDiffusersKillRecovery(() =>
-  recoverLoadedModelAfterWorkerReset('Failed to reload the model after stopping image generation:')
+  requestWorkerReload('Failed to reload the model after stopping image generation:')
 );
 
 module.exports = {
@@ -614,4 +630,5 @@ module.exports = {
   handleEngineStreamStart,
   handleEngineCancel,
   cancelStreamRequest,
+  requestWorkerReload,
 };

@@ -26,6 +26,7 @@ const { clearPendingSessionFilename } = require('../src/main/domains/sessions');
 const {
   cancelStreamRequest,
   handleEngineStreamStart,
+  requestWorkerReload,
 } = require('../src/main/domains/engineBridge');
 
 const WORKER_PID = 4321;
@@ -38,10 +39,24 @@ const original = {
   close: hf.close,
   chatStop: hf.chatStop,
   workerPid: hf.workerPid,
+  downloadModel: hf.downloadModel,
 };
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Keep the event loop alive while an unref'd stop timer settles `promise`. */
+async function awaitAlive(promise, ms = 1000) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timed out')), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function waitFor(predicate, ms = 1000) {
@@ -109,6 +124,8 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
   let exitResolve;
   let resolveRun;
   let rejectRun;
+  let rejectDownload;
+  let offloadBases;
 
   before(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'glaux-diffusers-stop-'));
@@ -133,6 +150,12 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       outputsRoot: path.join(root, 'Outputs'),
     });
     state.engineBootstrapped = true;
+    offloadBases = [
+      path.join(root, 'offload', 'cache'),
+      path.join(root, 'offload', 'parent'),
+      path.join(root, 'offload', 'tmp'),
+    ];
+    engineManager.setDiffusersOffloadBaseDirs(offloadBases);
     const status = engineManager.getStatus();
     assert.equal(status.engineId, 'huggingface');
     assert.equal(status.pipelineTag, 'text-to-image');
@@ -150,7 +173,10 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     resolveRun = null;
     rejectRun = null;
     engineManager.setDiffusersStopGraceMs(40);
+    engineManager.setDiffusersWorkerExitMs(25);
+    engineManager.setDiffusersOffloadBaseDirs(offloadBases);
     engineManager.setDiffusersKillRecovery(async () => {});
+    rejectDownload = null;
     hf.workerPid = () => WORKER_PID;
     hf.chatStop = () => {
       stops += 1;
@@ -161,6 +187,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
         resolveRun = resolve;
         rejectRun = reject;
       });
+    hf.downloadModel = async () => {
+      throw new Error('unexpected download');
+    };
     hf.close = (options = {}) => {
       const final = options.final !== false;
       closes.push({ final });
@@ -170,6 +199,11 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
         resolveRun = null;
         if (typeof reject === 'function') {
           reject(new Error('Engine closed'));
+        }
+        if (typeof rejectDownload === 'function') {
+          const rejectDl = rejectDownload;
+          rejectDownload = null;
+          rejectDl(new Error('Engine closed'));
         }
         return new Promise((resolve) => {
           exitResolve = () => {
@@ -190,6 +224,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     hf.close = original.close;
     hf.chatStop = original.chatStop;
     hf.workerPid = original.workerPid;
+    hf.downloadModel = original.downloadModel;
+    engineManager.setDiffusersOffloadBaseDirs(null);
+    engineManager.setDiffusersWorkerExitMs(engineManager.DIFFUSERS_WORKER_EXIT_MS);
     engineManager.setDiffusersStopGraceMs(engineManager.DIFFUSERS_STOP_GRACE_MS);
     engineManager.setDiffusersKillRecovery(async () => {});
     contextManager.clear();
@@ -205,11 +242,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
 
   async function plantOffload() {
     const folder = path.join('.glaux-t2i-offload', `pid-${WORKER_PID}`);
-    const dirs = [
-      path.join(cache, folder),
-      path.join(cache, 'org', folder),
-      path.join('/var/tmp', folder),
-    ];
+    const dirs = offloadBases.map((base) => path.join(base, folder));
     for (const dir of dirs) {
       await fs.mkdir(dir, { recursive: true });
       await fs.writeFile(path.join(dir, 'weight.bin'), 'w');
@@ -226,8 +259,11 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
 
   it('keeps the production stop grace at 5000 ms', () => {
     assert.equal(engineManager.DIFFUSERS_STOP_GRACE_MS, 5000);
+    assert.equal(engineManager.DIFFUSERS_WORKER_EXIT_MS, 5000);
     engineManager.setDiffusersStopGraceMs(40);
+    engineManager.setDiffusersWorkerExitMs(25);
     assert.equal(engineManager.DIFFUSERS_STOP_GRACE_MS, 5000);
+    assert.equal(engineManager.DIFFUSERS_WORKER_EXIT_MS, 5000);
     assert.equal(typeof recoveryInstalls[0], 'function');
   });
 
@@ -282,6 +318,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     assert.equal(closes.length, 0);
     assert.equal(stops, 1);
     assert.equal(exitSettled, false);
+    assert.equal(engineManager.getStatus().phase, 'idle');
 
     const next = await allocateSessionImagePath(sessions, 'coop-next.json');
     finishRunChat();
@@ -344,7 +381,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
 
     const raced = await racePrompt(pending);
     assert.equal(raced.kind, 'prompt');
-    await enteredReload;
+    await awaitAlive(enteredReload);
     assert.equal(entered, true);
     await assert.rejects(
       engineManager.sendPrompt('a yellow fox', {
@@ -406,6 +443,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     assert.deepEqual(closes, [{ final: false }]);
     await turn;
     assert.equal(exitSettled, false);
+    await waitFor(() => engineManager.getStatus().phase !== 'loading');
     const canceled = sender.events.find((event) => event.type === 'canceled');
     assert.equal(canceled.requestId, 'diffusers-stream');
     assert.equal(
@@ -416,6 +454,394 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       { role: 'user', text: 'a red fox', image: null },
       { role: 'assistant', text: STOP_MARKER, image: null },
     ]);
+  });
+
+  function modelInit(modelId, extra = {}) {
+    return {
+      modelId,
+      modelsCacheDir: cache,
+      sessionsRoot: sessions,
+      resourcesRoot: path.join(root, 'Resources'),
+      outputsRoot: path.join(root, 'Outputs'),
+      ...extra,
+    };
+  }
+
+  it('rejects model changes during the stop and skips the kill if the model changed', async () => {
+    const otherDir = path.join(cache, 'org', 'other');
+    await fs.mkdir(otherDir, { recursive: true });
+    await fs.writeFile(path.join(otherDir, 'model.safetensors'), 'weights');
+    await fs.writeFile(path.join(otherDir, 'README.md'), '---\npipeline_tag: text-generation\n---\n');
+    const allocated = await allocateSessionImagePath(sessions, 'switch.json');
+    engineManager.setDiffusersStopGraceMs(400);
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    assert.equal(engineManager.getStatus().phase, 'loading');
+    await assert.rejects(engineManager.ejectModel(), /Engine is busy\./);
+    await assert.rejects(engineManager.reinitialize(modelInit('org/diffusers')), /Engine is busy\./);
+    await assert.rejects(engineManager.initialize(modelInit('org/diffusers')), /Engine is busy\./);
+    assert.equal(engineManager.getStatus().modelId, 'org/diffusers');
+    assert.equal(engineManager.getStatus().engineId, 'huggingface');
+
+    await engineManager.reinitialize(
+      modelInit('org/other', { allowDuringDiffusersStop: true })
+    );
+    assert.equal(engineManager.getStatus().modelId, 'org/other');
+    await delay(500);
+    assert.equal(closes.length, 0);
+    assert.equal(engineManager.getStatus().phase, 'idle');
+    resolveRun({ text: '', imagePaths: [allocated.absolutePath] });
+    assert.equal(await pending, STOP_MARKER);
+    await engineManager.reinitialize(modelInit('org/diffusers'));
+    assert.equal(engineManager.getStatus().modelId, 'org/diffusers');
+    assert.equal(engineManager.getStatus().pipelineTag, 'text-to-image');
+  });
+
+  it('reports loading for the whole stop and the reload-model progress events', async () => {
+    const events = [];
+    let releaseReload = () => {};
+    let markEntered;
+    const entered = new Promise((resolve) => {
+      markEntered = resolve;
+    });
+    const originalCreate = hf.chatbotCreate;
+    hf.chatbotCreate = async (_modelId, options) => {
+      if (options && typeof options.onProgress === 'function') {
+        options.onProgress({ loaded: 1, total: 2, percent: 50 });
+      }
+    };
+    engineManager.setDiffusersKillRecovery(async () => {
+      markEntered();
+      await new Promise((resolve) => {
+        releaseReload = resolve;
+      });
+      await engineManager.reinitialize(
+        modelInit('org/diffusers', {
+          allowDuringDiffusersStop: true,
+          onProgress: (info) => events.push(info),
+        })
+      );
+    });
+    try {
+      const allocated = await allocateSessionImagePath(sessions, 'loading.json');
+      const pending = engineManager.sendPrompt('a red fox', {
+        outputPath: allocated.absolutePath,
+        reservationId: allocated.reservationId,
+      });
+      engineManager.cancelGeneration();
+      assert.equal(engineManager.getStatus().phase, 'loading');
+      assert.equal(engineManager.getStatus().phase === 'idle', false);
+      await awaitAlive(entered);
+      assert.equal(engineManager.getStatus().phase, 'loading');
+      releaseReload();
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      await waitFor(() => engineManager.getStatus().phase === 'idle');
+      assert.equal(
+        events.some((info) => info.phase === 'loading' && info.status === 'starting'),
+        true
+      );
+      assert.equal(
+        events.some((info) => info.phase === 'loading' && info.status === 'progress'),
+        true
+      );
+      assert.equal(
+        events.some((info) => info.phase === 'loading' && info.status === 'complete'),
+        true
+      );
+    } finally {
+      hf.chatbotCreate = originalCreate;
+      releaseReload();
+    }
+  });
+
+  it('removes offload only after a late worker exit', async () => {
+    engineManager.setDiffusersWorkerExitMs(500);
+    const allocated = await allocateSessionImagePath(sessions, 'late-exit.json');
+    const offloadDirs = await plantOffload();
+    let reloaded = false;
+    engineManager.setDiffusersKillRecovery(() => {
+      reloaded = true;
+    });
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    const raced = await racePrompt(pending);
+    assert.equal(raced.kind, 'prompt');
+    assert.equal(raced.value, STOP_MARKER);
+    assert.equal(exitSettled, false);
+    assert.equal(reloaded, false);
+    for (const dir of offloadDirs) {
+      assert.equal(await fs.readFile(path.join(dir, 'weight.bin'), 'utf8'), 'w');
+    }
+    exitResolve();
+    await waitFor(() => reloaded);
+    assert.equal(exitSettled, true);
+    for (const dir of offloadDirs) {
+      await assert.rejects(fs.stat(dir));
+    }
+  });
+
+  it('retries offload removal once when the first delete fails', async () => {
+    const base = path.join(root, 'retry-offload');
+    engineManager.setDiffusersOffloadBaseDirs([base]);
+    const dir = path.join(base, '.glaux-t2i-offload', `pid-${WORKER_PID}`);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'weight.bin'), 'w');
+    const fsPromises = require('fs').promises;
+    const originalRm = fsPromises.rm;
+    let failures = 0;
+    fsPromises.rm = async function rmOnce(target, opts) {
+      if (path.resolve(String(target)) === path.resolve(dir) && failures < 1) {
+        failures += 1;
+        const err = new Error('busy');
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return originalRm.call(fsPromises, target, opts);
+    };
+    try {
+      const allocated = await allocateSessionImagePath(sessions, 'retry.json');
+      let reloaded = false;
+      engineManager.setDiffusersKillRecovery(() => {
+        reloaded = true;
+      });
+      const pending = engineManager.sendPrompt('a red fox', {
+        outputPath: allocated.absolutePath,
+        reservationId: allocated.reservationId,
+      });
+      engineManager.cancelGeneration();
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      await waitFor(() => reloaded);
+      assert.equal(failures, 1);
+      await assert.rejects(fs.stat(dir));
+    } finally {
+      fsPromises.rm = originalRm;
+      engineManager.setDiffusersOffloadBaseDirs(offloadBases);
+    }
+  });
+
+  it('builds offload paths from the armed model and skips /var/tmp on Windows', () => {
+    engineManager.setDiffusersOffloadBaseDirs(null);
+    try {
+      const linux = engineManager.killedOffloadPaths(WORKER_PID, 'org/diffusers', 'linux');
+      const win = engineManager.killedOffloadPaths(WORKER_PID, 'org/diffusers', 'win32');
+      const other = engineManager.killedOffloadPaths(WORKER_PID, 'otherorg/model', 'linux');
+      const folder = path.join('.glaux-t2i-offload', `pid-${WORKER_PID}`);
+      assert.ok(linux.some((dir) => dir === path.resolve('/var/tmp', folder)));
+      assert.equal(
+        win.some((dir) => dir.startsWith(path.resolve('/var/tmp'))),
+        false
+      );
+      assert.ok(linux.some((dir) => dir === path.resolve(cache, 'org', folder)));
+      assert.ok(other.some((dir) => dir === path.resolve(cache, 'otherorg', folder)));
+      assert.equal(other.some((dir) => dir === path.resolve(cache, 'org', folder)), false);
+      assert.deepEqual(engineManager.killedOffloadPaths(0, 'org/diffusers', 'linux'), []);
+      assert.deepEqual(engineManager.killedOffloadPaths(1.5, 'org/diffusers', 'linux'), []);
+      assert.equal(
+        linux.some((dir) => dir.startsWith('/var/tmp') && !dir.includes('.glaux-t2i-offload')),
+        false
+      );
+    } finally {
+      engineManager.setDiffusersOffloadBaseDirs(offloadBases);
+    }
+  });
+
+  it('joins the stop reload and the stream-timeout reload into one', async () => {
+    const orig = engineManager.joinModelReload.bind(engineManager);
+    const seen = [];
+    engineManager.joinModelReload = (fn) => {
+      seen.push(fn);
+      return Promise.resolve();
+    };
+    try {
+      await recoveryInstalls[0]();
+      await requestWorkerReload('Failed to reinitialize inference engine after stream timeout:');
+      assert.equal(seen.length, 2);
+    } finally {
+      engineManager.joinModelReload = orig;
+    }
+    let runs = 0;
+    let release;
+    const hold = new Promise((resolve) => {
+      release = resolve;
+    });
+    const first = orig(async () => {
+      runs += 1;
+      await hold;
+    });
+    const second = orig(async () => {
+      runs += 1;
+    });
+    await Promise.resolve();
+    assert.equal(runs, 1);
+    release();
+    await Promise.all([first, second]);
+    assert.equal(runs, 1);
+  });
+
+  function trackDownload() {
+    let calls = 0;
+    hf.downloadModel = (_modelId, options) => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise((_resolve, reject) => {
+          rejectDownload = () => reject(new Error('Engine closed'));
+        });
+      }
+      if (options && typeof options.onProgress === 'function') {
+        options.onProgress({ status: 'progress', loaded: 3, total: 4, file: 'download' });
+      }
+      return Promise.resolve();
+    };
+    return {
+      calls: () => calls,
+    };
+  }
+
+  async function startParkedDownload(modelId) {
+    const tracked = trackDownload();
+    const events = [];
+    const download = engineManager.downloadModel({
+      modelId,
+      modelsCacheDir: cache,
+      onProgress: (info) => events.push(info),
+    });
+    await waitFor(() => tracked.calls() === 1);
+    return { tracked, events, download };
+  }
+
+  it('resumes a download aborted by the kill after reload', async () => {
+    const { tracked, events, download } = await startParkedDownload('org/side');
+    let releaseReload = () => {};
+    let markEntered;
+    const entered = new Promise((resolve) => {
+      markEntered = resolve;
+    });
+    engineManager.setDiffusersKillRecovery(() => {
+      markEntered();
+      return new Promise((resolve) => {
+        releaseReload = resolve;
+      });
+    });
+    const allocated = await allocateSessionImagePath(sessions, 'resume.json');
+    const pending = engineManager.sendPrompt('a red fox', {
+      outputPath: allocated.absolutePath,
+      reservationId: allocated.reservationId,
+    });
+    engineManager.cancelGeneration();
+    await awaitAlive(entered);
+    assert.equal(tracked.calls(), 1);
+    releaseReload();
+    const raced = await racePrompt(pending);
+    assert.equal(raced.kind, 'prompt');
+    await download;
+    assert.equal(tracked.calls(), 2);
+    assert.equal(
+      events.some((info) => info.phase === 'download' && info.status === 'starting'),
+      true
+    );
+    assert.equal(
+      events.some((info) => info.phase === 'download' && info.status === 'complete'),
+      true
+    );
+    assert.equal(
+      events.some((info) => info.status === 'error'),
+      false
+    );
+  });
+
+  it('does not resume a download the user cancelled during reload', async () => {
+    const { tracked, download } = await startParkedDownload('org/cancel-me');
+    let releaseReload = () => {};
+    let markEntered;
+    const entered = new Promise((resolve) => {
+      markEntered = resolve;
+    });
+    engineManager.setDiffusersKillRecovery(() => {
+      markEntered();
+      return new Promise((resolve) => {
+        releaseReload = resolve;
+      });
+    });
+    try {
+      const allocated = await allocateSessionImagePath(sessions, 'cancel-dl.json');
+      const pending = engineManager.sendPrompt('a red fox', {
+        outputPath: allocated.absolutePath,
+        reservationId: allocated.reservationId,
+      });
+      engineManager.cancelGeneration();
+      await awaitAlive(entered);
+      const cancelled = download.then(
+        () => null,
+        (err) => err
+      );
+      await engineManager.cancelModelDownload('org/cancel-me', { modelsCacheDir: cache });
+      const err = await cancelled;
+      assert.equal(err.code, 'DOWNLOAD_CANCELLED');
+      releaseReload();
+      await racePrompt(pending);
+      await delay(40);
+      assert.equal(tracked.calls(), 1);
+    } finally {
+      releaseReload();
+    }
+  });
+
+  it('does not resume a download when reload fails or the model was deleted', async () => {
+    const failed = await startParkedDownload('org/fail-dl');
+    engineManager.setDiffusersKillRecovery(async () => ({ ok: false }));
+    const failedPath = await allocateSessionImagePath(sessions, 'fail-dl.json');
+    const failedPrompt = engineManager.sendPrompt('a red fox', {
+      outputPath: failedPath.absolutePath,
+      reservationId: failedPath.reservationId,
+    });
+    engineManager.cancelGeneration();
+    await awaitAlive(assert.rejects(failed.download, /Engine closed/));
+    const failedRace = await racePrompt(failedPrompt);
+    assert.equal(failedRace.kind, 'prompt');
+    assert.equal(failed.tracked.calls(), 1);
+
+    const deletedDir = path.join(cache, 'org', 'deleted-dl');
+    await fs.mkdir(deletedDir, { recursive: true });
+    const deleted = await startParkedDownload('org/deleted-dl');
+    let releaseReload = () => {};
+    let markEntered;
+    const entered = new Promise((resolve) => {
+      markEntered = resolve;
+    });
+    engineManager.setDiffusersKillRecovery(() => {
+      markEntered();
+      return new Promise((resolve) => {
+        releaseReload = resolve;
+      });
+    });
+    const deletedPath = await allocateSessionImagePath(sessions, 'deleted-dl.json');
+    const deletedPrompt = engineManager.sendPrompt('a blue fox', {
+      outputPath: deletedPath.absolutePath,
+      reservationId: deletedPath.reservationId,
+    });
+    engineManager.cancelGeneration();
+    await awaitAlive(entered);
+    await fs.rm(deletedDir, { recursive: true, force: true });
+    releaseReload();
+    await assert.rejects(deleted.download, /Engine closed/);
+    const deletedRace = await racePrompt(deletedPrompt);
+    assert.equal(deletedRace.kind, 'prompt');
+    assert.equal(deleted.tracked.calls(), 1);
+  });
+
+  it('clears the active download rpc id when the worker is closed', async () => {
+    hf.setActiveDownloadRpcId(9);
+    assert.equal(hf.activeDownloadRpcId(), 9);
+    await original.close({ final: false });
+    assert.equal(hf.activeDownloadRpcId(), null);
   });
 
   it('returns from shutdown during reload without waiting for worker exit', async () => {
@@ -439,7 +865,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       reservationId: allocated.reservationId,
     });
     engineManager.cancelGeneration();
-    await entered;
+    await awaitAlive(entered);
     const raced = await racePrompt(pending);
     assert.equal(raced.kind, 'prompt');
     assert.equal(exitSettled, false);
