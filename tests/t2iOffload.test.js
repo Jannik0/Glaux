@@ -2195,7 +2195,7 @@ for param in partial.parameters():
     assert param.dtype == torch.float16, param.dtype
 
 class TypelessPartialVae:
-    """No ``dtype`` attribute. The failed upcast restores the pipeline dtype."""
+    # No dtype attribute. The failed upcast restores the pipeline dtype.
 
     def __init__(self):
         self.keep = nn.Linear(2, 2, bias=False).to(dtype=torch.float16)
