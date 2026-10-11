@@ -14,6 +14,7 @@ import gc
 import os
 import sys
 import threading
+import traceback
 import types
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_lo
 from .t2i import (
     DiffusionStopped,
     _CUDA_TIER_ORDER,
+    clear_cuda_tier_limit,
     generate_text_to_image,
     load_text_to_image_pipeline,
     lower_cuda_tier_after_oom,
@@ -193,7 +195,13 @@ def _diffusion_uses_cuda() -> bool:
 
 
 def _reload_same_diffusion_model() -> None:
-    """Drop the loaded pipeline and build it again. Caller holds ``_CHAT_LOCK``."""
+    """Drop the loaded pipeline and build it again. Caller holds ``_CHAT_LOCK``.
+
+    Call this only after the ``except`` that caught the failure has exited.
+    While that handler is on the stack, ``sys.exception()`` keeps the traceback,
+    and the traceback keeps the failed pipeline alive, so the ``gc.collect()``
+    here cannot free it before the next load measures memory.
+    """
     model_id = CHATBOT_MODEL_ID
     old = _chatbot_destroy_unlocked()
     if old is not None:
@@ -207,6 +215,31 @@ def _reload_same_diffusion_model() -> None:
     if not model_id:
         raise RuntimeError("No diffusion model is loaded.")
     chatbot_create(model_id)
+
+
+def _reload_diffusion_on_cpu(summary: str) -> None:
+    """Drop the CUDA pipeline and load the same model on CPU. Caller holds ``_CHAT_LOCK``.
+
+    *summary* is text only. The exception object is not accepted here, because
+    this reload runs after the handler that caught it has exited.
+    """
+    model_id = CHATBOT_MODEL_ID
+    print(
+        f"CUDA failed ({summary}); retrying on CPU.",
+        file=sys.stderr,
+        flush=True,
+    )
+    old = _chatbot_destroy_unlocked()
+    if old is not None:
+        del old
+    gc.collect()
+    try:
+        _release_torch_cache()
+    except Exception:
+        pass
+    release_disk_offload()
+    if model_id:
+        chatbot_create(model_id)
 
 
 def _pipeline_uses_cuda() -> bool:
@@ -223,25 +256,16 @@ def _pipeline_uses_cuda() -> bool:
 
 
 def _fallback_pipeline_to_cpu(exc: BaseException) -> None:
-    """Drop the CUDA pipeline and load the same model on CPU. Caller holds ``_CHAT_LOCK``."""
-    model_id = CHATBOT_MODEL_ID
-    _note_cuda_failure(exc, model_id)
-    print(
-        f"CUDA failed ({_cuda_failure_summary(exc)}); retrying on CPU.",
-        file=sys.stderr,
-        flush=True,
-    )
-    old = _chatbot_destroy_unlocked()
-    if old is not None:
-        del old
-    gc.collect()
-    try:
-        _release_torch_cache()
-    except Exception:
-        pass
-    release_disk_offload()
-    if model_id:
-        chatbot_create(model_id)
+    """Drop the CUDA pipeline and load the same model on CPU. Caller holds ``_CHAT_LOCK``.
+
+    Chat generation does not call this from inside the ``except`` that owns
+    *exc*. That path records the failure, clears the traceback, and calls
+    :func:`_reload_diffusion_on_cpu` after the handler exits. This helper
+    remains for the text-generation stream, which reloads before another
+    pipeline is measured.
+    """
+    _note_cuda_failure(exc, CHATBOT_MODEL_ID)
+    _reload_diffusion_on_cpu(_cuda_failure_summary(exc))
 
 
 @contextmanager
@@ -332,17 +356,20 @@ def chatbot_create(model_id: str):
             if _force_cpu() or _cuda_unavailable or not _is_cuda_failure(exc):
                 raise
             _note_cuda_failure(exc, CHATBOT_MODEL_ID)
-            gc.collect()
-            try:
-                _release_torch_cache()
-            except Exception:
-                pass
-            print(
-                f"CUDA failed while loading the model ({_cuda_failure_summary(exc)}); retrying on CPU.",
-                file=sys.stderr,
-                flush=True,
-            )
-            return _build_pipeline({"device": "cpu"})
+            summary = _cuda_failure_summary(exc)
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
+        gc.collect()
+        try:
+            _release_torch_cache()
+        except Exception:
+            pass
+        print(
+            f"CUDA failed while loading the model ({summary}); retrying on CPU.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _build_pipeline({"device": "cpu"})
 
     if _download._load_progress_callback is not None:
         with _load_progress_tqdm_hook():
@@ -360,11 +387,18 @@ def _configure_asr_generation_limits() -> None:
         generation_config.max_new_tokens = None
 
 def _release_torch_cache() -> None:
-    """Return cached GPU/MPS allocations to the driver when torch is available."""
+    """Return cached GPU/MPS allocations, and pinned host memory, to the driver."""
     try:
         import torch
     except ImportError:
         return
+    accelerator = getattr(torch, "accelerator", None)
+    empty_host = getattr(accelerator, "empty_host_cache", None)
+    if callable(empty_host):
+        try:
+            empty_host()
+        except Exception:
+            pass
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -384,9 +418,20 @@ def _chatbot_destroy_unlocked():
 
 
 def chatbot_destroy():
-    """Drop the in-process chat pipeline and encourage the OS to reclaim weight memory."""
+    """Drop the in-process chat pipeline and encourage the OS to reclaim weight memory.
+
+    An explicit unload clears a lowered CUDA tier for this model. The immediate
+    retry after an out-of-memory error uses ``_chatbot_destroy_unlocked`` and
+    keeps that cap until the retry's load succeeds.
+    """
     with _chat_lock_guard():
+        model_id = CHATBOT_MODEL_ID
         chatbot = _chatbot_destroy_unlocked()
+    if model_id:
+        try:
+            clear_cuda_tier_limit(str(model_local_dir(model_id)))
+        except Exception:
+            pass
     if chatbot is not None:
         del chatbot
     gc.collect()
@@ -1046,6 +1091,8 @@ def _generate_text_to_image_turn(
     cpu_tried = False
     try:
         while True:
+            action = None
+            failure_summary = None
             try:
                 saved = generate_text_to_image(CHATBOT, prompt, output_path, init_image)
                 break
@@ -1053,26 +1100,51 @@ def _generate_text_to_image_turn(
                 stopped = True
                 break
             except Exception as exc:
-                # A too-eager CUDA tier retries one step down before the CPU reload.
-                if (
+                # Decide here and reload only after this handler exits. The
+                # traceback keeps the failed pipeline in ``generate_text_to_image``'s
+                # frame, so a reload inside this block measures memory while
+                # that pipeline is still resident. A stop never becomes a retry
+                # or a second generation.
+                if CHAT_GENERATION_STOP:
+                    stopped = True
+                    break
+                can_lower = (
                     tier_drops < len(_CUDA_TIER_ORDER)
                     and _diffusion_uses_cuda()
                     and _is_cuda_oom(exc)
                     and lower_cuda_tier_after_oom(CHATBOT)
-                ):
-                    tier_drops += 1
-                    print(
-                        "Text-to-image ran out of GPU memory; retrying a lower CUDA placement.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    _reload_same_diffusion_model()
-                    continue
-                if not cpu_tried and _diffusion_uses_cuda() and _is_cuda_failure(exc):
-                    cpu_tried = True
-                    _fallback_pipeline_to_cpu(exc)
-                    continue
-                raise
+                )
+                if can_lower:
+                    action = "lower"
+                elif not cpu_tried and _diffusion_uses_cuda() and _is_cuda_failure(exc):
+                    action = "cpu"
+                    _note_cuda_failure(exc, CHATBOT_MODEL_ID)
+                else:
+                    raise
+                failure_summary = _cuda_failure_summary(exc)
+                if exc.__traceback__ is not None:
+                    traceback.clear_frames(exc.__traceback__)
+            gc.collect()
+            try:
+                _release_torch_cache()
+            except Exception:
+                pass
+            if CHAT_GENERATION_STOP:
+                stopped = True
+                break
+            if action == "lower":
+                tier_drops += 1
+                print(
+                    "Text-to-image ran out of GPU memory; retrying a lower CUDA placement.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _reload_same_diffusion_model()
+                continue
+            if action == "cpu":
+                cpu_tried = True
+                _reload_diffusion_on_cpu(failure_summary or "CUDA error")
+                continue
     finally:
         if CHAT_GENERATION_STOP:
             stopped = True

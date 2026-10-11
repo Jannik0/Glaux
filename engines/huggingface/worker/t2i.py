@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import time
+import traceback
 from pathlib import Path
 
 _REJECTED_CLASS_MARKERS = ("inpaint", "unconditional")
@@ -39,10 +40,14 @@ _OFFLOAD_DIRNAME = ".glaux-t2i-offload"
 # minus this. 3 GiB covers a 1024px step on common shapes; a tighter card uses
 # group offload instead of dying on the first step.
 _ACTIVATION_HEADROOM_BYTES = 3 * 1024**3
-# Cast weights may use this share of currently available RAM before disk.
+# CUDA cast weights may use this share of currently available RAM before disk.
 # psutil's available figure already excludes memory the OS has given out.
-# The previous 0.55 share sent models that still fit in RAM to disk.
 _RAM_RESIDENT_FRACTION = 0.70
+# CPU loads, including the reload after a CUDA failure, keep the smaller
+# resident threshold and the equal Accelerate split. Those numbers are not
+# the CUDA shares above.
+_CPU_RAM_RESIDENT_FRACTION = 0.55
+_CPU_ACCELERATE_RAM_FRACTION = 0.28
 # Block groups keep one transformer block resident and prefetch the next.
 # Below this much usable VRAM (free minus the activation headroom), leaf
 # groups are smaller than a full block plus that prefetch.
@@ -95,18 +100,142 @@ def assert_text_to_image_repo(model_path: str, *, allow_img2img: bool = False) -
     return class_name
 
 
-def _safetensors_bytes(root: Path) -> int:
+# Names ``from_pretrained`` resolves when ``variant`` is omitted and
+# ``use_safetensors`` stays at its default. Diffusers 0.41 ``_fetch_index_file``
+# looks for the non-variant index first and, on a hit, loads only the shards in
+# ``weight_map``. Otherwise it loads the non-variant single file. Sibling
+# ``*.fp16.safetensors`` files and a root single-file checkpoint are not selected.
+_DIFFUSERS_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
+_DIFFUSERS_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
+_TRANSFORMERS_WEIGHTS_NAME = "model.safetensors"
+_TRANSFORMERS_INDEX_NAME = "model.safetensors.index.json"
+# Safetensors header dtype → stored bytes per value. Runtime size is numel
+# times the dtype we cast to, not this width and not the file size.
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8,
+    "F32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "I64": 8,
+    "I32": 4,
+    "I16": 2,
+    "I8": 1,
+    "U64": 8,
+    "U32": 4,
+    "U16": 2,
+    "U8": 1,
+    "BOOL": 1,
+    "C64": 8,
+    "C128": 16,
+}
+
+
+def _safetensors_header(path: Path) -> dict:
+    """JSON header of a safetensors file. The tensor body is not read."""
+    with path.open("rb") as handle:
+        raw_len = handle.read(8)
+        if len(raw_len) < 8:
+            raise ValueError(f"safetensors header is truncated: {path}")
+        length = int.from_bytes(raw_len, "little")
+        payload = handle.read(length)
+    if len(payload) < length:
+        raise ValueError(f"safetensors header is truncated: {path}")
+    header = json.loads(payload)
+    if not isinstance(header, dict):
+        raise ValueError(f"safetensors header is not an object: {path}")
+    return header
+
+
+def _header_numel(header: dict) -> int:
     total = 0
-    if not root.exists():
-        return 0
-    for path in root.rglob("*.safetensors"):
-        if ".index." in path.name:
+    for key, info in header.items():
+        if key == "__metadata__" or not isinstance(info, dict):
             continue
-        try:
-            total += path.stat().st_size
-        except OSError:
-            continue
+        shape = info.get("shape") or []
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        if numel:
+            total += numel
     return total
+
+
+def _weight_filenames(library: str) -> tuple[str, str]:
+    if library == "transformers":
+        return _TRANSFORMERS_WEIGHTS_NAME, _TRANSFORMERS_INDEX_NAME
+    return _DIFFUSERS_WEIGHTS_NAME, _DIFFUSERS_INDEX_NAME
+
+
+def _component_checkpoint_files(folder: Path, library: str) -> list[Path]:
+    """Files one component loads from *folder* with ``variant=None``.
+
+    An index wins over a sibling single file, matching ``_fetch_index_file``
+    then ``_get_checkpoint_shard_files``. Shard names come from ``weight_map``
+    and are counted once. A ``.fp16`` (or any other) variant is a different
+    filename and is left out.
+    """
+    weights_name, index_name = _weight_filenames(library)
+    index_path = folder / index_name
+    if index_path.is_file():
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+        if isinstance(weight_map, dict) and weight_map:
+            shards: list[Path] = []
+            seen: set[str] = set()
+            for shard in weight_map.values():
+                if not isinstance(shard, str) or shard in seen:
+                    continue
+                seen.add(shard)
+                path = folder / shard
+                if path.is_file():
+                    shards.append(path)
+            if shards:
+                return shards
+    single = folder / weights_name
+    if single.is_file():
+        return [single]
+    return []
+
+
+def _runtime_tensor_bytes(files: list[Path], dtype) -> int:
+    """``numel * target itemsize`` across *files*. Headers only."""
+    itemsize = int(getattr(dtype, "itemsize", 2) or 2)
+    numel = 0
+    for path in files:
+        numel += _header_numel(_safetensors_header(path))
+    return numel * itemsize
+
+
+def measure_component_bytes(model_path: str, dtype) -> dict[str, int]:
+    """Runtime bytes of the checkpoint each ``model_index.json`` component loads.
+
+    The size is the cast dtype, not the stored width: an fp32 or fp8 file loaded
+    as fp16 occupies ``numel * 2``. Components that are not a subdirectory are
+    skipped; ``from_pretrained`` would load those from the repo root and a root
+    single-file checkpoint is not one of them.
+    """
+    index = _read_model_index(model_path)
+    root = Path(model_path)
+    sizes: dict[str, int] = {}
+    for name, value in index.items():
+        if name.startswith("_") or not isinstance(value, list) or len(value) != 2:
+            continue
+        folder = root / name
+        if not folder.is_dir():
+            continue
+        files = _component_checkpoint_files(folder, str(value[0]))
+        if not files:
+            continue
+        nbytes = _runtime_tensor_bytes(files, dtype)
+        if nbytes > 0:
+            sizes[name] = nbytes
+    return sizes
 
 
 def _available_ram_bytes() -> int | None:
@@ -325,49 +454,39 @@ def _prepare_disk_offload(model_path: str, nbytes: int) -> Path:
 
 
 def _offload_disk_bytes(weight_bytes: int, dtype) -> int:
-    """Size of the offload copy after the checkpoint is cast to *dtype*.
+    """Scale a 2-byte-per-value estimate to *dtype*.
 
-    Safetensors diffusion weights are stored at 2 bytes per value. A float32
-    CPU load writes twice that.
+    Callers that already measured ``numel * itemsize`` from safetensors headers
+    must not use this. It remains for a raw byte count that assumed fp16 storage.
     """
     itemsize = int(getattr(dtype, "itemsize", 2) or 2)
     return max(weight_bytes, weight_bytes * itemsize // 2)
 
 
-def _weights_need_disk_offload(device: str, available: int | None, weights: int, dtype) -> bool:
-    """True when the resident weights would exceed ``_RAM_RESIDENT_FRACTION`` of free RAM.
+def _resident_fraction(device: str) -> float:
+    if device == "cpu":
+        return _CPU_RAM_RESIDENT_FRACTION
+    return _RAM_RESIDENT_FRACTION
 
-    CUDA compares checkpoint bytes (fp16 and bf16 files already match the
-    runtime dtype). A float32 CPU load doubles a 2-byte checkpoint.
+
+def _weights_need_disk_offload(device: str, available: int | None, weights: int, dtype) -> bool:
+    """True when a 2-byte checkpoint estimate would exceed the resident RAM share.
+
+    CPU uses ``_CPU_RAM_RESIDENT_FRACTION`` and doubles a float32 load. CUDA
+    compares the estimate to ``_RAM_RESIDENT_FRACTION``. Loads that can read
+    headers use :func:`measure_component_bytes` instead of this estimate.
     """
     if device not in ("cuda", "cpu") or available is None:
         return False
     resident = _offload_disk_bytes(weights, dtype) if device == "cpu" else weights
-    return resident > int(available * _RAM_RESIDENT_FRACTION)
+    return resident > int(available * _resident_fraction(device))
 
 
-def _cast_component_bytes(component_bytes: dict[str, int], dtype) -> dict[str, int]:
-    return {name: _offload_disk_bytes(size, dtype) for name, size in component_bytes.items()}
-
-
-def _component_weight_bytes(model_path: str) -> dict[str, int]:
-    """Safetensors bytes for each ``model_index.json`` component folder."""
-    index = _read_model_index(model_path)
-    root = Path(model_path)
-    sizes: dict[str, int] = {}
-    for name, value in index.items():
-        if name.startswith("_") or not isinstance(value, list) or len(value) != 2:
-            continue
-        nbytes = _safetensors_bytes(root / name)
-        if nbytes > 0:
-            sizes[name] = nbytes
-    return sizes
-
-
-def _unscoped_weight_bytes(model_path: str, components: dict[str, int]) -> int:
-    """Checkpoint bytes that are not inside a component folder."""
-    total = _safetensors_bytes(Path(model_path))
-    return max(0, total - sum(components.values()))
+def _resident_exceeds(device: str, available: int | None, resident: int) -> bool:
+    """True when *resident* runtime bytes exceed that device's RAM share."""
+    if device not in ("cuda", "cpu") or available is None:
+        return False
+    return resident > int(available * _resident_fraction(device))
 
 
 def _is_denoiser_component(name: str) -> bool:
@@ -418,16 +537,21 @@ def select_cuda_tier(
     dtype,
     extra_bytes: int = 0,
 ) -> str:
-    """Pick a CUDA placement from cast component sizes and free memory.
+    """Pick a CUDA placement from runtime component sizes and free memory.
 
-    ``extra_bytes`` are checkpoint files that are not inside a component
-    folder. They count toward the RAM and VRAM totals but not toward the
-    largest component, because they are not a module we can offload alone.
+    *component_bytes* and *extra_bytes* are already ``numel * `` the target
+    itemsize (see :func:`measure_component_bytes`). *dtype* is unused; it is
+    kept so callers can show which cast the sizes belong to. ``extra_bytes``
+    count toward the RAM and VRAM totals but not toward the largest component.
+    The loader passes 0: a root single-file checkpoint is not loaded.
+
+    Non-denoiser modules are leaf-offloaded even when this returns
+    ``group_offload``, so a text encoder larger than VRAM does not onload as
+    one group. See :func:`_offload_type_for_component`.
     """
-    cast = _cast_component_bytes(component_bytes, dtype)
-    extra = _offload_disk_bytes(extra_bytes, dtype) if extra_bytes else 0
-    total = sum(cast.values()) + extra
-    largest = max(cast.values(), default=0)
+    del dtype
+    total = sum(component_bytes.values()) + max(0, int(extra_bytes))
+    largest = max(component_bytes.values(), default=0)
     usable = int(free_vram) - _ACTIVATION_HEADROOM_BYTES
     exceeds_ram = (
         available_ram is not None and total > int(available_ram * _RAM_RESIDENT_FRACTION)
@@ -470,6 +594,17 @@ def _note_tier_limit(model_path: str, failed_tier: str) -> str | None:
     return nxt
 
 
+def clear_cuda_tier_limit(model_path: str) -> None:
+    """Forget a lowered tier for *model_path*.
+
+    The cap is read once at the start of a load, so the immediate retry still
+    uses it. A successful load of that model clears it, and so does an explicit
+    unload. A later load measures free memory again instead of keeping a cap
+    that was only true during GPU contention.
+    """
+    _cuda_tier_limits.pop(str(Path(model_path).resolve()), None)
+
+
 def lower_cuda_tier_after_oom(pipe) -> bool:
     """Record a lower tier after *pipe* ran out of GPU memory. False at disk."""
     tier = getattr(pipe, "_glaux_placement_tier", None)
@@ -498,8 +633,15 @@ def _denoiser_gpu_budget(free_vram: int | None, small_bytes: int) -> int:
     # give the denoiser at most half of what is left so the first step can run.
     remain = free - small - _GPU_SLIVER_BYTES
     if remain < _MIN_GPU_OFFLOAD_BYTES:
-        return max(0, remain)
-    return min(int(remain * 0.5), remain)
+        budget = max(0, remain)
+    else:
+        budget = min(int(remain * 0.5), remain)
+    # A few mebibytes does not fit a denoiser block, and a zero budget makes
+    # Accelerate set ``main_device`` to CPU so the whole forward stays there.
+    # When the card can hold the minimum shard, use that instead of the remainder.
+    if budget < _MIN_GPU_OFFLOAD_BYTES <= free:
+        return _MIN_GPU_OFFLOAD_BYTES
+    return budget
 
 
 def _split_cpu_budgets(sizes: dict[str, int], total_budget: int) -> dict[str, int]:
@@ -531,6 +673,74 @@ def _split_cpu_budgets(sizes: dict[str, int], total_budget: int) -> dict[str, in
     return budgets
 
 
+def _disk_component_gpu_budgets(
+    large: dict[str, int],
+    small_bytes: int,
+    free_vram: int | None,
+) -> dict[str, int]:
+    """GPU ``max_memory`` for each large component on the CUDA disk tier.
+
+    Accelerate's device map is static. A component whose budget is only CPU
+    and disk has no parameter on the GPU, so ``dispatch_model`` sets
+    ``main_device`` to CPU and the forward runs there — a bf16 text encoder
+    then encodes the prompt on the CPU. A non-zero GPU budget keeps execution
+    on the GPU, and that slice stays resident for the whole denoise because
+    the map is not streamed.
+
+    Each text encoder therefore takes its full cast size when the denoiser
+    still keeps at least ``_MIN_GPU_OFFLOAD_BYTES``, and otherwise one minimum
+    shard so prompt encoding stays on the GPU without parking the whole
+    encoder beside the denoiser. The denoiser gets what remains. A remainder
+    below the minimum shard is raised when free VRAM can hold the shard;
+    otherwise the entry stays 0 and the loader logs that the denoiser forward
+    stays on the CPU.
+    """
+    assigned = {name: 0 for name in large}
+    denoiser = _preferred_gpu_component(large)
+    if denoiser is None:
+        return assigned
+    budget = _denoiser_gpu_budget(free_vram, small_bytes)
+    encoders = sorted(
+        (
+            name
+            for name in large
+            if name.startswith("text_encoder") and name != denoiser
+        ),
+        key=lambda name: large[name],
+    )
+    for name in encoders:
+        size = large[name]
+        if budget - size >= _MIN_GPU_OFFLOAD_BYTES:
+            assigned[name] = size
+            budget -= size
+        elif budget - _MIN_GPU_OFFLOAD_BYTES >= _MIN_GPU_OFFLOAD_BYTES:
+            assigned[name] = _MIN_GPU_OFFLOAD_BYTES
+            budget -= _MIN_GPU_OFFLOAD_BYTES
+    if 0 < budget < _MIN_GPU_OFFLOAD_BYTES and int(free_vram or 0) >= _MIN_GPU_OFFLOAD_BYTES:
+        budget = _MIN_GPU_OFFLOAD_BYTES
+    assigned[denoiser] = max(0, budget)
+    return assigned
+
+
+def _cpu_disk_budgets(large: dict[str, int], available_ram: int, cuda_visible: bool) -> dict[str, dict]:
+    """Equal CPU cap for every large component. GPU stays at 0 when it is visible.
+
+    This is the resident share used before the CUDA tiers: about 28% of
+    available RAM, split across the large components, and at least 1 GiB.
+    A CUDA failure that reloads on CPU uses it, so the fallback does not keep
+    the larger CUDA RAM share or place weights on the GPU.
+    """
+    count = max(len(large), 1)
+    cpu_bytes = max(1024**3, int(available_ram * _CPU_ACCELERATE_RAM_FRACTION / count))
+    budgets: dict[str, dict] = {}
+    for name in large:
+        entry: dict = {"cpu": cpu_bytes}
+        if cuda_visible:
+            entry[0] = 0
+        budgets[name] = entry
+    return budgets
+
+
 def _component_disk_budgets(
     component_bytes: dict[str, int],
     *,
@@ -541,26 +751,22 @@ def _component_disk_budgets(
 ) -> dict[str, dict]:
     """Per-component Accelerate ``max_memory`` for the disk path.
 
-    The denoiser gets the GPU budget. Other large components get none, so a
-    text encoder that runs once per prompt does not stay resident during
-    denoising. A CPU load still publishes a zero GPU budget when CUDA is
-    visible, so a fallback after an out-of-memory error does not place
+    CUDA gives the denoiser most of the spare VRAM and a text encoder enough
+    to run prompt encoding on the GPU (see :func:`_disk_component_gpu_budgets`).
+    CPU loads use the equal 0.28 split and publish a zero GPU budget when CUDA
+    is visible, so a fallback after an out-of-memory error does not place
     weights on the GPU.
     """
     large, small = _partition_components(component_bytes)
     if not large:
         return {}
+    if device != "cuda":
+        return _cpu_disk_budgets(large, available_ram, cuda_visible)
     cpu_budgets = _split_cpu_budgets(large, int(available_ram * _RAM_RESIDENT_FRACTION))
-    gpu_name = _preferred_gpu_component(large) if device == "cuda" else None
-    gpu_budget = _denoiser_gpu_budget(free_vram, small) if device == "cuda" else 0
+    gpu_budgets = _disk_component_gpu_budgets(large, small, free_vram)
     budgets: dict[str, dict] = {}
     for name, cpu_bytes in cpu_budgets.items():
-        entry: dict = {"cpu": cpu_bytes}
-        if device == "cuda":
-            entry[0] = gpu_budget if name == gpu_name else 0
-        elif cuda_visible:
-            entry[0] = 0
-        budgets[name] = entry
+        budgets[name] = {"cpu": cpu_bytes, 0: gpu_budgets.get(name, 0)}
     return budgets
 
 
@@ -629,32 +835,101 @@ def _format_placement_log(
     )
 
 
-def _format_step_timing(steps: int, elapsed: float) -> str:
-    average = elapsed / steps if steps else 0.0
-    return (
-        f"Text-to-image generation: {steps} steps, "
-        f"average {average:.2f}s/step, total {elapsed:.1f}s."
-    )
+def _format_step_timing(
+    steps: int,
+    wall: float,
+    encode: float | None = None,
+    denoise: float | None = None,
+    decode: float | None = None,
+) -> str:
+    """Wall time of one generation, plus a host-side phase split when known.
+
+    The split is prompt encode (start until the first denoising step returns),
+    denoise (first step return until the last), and decode (the remainder,
+    which is the VAE). It is not an average of kernel time per step.
+    """
+    text = f"Text-to-image generation: {steps} denoising steps, wall {wall:.1f}s"
+    if encode is not None and denoise is not None and decode is not None:
+        text += (
+            f" (prompt encode {encode:.2f}s, denoise {denoise:.2f}s, decode {decode:.2f}s)"
+        )
+    return text + "."
 
 
-def _group_offload_kwargs(offload_type: str, *, pre_pin: bool) -> dict:
+def select_compute_dtype_name(device: str, *, bf16_native: bool) -> str:
+    """``float32`` on CPU, hardware ``bfloat16`` on CUDA, otherwise ``float16``."""
+    if device == "cpu":
+        return "float32"
+    if device == "cuda" and bf16_native:
+        return "bfloat16"
+    return "float16"
+
+
+def _cuda_bf16_without_emulation(torch_mod) -> bool:
+    """True when CUDA bf16 does not depend on software emulation.
+
+    ``torch.cuda.is_bf16_supported()`` defaults to ``including_emulation=True``,
+    so Turing (compute capability 7.5) reports support. Prefer the flag that
+    excludes emulation. An older signature falls back to capability 8 or newer.
+    """
+    cuda = getattr(torch_mod, "cuda", None)
+    if cuda is None:
+        return False
+    supported = getattr(cuda, "is_bf16_supported", None)
+    if callable(supported):
+        try:
+            return bool(supported(including_emulation=False))
+        except TypeError:
+            pass
+    capability = getattr(cuda, "get_device_capability", None)
+    if not callable(capability):
+        return False
+    try:
+        major, _minor = capability()
+    except Exception:
+        return False
+    return int(major) >= 8
+
+
+def _group_offload_kwargs(offload_type: str, *, pre_pin: bool, use_stream: bool = True) -> dict:
     """Keyword arguments for diffusers 0.41 ``apply_group_offloading``.
 
     Streams require ``num_blocks_per_group`` of 1; a larger group is forced
     back to 1 and disables the overlap the stream was opened for. Disk
-    offload is intentionally absent: see ``_load_disk_offloaded``.
+    offload is intentionally absent: see ``_load_disk_offloaded``. Streams
+    also require a CUDA onload device, so a CPU onload passes ``use_stream``
+    false. ``low_cpu_mem_usage`` only changes streamed pinning: false pre-pins
+    the host copy, true pins each group when it is copied.
     """
+    streaming = bool(use_stream)
     return {
         "offload_type": offload_type,
         "num_blocks_per_group": 1 if offload_type == "block_level" else None,
-        "non_blocking": True,
-        "use_stream": True,
-        "record_stream": True,
-        "low_cpu_mem_usage": not pre_pin,
+        "non_blocking": streaming,
+        "use_stream": streaming,
+        "record_stream": streaming,
+        "low_cpu_mem_usage": (not pre_pin) if streaming else False,
     }
 
 
+def _empty_host_cache() -> None:
+    """Release pinned host blocks when this torch build exposes the call."""
+    try:
+        import torch
+    except ImportError:
+        return
+    accelerator = getattr(torch, "accelerator", None)
+    empty_host = getattr(accelerator, "empty_host_cache", None)
+    if not callable(empty_host):
+        return
+    try:
+        empty_host()
+    except Exception:
+        pass
+
+
 def _empty_cuda_cache() -> None:
+    _empty_host_cache()
     try:
         import torch
     except ImportError:
@@ -681,32 +956,43 @@ def _release_failed_placement(pipe) -> None:
 
 
 def _run_placement_attempts(tiers: list[str], attempt, on_drop=None):
-    """Call *attempt(tier)* until one returns. Drop a tier on OOM or if it is unsupported."""
-    last: BaseException | None = None
+    """Call *attempt(tier)* until one returns. Drop a tier on OOM or if it is unsupported.
+
+    The exception is not kept across attempts. Its traceback holds the failed
+    pipeline in the attempt's frame locals; storing the exception, or loading
+    the next tier inside the ``except``, keeps that pipeline alive while the
+    next one is measured. Frames are cleared before the next attempt, then
+    ``gc.collect()`` runs after the ``except`` has released the exception.
+    """
+    last_summary = "No text-to-image placement was attempted."
     for index, tier in enumerate(tiers):
         generation = _active_offload_generation
         try:
             return attempt(tier)
         except Exception as exc:
-            last = exc
-            # Drop a folder this attempt created. Leave an older model's folder
-            # in place when the attempt failed before preparing one.
-            if _active_offload_generation != generation:
-                release_disk_offload()
-            if index >= len(tiers) - 1 or not _should_drop_placement(exc):
+            last_summary = _placement_failure_summary(exc)
+            drop = index < len(tiers) - 1 and _should_drop_placement(exc)
+            created = _active_offload_generation != generation
+            if not drop:
+                if created:
+                    release_disk_offload()
                 raise
             nxt = tiers[index + 1]
             if on_drop is not None:
                 on_drop(tier, nxt)
             print(
                 f"Text-to-image placement {tier} did not fit "
-                f"({_placement_failure_summary(exc)}); trying {nxt}.",
+                f"({last_summary}); trying {nxt}.",
                 file=sys.stderr,
                 flush=True,
             )
-    if last is not None:
-        raise last
-    raise RuntimeError("No text-to-image placement was attempted.")
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
+        if created:
+            release_disk_offload()
+        gc.collect()
+        _empty_cuda_cache()
+    raise RuntimeError(last_summary)
 
 
 def _cuda_is_visible() -> bool:
@@ -833,16 +1119,16 @@ def _load_disk_offloaded(
     ``device_map`` memmap does free the overflow. CPU loads keep this path:
     group-offload streams require a CUDA onload device.
 
-    On CUDA the denoiser gets free VRAM minus the activation headroom. Other
-    large components, including a text encoder that runs once per prompt, get
-    no GPU budget so they do not stay resident during denoising.
+    On CUDA the denoiser gets free VRAM minus the activation headroom, and each
+    text encoder gets a GPU budget so prompt encoding is not a bf16 CPU
+    forward. That GPU slice stays resident during denoising. See
+    ``_disk_component_gpu_budgets``.
     """
     from diffusers import DiffusionPipeline
 
     index = _read_model_index(model_path)
     root = Path(model_path)
-    measured = _component_weight_bytes(model_path)
-    cast = _cast_component_bytes(measured, dtype)
+    cast = measure_component_bytes(model_path, dtype)
     large, _small = _partition_components(cast)
     if available_ram is None:
         available_ram = _available_ram_bytes() or (6 * 1024**3)
@@ -860,7 +1146,22 @@ def _load_disk_offloaded(
     try:
         gpu_name = _preferred_gpu_component(large) if device == "cuda" else None
         gpu_budget = budgets.get(gpu_name or "", {}).get(0, 0)
-        gpu_note = f" Denoiser GPU budget {_format_gib(gpu_budget)}." if device == "cuda" else ""
+        gpu_note = ""
+        if device == "cuda":
+            if gpu_budget < _MIN_GPU_OFFLOAD_BYTES:
+                gpu_note = (
+                    " Free VRAM is below the minimum denoiser shard, so the "
+                    "denoiser forward stays on CPU."
+                )
+            else:
+                gpu_note = f" Denoiser GPU budget {_format_gib(gpu_budget)}."
+            encoder_notes = [
+                f"{name} {_format_gib(entry.get(0, 0))}"
+                for name, entry in sorted(budgets.items())
+                if name.startswith("text_encoder") and entry.get(0, 0) > 0
+            ]
+            if encoder_notes:
+                gpu_note += " Text encoder GPU budget " + ", ".join(encoder_notes) + "."
         print(
             "Text-to-image weights are larger than available RAM; "
             f"offloading them to {offload_root}.{gpu_note}",
@@ -907,13 +1208,60 @@ def _apply_model_cpu_offload(pipe) -> None:
     enable()
 
 
-def _apply_group_offload(pipe, offload_type: str, *, pre_pin: bool) -> None:
-    """Prefetch groups onto CUDA. Every module is included, then offloaded.
+def _component_has_block_modules(module) -> bool:
+    """True when diffusers block offload would split this module.
+
+    Block offload only groups direct ``ModuleList`` / ``Sequential`` children
+    and names listed in ``_group_offload_block_modules``. Without those, the
+    hook wraps ``forward`` alone. ``decode`` and ``encode`` never call
+    ``forward``, so a VAE stays on the offload device while its inputs are on
+    the onload device. The attribute is defined on AutoencoderKL and two other
+    autoencoders, not on the other VAEs or on transformers text encoders.
+    """
+    names = getattr(module, "_group_offload_block_modules", None)
+    if names:
+        return True
+    try:
+        import torch
+    except ImportError:
+        return False
+    children = getattr(module, "named_children", None)
+    if not callable(children):
+        return False
+    for _name, child in children():
+        if isinstance(child, (torch.nn.ModuleList, torch.nn.Sequential)) and len(child) > 0:
+            return True
+    return False
+
+
+def _offload_type_for_component(name: str, module, requested: str) -> str:
+    """Leaf groups for everything except a denoiser that actually has blocks.
+
+    Text encoders and the VAE run once per prompt, so leaf groups do not change
+    step time, and they onload the ``Linear`` / ``Conv`` that ``decode`` and
+    ``encode`` call. A denoiser with no block modules cannot use block offload
+    (the hook would miss every path that does not call ``forward``), so it uses
+    leaf groups as well. ``block_level`` stays the request only for a denoiser
+    diffusers can split.
+    """
+    if requested == "block_level" and _is_denoiser_component(name) and _component_has_block_modules(module):
+        return "block_level"
+    return "leaf_level"
+
+
+def _apply_group_offload(pipe, offload_type: str, *, pre_pin: bool, onload_device=None) -> None:
+    """Prefetch groups onto *onload_device*. Every module is included.
 
     ``enable_group_offload(..., exclude_modules=...)`` moves excluded modules
     onto the onload device and leaves them there. A text encoder excluded that
     way would stay resident through denoising. Applying the hook to every
-    ``nn.Module`` keeps it on the GPU only during its own forward.
+    ``nn.Module`` keeps it on the onload device only during its own forward.
+    Non-denoisers, and a denoiser without block modules, use leaf groups even
+    when *offload_type* is ``block_level``.
+
+    A component that cannot take the hook raises ``_PlacementUnsupported`` so
+    the next tier is tried. Leaving it on CPU would surface as a device
+    mismatch only when generation runs.
     """
     try:
         from diffusers.hooks import apply_group_offloading
@@ -924,34 +1272,38 @@ def _apply_group_offload(pipe, offload_type: str, *, pre_pin: bool) -> None:
     components = getattr(pipe, "components", None)
     if not isinstance(components, dict):
         raise _PlacementUnsupported("pipeline has no components")
-    kwargs = _group_offload_kwargs(offload_type, pre_pin=pre_pin)
+    onload = torch.device("cuda") if onload_device is None else torch.device(onload_device)
+    offload = torch.device("cpu")
+    use_stream = onload.type == "cuda"
     applied = 0
+    choices: list[str] = []
     for name, component in components.items():
         if not isinstance(component, torch.nn.Module):
             continue
+        chosen = _offload_type_for_component(name, component, offload_type)
+        choices.append(f"{name}={chosen}")
+        kwargs = _group_offload_kwargs(chosen, pre_pin=pre_pin, use_stream=use_stream)
         try:
             apply_group_offloading(
                 component,
-                onload_device=torch.device("cuda"),
-                offload_device=torch.device("cpu"),
+                onload_device=onload,
+                offload_device=offload,
                 **kwargs,
             )
             applied += 1
         except Exception as exc:
             if _is_cuda_oom_error(exc) or isinstance(exc, MemoryError):
                 raise
-            if _is_denoiser_component(name):
-                raise _PlacementUnsupported(
-                    f"{name} group offload failed: {_placement_failure_summary(exc)}"
-                ) from exc
-            component.to("cpu")
-            print(
-                f"Text-to-image left {name} on CPU ({_placement_failure_summary(exc)}).",
-                file=sys.stderr,
-                flush=True,
-            )
+            raise _PlacementUnsupported(
+                f"{name} group offload failed: {_placement_failure_summary(exc)}"
+            ) from exc
     if applied == 0:
         raise _PlacementUnsupported("pipeline has no modules to group-offload")
+    print(
+        "Text-to-image group offload: " + ", ".join(choices) + ".",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _mark_cuda_pipe(pipe, tier: str, model_path: str) -> None:
@@ -968,8 +1320,14 @@ def _place_cuda_tier(
     *,
     available_ram: int | None,
     free_vram: int | None,
+    pre_pin: bool | None = None,
 ):
-    """Load *model_path* and apply one CUDA tier. The caller retries on failure."""
+    """Load *model_path* and apply one CUDA tier. The caller retries on failure.
+
+    *pre_pin* overrides the group-offload pin choice. ``False`` sets
+    ``low_cpu_mem_usage=True``, which pins each group as it is copied instead
+    of pinning the whole host duplicate up front.
+    """
     from diffusers import DiffusionPipeline
 
     pipe = None
@@ -995,7 +1353,8 @@ def _place_cuda_tier(
             _apply_model_cpu_offload(pipe)
         elif tier in (TIER_GROUP, TIER_GROUP_LEAF):
             offload_type = "leaf_level" if tier == TIER_GROUP_LEAF else "block_level"
-            pre_pin = group_offload_pre_pin(sum(cast.values()), available_ram)
+            if pre_pin is None:
+                pre_pin = group_offload_pre_pin(sum(cast.values()), available_ram)
             _apply_group_offload(pipe, offload_type, pre_pin=pre_pin)
         else:
             raise _PlacementUnsupported(f"unknown placement {tier}")
@@ -1009,32 +1368,29 @@ def _place_cuda_tier(
 
 
 def _load_cuda_pipeline(model_path: str, dtype, available_ram: int | None, free_vram: int | None):
-    """Load a CUDA pipeline, dropping a tier when the choice does not fit."""
+    """Load a CUDA pipeline, dropping a tier when the choice does not fit.
+
+    A group-offload tier that pinned host memory and then ran out of GPU memory
+    is retried once on the same tier with ``pre_pin=False`` before the next
+    tier. Pinning failures are reported as CUDA out of memory. The retry pins
+    on the fly (``low_cpu_mem_usage=True``), which costs the stream overlap a
+    pre-pinned duplicate would have given. The tier cap recorded for an
+    out-of-memory drop is cleared after this load succeeds so a later load of
+    the same model measures again. The cap still applies to this call: it was
+    read into ``tiers`` before the attempts.
+    """
     resolved = str(Path(model_path).resolve())
-    measured = _component_weight_bytes(model_path)
-    extra = _unscoped_weight_bytes(model_path, measured)
-    cast = _cast_component_bytes(measured, dtype)
-    if extra:
-        cast = {**cast, "other": _offload_disk_bytes(extra, dtype)}
+    cast = measure_component_bytes(model_path, dtype)
     preferred = select_cuda_tier(
-        measured,
+        cast,
         free_vram or 0,
         available_ram,
         dtype,
-        extra_bytes=extra,
     )
     tiers = cuda_tiers_from(preferred, _cuda_tier_limits.get(resolved))
     dtype_name = _dtype_name(dtype)
 
-    def attempt(tier: str):
-        pipe = _place_cuda_tier(
-            model_path,
-            dtype,
-            tier,
-            cast,
-            available_ram=available_ram,
-            free_vram=free_vram,
-        )
+    def publish(pipe, tier: str):
         _mark_cuda_pipe(pipe, tier, resolved)
         print(
             _format_placement_log(tier, dtype_name, free_vram, available_ram, cast),
@@ -1043,10 +1399,53 @@ def _load_cuda_pipeline(model_path: str, dtype, available_ram: int | None, free_
         )
         return pipe
 
+    def attempt(tier: str):
+        pre_pin = None
+        if tier in (TIER_GROUP, TIER_GROUP_LEAF):
+            pre_pin = group_offload_pre_pin(sum(cast.values()), available_ram)
+        try:
+            pipe = _place_cuda_tier(
+                model_path,
+                dtype,
+                tier,
+                cast,
+                available_ram=available_ram,
+                free_vram=free_vram,
+                pre_pin=pre_pin,
+            )
+        except Exception as exc:
+            if not pre_pin or not _is_cuda_oom_error(exc):
+                raise
+            print(
+                f"Text-to-image placement {tier} ran out of memory while pinning "
+                "host weights; retrying the same tier with low_cpu_mem_usage=True. "
+                "Weights pin on the fly, so stream overlap costs an extra copy.",
+                file=sys.stderr,
+                flush=True,
+            )
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
+        else:
+            return publish(pipe, tier)
+        gc.collect()
+        _empty_cuda_cache()
+        pipe = _place_cuda_tier(
+            model_path,
+            dtype,
+            tier,
+            cast,
+            available_ram=available_ram,
+            free_vram=free_vram,
+            pre_pin=False,
+        )
+        return publish(pipe, tier)
+
     def on_drop(failed: str, _nxt: str) -> None:
         _note_tier_limit(resolved, failed)
 
-    return _run_placement_attempts(tiers, attempt, on_drop)
+    pipe = _run_placement_attempts(tiers, attempt, on_drop)
+    clear_cuda_tier_limit(resolved)
+    return pipe
 
 
 def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: bool = False):
@@ -1073,20 +1472,22 @@ def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: 
         ) from exc
     import torch
 
-    # float32 on CPU. bfloat16 on CUDA when the GPU supports it; float16
-    # otherwise. Steps, size, seed, and CFG stay at the pipeline defaults.
-    if device == "cpu":
-        dtype = torch.float32
-    elif device == "cuda" and torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-    else:
-        dtype = torch.float16
+    # float32 on CPU. bfloat16 on CUDA only when the GPU runs it in hardware
+    # (compute capability 8 or newer). ``is_bf16_supported()`` defaults to
+    # counting software emulation, which is true on Turing (7.5) and would
+    # pick bf16 there. float16 otherwise. Steps, size, seed, and CFG stay at
+    # the pipeline defaults.
+    dtype_name = select_compute_dtype_name(
+        device, bf16_native=_cuda_bf16_without_emulation(torch)
+    )
+    dtype = getattr(torch, dtype_name)
 
     available = _available_ram_bytes()
     generation = _active_offload_generation
+    resident = sum(measure_component_bytes(model_path, dtype).values())
     if device == "cuda":
         pipe = _load_cuda_pipeline(model_path, dtype, available, _free_vram_bytes())
-    elif _weights_need_disk_offload(device, available, _safetensors_bytes(Path(model_path)), dtype):
+    elif _resident_exceeds(device, available, resident):
         pipe = _load_disk_offloaded(model_path, dtype, device, available_ram=available)
     else:
         pipe = DiffusionPipeline.from_pretrained(
@@ -1165,14 +1566,42 @@ def _declares_step_end_callback(pipe) -> bool:
     return "callback_on_step_end" in signature.parameters
 
 
+def _sync_timing_device() -> None:
+    """Wait for queued CUDA work so a timestamp is not only the launch time."""
+    try:
+        import torch
+    except ImportError:
+        return
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        return
+    try:
+        cuda.synchronize()
+    except Exception:
+        pass
+
+
 class _StepTimer:
-    """Wall clock around one ``pipe()`` call, with a count of denoising steps."""
+    """Wall clock around one ``pipe()`` call, with a count of denoising steps.
+
+    The first mark is the end of prompt encode plus the first step. The last
+    mark is the end of denoising. Whatever remains until :meth:`log` is the
+    VAE decode. CUDA is synchronized on the first mark and by the caller
+    before :meth:`log`, not on every step, so group-offload streams are not
+    drained once per step just to print the split.
+    """
 
     def __init__(self) -> None:
         self.started = time.perf_counter()
         self.steps = 0
+        self.first_mark: float | None = None
+        self.last_mark: float | None = None
 
     def mark(self, step_index=None) -> None:
+        if self.first_mark is None:
+            _sync_timing_device()
+            self.first_mark = time.perf_counter()
+        self.last_mark = time.perf_counter()
         if isinstance(step_index, int) and step_index >= 0:
             self.steps = max(self.steps, step_index + 1)
         else:
@@ -1181,8 +1610,17 @@ class _StepTimer:
     def log(self) -> None:
         if self.steps <= 0:
             return
-        elapsed = time.perf_counter() - self.started
-        print(_format_step_timing(self.steps, elapsed), file=sys.stderr, flush=True)
+        ended = time.perf_counter()
+        encode = denoise = decode = None
+        if self.first_mark is not None and self.last_mark is not None:
+            encode = max(0.0, self.first_mark - self.started)
+            denoise = max(0.0, self.last_mark - self.first_mark)
+            decode = max(0.0, ended - self.last_mark)
+        print(
+            _format_step_timing(self.steps, ended - self.started, encode, denoise, decode),
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _bind_step_timer(timer: _StepTimer):
@@ -1233,8 +1671,8 @@ def generate_text_to_image(pipe, prompt: str, output_path: str, image_path: str 
     lands in that slot.
 
     ``chat_stop()`` ends the run at the next denoising step. The partial image
-    is not saved. Stderr then reports the step count, the average seconds per
-    step, and the wall time of the pipeline call.
+    is not saved. Stderr then reports the denoising step count, the wall time
+    of the pipeline call, and a prompt-encode / denoise / decode split.
     """
     text = prompt.strip()
     if not text:
@@ -1249,6 +1687,7 @@ def generate_text_to_image(pipe, prompt: str, output_path: str, image_path: str 
 
         with Image.open(image_path) as opened:
             call["image"] = opened.convert("RGB")
+    _sync_timing_device()
     timer = _StepTimer()
     if _declares_step_end_callback(pipe):
         call["callback_on_step_end"] = _bind_step_timer(timer)
@@ -1271,4 +1710,5 @@ def generate_text_to_image(pipe, prompt: str, output_path: str, image_path: str 
         images[0].save(destination)
         return str(destination)
     finally:
+        _sync_timing_device()
         timer.log()
