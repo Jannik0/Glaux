@@ -1436,6 +1436,9 @@ sys.modules["worker.thinking"] = thinking
 import worker.chat as chat
 import worker.t2i as t2i
 
+real_chatbot_create = chat.chatbot_create
+real_release_torch_cache = chat._release_torch_cache
+
 class Pipe:
     def __init__(self, tier="cuda"):
         self._glaux_uses_cuda = True
@@ -1611,11 +1614,63 @@ chat.generate_text_to_image = generate_oom_again
 assert chat._generate_text_to_image_turn("a cat", None, None, None, "/tmp/out.png") == ""
 assert calls["n"] == 1, calls
 assert creates == []
+
+# A model switch must collect the previous pipeline before the next load
+# reads free VRAM. chat_stream used to keep that pipeline in a local until
+# the turn finished, so _free_vram_bytes saw the old weights.
+class SwitchPipe:
+    pass
+
+held = {}
+seen = {"alive": "not-measured"}
+
+def measure_vram():
+    ref = held.get("ref")
+    seen["alive"] = ref is not None and ref() is not None
+    return 8 * 1024 ** 3
+
+def loading_measures(model_path, device, allow_img2img=False):
+    t2i._free_vram_bytes()
+    nxt = SwitchPipe()
+    nxt._glaux_uses_cuda = False
+    return nxt
+
+chat._release_torch_cache = real_release_torch_cache
+chat.load_text_to_image_pipeline = loading_measures
+chat.chatbot_create = real_chatbot_create
+chat.generate_text_to_image = lambda *args, **kwargs: "/tmp/out.png"
+t2i._free_vram_bytes = measure_vram
+download.read_model_pipeline_tag = lambda model_id: "text-to-image"
+
+previous = SwitchPipe()
+held["ref"] = weakref.ref(previous)
+chat.CHATBOT = previous
+del previous
+chat.CHATBOT_MODEL_ID = "org/old"
+chat.CHATBOT_PIPELINE_TAG = "text-to-image"
+list(chat.chat_stream("org/new", False, "a cat", output_path="/tmp/out.png"))
+assert seen["alive"] is False, seen
+assert held["ref"]() is None
+
+second = SwitchPipe()
+held["ref"] = weakref.ref(second)
+chat.CHATBOT = second
+del second
+chat.CHATBOT_MODEL_ID = "org/new"
+chat.CHATBOT_PIPELINE_TAG = "text-to-image"
+seen["alive"] = "not-measured"
+assert chat.chat_generation_starts_in_thinking("org/third", False, "hi") is False
+assert seen["alive"] is False, seen
+assert held["ref"]() is None
 `;
 
 const VAE_SCRIPT = String.raw`
+import contextlib
+import gc
+import io
 import sys
 import types
+import weakref
 from pathlib import Path
 
 repo = Path(sys.argv[1]).resolve()
@@ -1782,6 +1837,10 @@ class Stub(nn.Module):
     def dtype(self):
         return self.proj.weight.dtype
 
+    @property
+    def device(self):
+        return self.proj.weight.device
+
 class Tok:
     model_max_length = 77
 
@@ -1921,7 +1980,20 @@ except RuntimeError as exc:
 
 sd3 = StableDiffusion3Pipeline(**sd3_kwargs(tiny_vae(torch.float16, force_upcast=True)))
 assert t2i._pipeline_owns_vae_upcast(sd3) is False
-assert t2i._prepare_fp16_vae(sd3, torch.float16) is True
+vae_log = io.StringIO()
+_err = sys.stderr
+sys.stderr = vae_log
+try:
+    assert t2i._prepare_fp16_vae(sd3, torch.float16) is True
+finally:
+    sys.stderr = _err
+vae_text = vae_log.getvalue()
+assert "VAE is fp32" in vae_text, vae_text
+assert "extra parameter bytes versus fp16" in vae_text, vae_text
+assert "No structural flag separates an SD1.x VAE" in vae_text, vae_text
+extra = t2i._fp32_vae_extra_bytes(sd3.vae)
+assert extra is not None and extra > 0
+assert str(extra) in vae_text, (extra, vae_text)
 with torch.no_grad():
     sd3_image = sd3.vae.decode(fp16_latents, return_dict=False)[0]
 assert sd3_image.dtype == torch.float32
@@ -1930,6 +2002,195 @@ assert t2i._prepare_fp16_vae(sd3_i2i, torch.float16) is True
 with torch.no_grad():
     sd3_latents = sd3_i2i.vae.encode(torch.zeros(1, 3, 32, 32, dtype=torch.float16)).latent_dist.mode()
 assert sd3_latents.dtype == torch.float16, sd3_latents.dtype
+
+from diffusers.models.autoencoders.vae import EncoderOutput
+
+dc_out = EncoderOutput(latent=torch.zeros(1, 4, 2, 2, dtype=torch.float32))
+dc_cast = t2i._cast_encode_output(dc_out, torch.float16)
+assert dc_cast.latent.dtype == torch.float16, dc_cast.latent.dtype
+
+class PluralLatents:
+    def __init__(self):
+        self.latents = torch.zeros(1, 4, dtype=torch.float32)
+
+plural = t2i._cast_encode_output(PluralLatents(), torch.float16)
+assert plural.latents.dtype == torch.float16
+
+def assert_wrapper_is_refcount_collectable():
+    class CycleVae(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4, bias=False)
+
+        @property
+        def dtype(self):
+            return self.proj.weight.dtype
+
+        def decode(self, z, *args, **kwargs):
+            return z
+
+        def encode(self, x, *args, **kwargs):
+            return x
+
+    class CyclePipe:
+        def __init__(self):
+            self.vae = CycleVae()
+
+    pipe = CyclePipe()
+    assert t2i._install_vae_io_cast(pipe.vae, torch.float16) is True
+    with torch.no_grad():
+        cast = pipe.vae.decode(torch.zeros(1, 4, dtype=torch.float16))
+    assert cast.dtype == torch.float32
+    gc.disable()
+    try:
+        ref = weakref.ref(pipe)
+        del pipe
+        assert ref() is None, "VAE wrapper kept the pipeline alive without gc.collect()"
+    finally:
+        gc.enable()
+
+assert_wrapper_is_refcount_collectable()
+
+class HookBoom:
+    def maybe_free_model_hooks(self):
+        raise RuntimeError("hook release failed\nsecond line")
+
+hook_log = io.StringIO()
+sys.stderr = hook_log
+try:
+    t2i._release_pipeline_hooks(HookBoom())
+finally:
+    sys.stderr = _err
+assert "RuntimeError: hook release failed" in hook_log.getvalue(), hook_log.getvalue()
+assert "second line" not in hook_log.getvalue()
+
+def host_boom():
+    raise RuntimeError("host cache failed\nsecond line")
+
+accelerator = getattr(torch, "accelerator", None)
+previous_empty = getattr(accelerator, "empty_host_cache", None) if accelerator is not None else None
+if accelerator is None:
+    torch.accelerator = types.SimpleNamespace(empty_host_cache=host_boom)
+else:
+    accelerator.empty_host_cache = host_boom
+host_log = io.StringIO()
+sys.stderr = host_log
+try:
+    t2i._empty_host_cache()
+finally:
+    sys.stderr = _err
+    if accelerator is None:
+        del torch.accelerator
+    elif previous_empty is None:
+        del accelerator.empty_host_cache
+    else:
+        accelerator.empty_host_cache = previous_empty
+assert "RuntimeError: host cache failed" in host_log.getvalue(), host_log.getvalue()
+assert "second line" not in host_log.getvalue()
+
+class Denoiser(nn.Module):
+    def __init__(self, **config):
+        super().__init__()
+        self.config = types.SimpleNamespace(**config)
+        self.proj = nn.Linear(4, 4, bias=False)
+        features = int(config.get("addition_time_embed_dim") or 0) * 6 + int(config.get("projection_dim") or 0)
+        if features:
+            self.add_embedding = nn.Module()
+            self.add_embedding.linear_1 = nn.Linear(features, 4, bias=False)
+
+    @property
+    def dtype(self):
+        return self.proj.weight.dtype
+
+    @property
+    def device(self):
+        return self.proj.weight.device
+
+    def cache_context(self, _name):
+        return contextlib.nullcontext()
+
+    def forward(self, *args, **kwargs):
+        hidden = args[0] if args else kwargs.get("hidden_states")
+        return (torch.zeros_like(hidden),)
+
+def fp16_embeds(seq=4, dim=8, pooled=32):
+    return (
+        torch.zeros(1, seq, dim, dtype=torch.float16),
+        torch.zeros(1, pooled, dtype=torch.float16),
+    )
+
+def run_pipe(pipe, *, image=None):
+    embeds, pooled = fp16_embeds()
+    kwargs = {
+        "prompt": None,
+        "prompt_embeds": embeds,
+        "pooled_prompt_embeds": pooled,
+        "num_inference_steps": 1,
+        "height": 8,
+        "width": 8,
+        "guidance_scale": 1.0,
+        "output_type": "pt",
+    }
+    if image is not None:
+        kwargs["image"] = image
+        kwargs["strength"] = 1.0
+    with torch.no_grad():
+        result = pipe(**kwargs)
+    image_out = result.images
+    assert image_out.shape[0] == 1 and image_out.shape[1] == 3, tuple(image_out.shape)
+    return image_out
+
+# pipe() goes through the real __call__ decode, not a direct vae.decode.
+# An fp32 VAE with no input cast is what the code before the B1 fix did for
+# Flux and SD3. Those four calls then raise Half vs float on this CPU.
+# SDXL txt2img does not raise here if the VAE was pre-upcast: DDIM's step
+# returns fp32 latents on CPU, so they match the fp32 VAE. The regression
+# for SDXL is that pre-upcast skips upcast_vae. The counter below fails if
+# that method does not run.
+pixels = torch.zeros(1, 3, 8, 8, dtype=torch.float16)
+e2e_flux = FluxPipeline(**flux_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+e2e_flux.transformer = Denoiser(in_channels=16, guidance_embeds=False, sample_size=8, patch_size=2).to(dtype=torch.float16)
+assert t2i._prepare_fp16_vae(e2e_flux, torch.float16) is True
+run_pipe(e2e_flux)
+e2e_flux_i2i = FluxImg2ImgPipeline(**flux_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+e2e_flux_i2i.transformer = Denoiser(in_channels=16, guidance_embeds=False, sample_size=8, patch_size=2).to(dtype=torch.float16)
+assert t2i._prepare_fp16_vae(e2e_flux_i2i, torch.float16) is True
+run_pipe(e2e_flux_i2i, image=pixels)
+
+e2e_sd3 = StableDiffusion3Pipeline(**sd3_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+e2e_sd3.transformer = Denoiser(in_channels=4, sample_size=8, patch_size=2, joint_attention_dim=32).to(dtype=torch.float16)
+assert t2i._prepare_fp16_vae(e2e_sd3, torch.float16) is True
+run_pipe(e2e_sd3)
+e2e_sd3_i2i = StableDiffusion3Img2ImgPipeline(**sd3_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+e2e_sd3_i2i.transformer = Denoiser(in_channels=4, sample_size=8, patch_size=2, joint_attention_dim=32).to(dtype=torch.float16)
+assert t2i._prepare_fp16_vae(e2e_sd3_i2i, torch.float16) is True
+run_pipe(e2e_sd3_i2i, image=pixels)
+
+def sdxl_denoiser():
+    return Denoiser(
+        in_channels=4,
+        sample_size=8,
+        addition_time_embed_dim=2,
+        projection_dim=32,
+        time_cond_proj_dim=None,
+    ).to(dtype=torch.float16)
+
+e2e_sdxl = StableDiffusionXLPipeline(**sdxl_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+e2e_sdxl.unet = sdxl_denoiser()
+assert t2i._prepare_fp16_vae(e2e_sdxl, torch.float16) is False
+assert e2e_sdxl.vae.dtype == torch.float16
+upcasts = {"n": 0}
+real_upcast = e2e_sdxl.upcast_vae
+def count_upcast():
+    upcasts["n"] += 1
+    return real_upcast()
+e2e_sdxl.upcast_vae = count_upcast
+run_pipe(e2e_sdxl)
+assert upcasts["n"] == 1, upcasts
+e2e_sdxl_i2i = StableDiffusionXLImg2ImgPipeline(**sdxl_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+e2e_sdxl_i2i.unet = sdxl_denoiser()
+assert t2i._prepare_fp16_vae(e2e_sdxl_i2i, torch.float16) is False
+run_pipe(e2e_sdxl_i2i, image=pixels)
 `;
 
 function runPython(script, label, command = PYTHON) {

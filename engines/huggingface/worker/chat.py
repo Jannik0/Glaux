@@ -28,6 +28,7 @@ from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_lo
 from .t2i import (
     DiffusionStopped,
     _CUDA_TIER_ORDER,
+    _release_pipeline_hooks,
     clear_cuda_tier_limit,
     generate_text_to_image,
     load_text_to_image_pipeline,
@@ -194,6 +195,32 @@ def _diffusion_uses_cuda() -> bool:
     return _pipeline_uses_cuda()
 
 
+def _free_replaced_pipeline(pipe) -> None:
+    """Drop *pipe* and reclaim caches before the next load measures memory.
+
+    Caller holds ``_CHAT_LOCK`` and must not keep another name for *pipe*.
+    Free VRAM is read inside the next ``chatbot_create``. A local that still
+    points at the previous pipeline makes that read too small, and the load
+    stamps that low value on ``_glaux_free_vram``. Hooks are released first.
+    ``gc.collect()`` then collects anything the hooks still cycle.
+    ``_release_torch_cache`` includes ``empty_host_cache``.
+    """
+    if pipe is not None:
+        _release_pipeline_hooks(pipe)
+        del pipe
+    gc.collect()
+    try:
+        _release_torch_cache()
+    except Exception as exc:
+        print(
+            "Text-to-image could not release the torch cache: "
+            f"{_exception_first_line(exc)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    release_disk_offload()
+
+
 def _reload_same_diffusion_model() -> None:
     """Drop the loaded pipeline and build it again. Caller holds ``_CHAT_LOCK``.
 
@@ -203,15 +230,7 @@ def _reload_same_diffusion_model() -> None:
     here cannot free it before the next load measures memory.
     """
     model_id = CHATBOT_MODEL_ID
-    old = _chatbot_destroy_unlocked()
-    if old is not None:
-        del old
-    gc.collect()
-    try:
-        _release_torch_cache()
-    except Exception:
-        pass
-    release_disk_offload()
+    _free_replaced_pipeline(_chatbot_destroy_unlocked())
     if not model_id:
         raise RuntimeError("No diffusion model is loaded.")
     chatbot_create(model_id)
@@ -229,15 +248,7 @@ def _reload_diffusion_on_cpu(summary: str) -> None:
         file=sys.stderr,
         flush=True,
     )
-    old = _chatbot_destroy_unlocked()
-    if old is not None:
-        del old
-    gc.collect()
-    try:
-        _release_torch_cache()
-    except Exception:
-        pass
-    release_disk_offload()
+    _free_replaced_pipeline(_chatbot_destroy_unlocked())
     if model_id:
         chatbot_create(model_id)
 
@@ -433,10 +444,14 @@ def chatbot_destroy():
     retry after an out-of-memory error uses ``_chatbot_destroy_unlocked`` and
     leaves the cap in place. A later successful load keeps it as well, until
     this unload or until free VRAM has grown by more than 1 GiB.
+
+    The pipeline is released before the lock is dropped. The next
+    ``chatbot_create`` would otherwise measure free VRAM while this frame
+    still held the weights.
     """
     with _chat_lock_guard():
         model_id = CHATBOT_MODEL_ID
-        chatbot = _chatbot_destroy_unlocked()
+        _free_replaced_pipeline(_chatbot_destroy_unlocked())
     if model_id:
         try:
             clear_cuda_tier_limit(str(model_local_dir(model_id)))
@@ -447,11 +462,6 @@ def chatbot_destroy():
                 file=sys.stderr,
                 flush=True,
             )
-    if chatbot is not None:
-        del chatbot
-    gc.collect()
-    _release_torch_cache()
-    release_disk_offload()
 
 
 _THINKING_TEMPLATE_PARAMS = ("enable_thinking",)
@@ -632,6 +642,8 @@ def chat_generation_starts_in_thinking(
     model_id = _assert_valid_model_id(model_id)
     with _chat_lock_guard():
         if CHATBOT_MODEL_ID != model_id or CHATBOT is None:
+            if CHATBOT is not None:
+                _free_replaced_pipeline(_chatbot_destroy_unlocked())
             chatbot_create(model_id)
         if not chatbot_has_chat_template():
             return False
@@ -1207,26 +1219,21 @@ def chat_stream(
     model_id = _assert_valid_model_id(model_id)
     owns_history = messages is None
     with _chat_lock_guard():
+        # Free the previous pipeline before the new load reads free VRAM.
+        # Keeping it in a local until the end of the turn picked a lower
+        # tier and stamped that low free-VRAM sample on the new pipeline.
         if CHATBOT_MODEL_ID != model_id:
-            old = _chatbot_destroy_unlocked()
-        else:
-            old = None
+            _free_replaced_pipeline(_chatbot_destroy_unlocked())
         if CHATBOT is None:
             chatbot_create(model_id)
         if _active_pipeline_tag() in _DIFFUSION_PIPELINE_TAGS:
-            try:
-                _generate_text_to_image_turn(
-                    message,
-                    image_paths,
-                    audio_paths,
-                    video_paths,
-                    output_path,
-                )
-            finally:
-                if old is not None:
-                    del old
-                    gc.collect()
-                    _release_torch_cache()
+            _generate_text_to_image_turn(
+                message,
+                image_paths,
+                audio_paths,
+                video_paths,
+                output_path,
+            )
             return
         # Drop any image paths left by a failed text-to-image call so a later
         # chat turn is not reported as an image result.
@@ -1298,12 +1305,6 @@ def chat_stream(
                 if owns_history:
                     context._context_rollback_last_user()
                 context._invalidate_context_usage_cache()
-            # Always release the outgoing model's memory, whether the stream
-            # finished cleanly, was stopped, or raised partway through.
-            if old is not None:
-                del old
-                gc.collect()
-                _release_torch_cache()
 
 
 def run_chat(

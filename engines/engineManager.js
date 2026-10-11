@@ -547,6 +547,24 @@ function setDiffusersStopGraceMs(ms) {
 }
 
 /**
+ * Run the armed stop-grace callback now.
+ *
+ * Tests use this instead of waiting out the timer. A grace of a few hundred
+ * milliseconds races a slow `reinitialize` under CPU load: the kill can close
+ * the worker before the model id has changed, which is the skip the test
+ * meant to observe. Production still waits {@link DIFFUSERS_STOP_GRACE_MS}.
+ * @returns {Promise<void>}
+ */
+function expireDiffusersStopGrace() {
+  const run = diffusersStopRun;
+  if (!run) {
+    return Promise.resolve();
+  }
+  clearStopGrace(run);
+  return Promise.resolve(killHungDiffusersRun(run));
+}
+
+/**
  * @param {number} ms
  */
 function setDiffusersWorkerExitMs(ms) {
@@ -2146,6 +2164,7 @@ module.exports = {
   shutdown,
   resetInferenceWorker,
   setDiffusersStopGraceMs,
+  expireDiffusersStopGrace,
   setDiffusersWorkerExitMs,
   setDiffusersOffloadBaseDirs,
   killedOffloadPaths,

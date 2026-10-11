@@ -51,7 +51,7 @@ function delay(ms) {
 }
 
 /** Keep the event loop alive while an unref'd stop timer settles `promise`. */
-async function awaitAlive(promise, ms = 1000) {
+async function awaitAlive(promise, ms = 15000) {
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error('timed out')), ms);
@@ -63,7 +63,7 @@ async function awaitAlive(promise, ms = 1000) {
   }
 }
 
-async function waitFor(predicate, ms = 1000) {
+async function waitFor(predicate, ms = 15000) {
   const start = Date.now();
   while (!predicate()) {
     if (Date.now() - start > ms) {
@@ -73,7 +73,7 @@ async function waitFor(predicate, ms = 1000) {
   }
 }
 
-async function racePrompt(pending, ms = 1000) {
+async function racePrompt(pending, ms = 15000) {
   let timer;
   const timeout = new Promise((resolve) => {
     timer = setTimeout(() => resolve({ kind: 'timeout' }), ms);
@@ -425,7 +425,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
           reservationId: next.reservationId,
         });
       } catch (err) {
-        if (!/Engine is busy\./.test(err.message) || Date.now() - start > 1000) {
+        if (!/Engine is busy\./.test(err.message) || Date.now() - start > 15000) {
           throw err;
         }
         await delay(5);
@@ -460,7 +460,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     );
     await waitFor(() => engineManager.getStatus().phase === 'generating');
     cancelStreamRequest('diffusers-stream', sender);
-    await waitFor(() => sender.events.some((event) => event.type === 'canceled'), 1000);
+    await waitFor(() => sender.events.some((event) => event.type === 'canceled'));
     assert.equal(exitSettled, false);
     assert.deepEqual(closes, [{ final: false }]);
     await turn;
@@ -495,7 +495,11 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     await fs.writeFile(path.join(otherDir, 'model.safetensors'), 'weights');
     await fs.writeFile(path.join(otherDir, 'README.md'), '---\npipeline_tag: text-generation\n---\n');
     const allocated = await allocateSessionImagePath(sessions, 'switch.json');
-    engineManager.setDiffusersStopGraceMs(400);
+    // Longer than any reinitialize in this test. The grace used to be 400 ms
+    // and then the test slept 500 ms. Under CPU load reinitialize itself
+    // exceeded 400 ms, the timer closed the worker while the model was still
+    // org/diffusers, and closes.length was 1. Expire after the id has changed.
+    engineManager.setDiffusersStopGraceMs(60_000);
     const pending = engineManager.sendPrompt('a red fox', {
       outputPath: allocated.absolutePath,
       reservationId: allocated.reservationId,
@@ -512,7 +516,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       modelInit('org/other', { allowDuringDiffusersStop: true })
     );
     assert.equal(engineManager.getStatus().modelId, 'org/other');
-    await delay(500);
+    await engineManager.expireDiffusersStopGrace();
     assert.equal(closes.length, 0);
     assert.equal(engineManager.getStatus().phase, 'idle');
     resolveRun({ text: '', imagePaths: [allocated.absolutePath] });
@@ -1247,7 +1251,10 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
   });
 
   it('parks a download started during the grace and resumes it after reload', async () => {
-    engineManager.setDiffusersStopGraceMs(400);
+    // The download must start while the grace is still armed. A 400 ms grace
+    // could fire during downloadModel under CPU load and close the worker
+    // before this asserts closes.length === 0. Expire once the download is parked.
+    engineManager.setDiffusersStopGraceMs(60_000);
     let calls = 0;
     hf.downloadModel = (_modelId, options) => {
       calls += 1;
@@ -1276,7 +1283,8 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     });
     await waitFor(() => calls === 1);
     assert.equal(closes.length, 0);
-    await awaitAlive(download, 2000);
+    await engineManager.expireDiffusersStopGrace();
+    await awaitAlive(download, 15000);
     const raced = await racePrompt(pending);
     assert.equal(raced.kind, 'prompt');
     assert.equal(calls, 2);

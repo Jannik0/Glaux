@@ -24,6 +24,7 @@ import shutil
 import sys
 import time
 import traceback
+import weakref
 from pathlib import Path
 
 _REJECTED_CLASS_MARKERS = ("inpaint", "unconditional")
@@ -1192,8 +1193,8 @@ def _empty_host_cache() -> None:
         return
     try:
         empty_host()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_ignored("release the pinned host cache", exc)
 
 
 def _empty_cuda_cache() -> None:
@@ -1432,12 +1433,15 @@ def _cast_encode_output(out, dtype):
     latent_dist = getattr(out, "latent_dist", None)
     if latent_dist is not None:
         _cast_latent_distribution(latent_dist, dtype)
-    latents = getattr(out, "latents", None)
-    if torch.is_tensor(latents) and latents.dtype != dtype:
-        try:
-            out.latents = latents.to(dtype=dtype)
-        except Exception:
-            pass
+    # AutoencoderKL uses ``.latents``. AutoencoderDC's EncoderOutput uses
+    # ``.latent``. Both are tensors the denoiser will sample in the pipeline dtype.
+    for name in ("latents", "latent"):
+        value = getattr(out, name, None)
+        if torch.is_tensor(value) and value.dtype != dtype:
+            try:
+                setattr(out, name, value.to(dtype=dtype))
+            except Exception:
+                pass
     if isinstance(out, tuple):
         return tuple(_cast_encode_output(item, dtype) for item in out)
     return out
@@ -1451,27 +1455,41 @@ def _install_vae_io_cast(vae, pipeline_dtype) -> bool:
     hooks wrap submodule ``forward``, not these methods, and tiling is inside
     the original ``decode``, so both keep working. A second call does not
     wrap again.
+
+    The wrappers do not close over the module or a bound method. A bound
+    method's ``__self__`` is the VAE, and a closure that stored it would
+    cycle through ``vae.decode`` until ``gc.collect()``. The next load
+    measures free VRAM only after the previous pipeline is dropped, so that
+    cycle would keep the old weights resident. The unbound ``__func__`` plus
+    a weak reference lets refcount free the pipeline on its own.
     """
     if getattr(vae, "_glaux_vae_io_cast", False):
         return False
     import torch
 
-    original_decode = vae.decode
-    original_encode = vae.encode
+    decode_func = vae.decode.__func__
+    encode_func = vae.encode.__func__
+    vae_ref = weakref.ref(vae)
 
     def decode(z, *args, **kwargs):
+        module = vae_ref()
+        if module is None:
+            raise RuntimeError("Text-to-image VAE was collected before decode.")
         if torch.is_tensor(z):
-            target = getattr(vae, "dtype", pipeline_dtype)
+            target = getattr(module, "dtype", pipeline_dtype)
             if z.dtype != target:
                 z = z.to(dtype=target)
-        return original_decode(z, *args, **kwargs)
+        return decode_func(module, z, *args, **kwargs)
 
     def encode(x, *args, **kwargs):
+        module = vae_ref()
+        if module is None:
+            raise RuntimeError("Text-to-image VAE was collected before encode.")
         if torch.is_tensor(x):
-            target = getattr(vae, "dtype", pipeline_dtype)
+            target = getattr(module, "dtype", pipeline_dtype)
             if x.dtype != target:
                 x = x.to(dtype=target)
-        return _cast_encode_output(original_encode(x, *args, **kwargs), pipeline_dtype)
+        return _cast_encode_output(encode_func(module, x, *args, **kwargs), pipeline_dtype)
 
     vae.decode = decode
     vae.encode = encode
@@ -1497,6 +1515,18 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
     the whole model was not chosen: ``is_bf16_supported(including_emulation=True)``
     is what Turing reports, and it is slower than the hardware dtype these
     pipelines ship with.
+
+    This stays broad on purpose. ``force_upcast`` is true on SD1.5 VAEs and
+    on many Flux VAEs, and ``decode`` / ``encode`` do not read it, so it does
+    not mean "fp16 overflows". ``sample_size <= 768`` would also keep fp16
+    for a Flux-style VAE that reports a small sample size. A tiny CPU run
+    cannot reproduce a CUDA fp16 overflow, so there is no experiment here
+    that separates "SD1.x fp16 is fine" from "this VAE overflows" without
+    guessing by class name. Every fp16 pipeline that does not own
+    ``upcast_vae`` therefore gets an fp32 VAE. Residual risk: SD1.x and SD2.x
+    pay about two extra bytes per VAE parameter, plus fp32 activations, and
+    the decode is slower on Turing. That cost is logged. Narrowing the cast
+    later needs a source that names which VAEs overflow, not a size cutoff.
 
     Residual risk: the denoiser and the text encoders stay fp16. A NaN from
     the transformer is not repaired by an fp32 decode. Streamed group offload
@@ -1534,15 +1564,48 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
         )
         return False
     _install_vae_io_cast(vae, dtype)
+    extra = _fp32_vae_extra_bytes(vae)
+    extra_note = (
+        f"about {extra} extra parameter bytes versus fp16"
+        if extra is not None
+        else "extra parameter bytes versus fp16 were not measured"
+    )
     print(
-        "Text-to-image VAE is fp32 for this fp16 run. Decode and encode cast "
-        "their inputs to the VAE dtype, and encode returns latents in the "
-        "pipeline dtype. The denoiser and text encoders stay fp16; on compute "
-        "capability below 8 those can still produce NaNs.",
+        "Text-to-image VAE is fp32 for this fp16 run "
+        f"({extra_note}). No structural flag separates an SD1.x VAE, where "
+        "fp16 is usually fine, from a Flux or SD3 VAE that overflows, so the "
+        "fp32 VAE covers every fp16 pipeline that does not upcast itself. "
+        "Decode and encode cast their inputs to the VAE dtype, and encode "
+        "returns latents in the pipeline dtype. The denoiser and text "
+        "encoders stay fp16; on compute capability below 8 those can still "
+        "produce NaNs.",
         file=sys.stderr,
         flush=True,
     )
     return True
+
+
+def _fp32_vae_extra_bytes(vae) -> int | None:
+    """Bytes the fp32 VAE parameters cost beyond an fp16 copy.
+
+    One fp32 parameter is four bytes and one fp16 parameter is two, so the
+    difference is two bytes per element. Activations are not included.
+    """
+    parameters = getattr(vae, "parameters", None)
+    if not callable(parameters):
+        return None
+    try:
+        return sum(int(param.numel()) for param in parameters()) * 2
+    except Exception:
+        return None
+
+
+def _log_ignored(action: str, exc: BaseException) -> None:
+    """One stderr line. The rest of a multi-line error is dropped."""
+    text = str(exc).strip()
+    first = text.splitlines()[0].strip() if text else ""
+    detail = f"{type(exc).__name__}: {first}" if first else type(exc).__name__
+    print(f"Text-to-image could not {action}: {detail}", file=sys.stderr, flush=True)
 
 
 def _vae_group_offload_use_stream(pipe, name: str, use_stream: bool) -> bool:
@@ -2066,8 +2129,8 @@ def _release_pipeline_hooks(pipe) -> None:
         return
     try:
         release()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_ignored("release pipeline hooks", exc)
 
 
 def _on_diffusion_step_end(pipe, step_index, timestep, callback_kwargs):
