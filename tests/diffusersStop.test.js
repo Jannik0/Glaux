@@ -85,6 +85,54 @@ async function waitFor(predicate, ms = 15000) {
   }
 }
 
+/**
+ * Settle `promise` or return `label` after `ms`. The timer is cleared when
+ * `promise` wins so a 15 s guard does not keep the process alive.
+ * @param {Promise<unknown>} promise
+ * @param {number} [ms]
+ * @param {string} [label]
+ */
+async function raceWithTimeout(promise, ms = 15000, label = 'hung') {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(label), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Count `fs.stat` calls whose path contains one of `markers`. Parking awaits
+ * that stat, so a test can wait until the park has passed it.
+ * @param {string | string[]} markers
+ */
+function watchStats(markers) {
+  const original = fs.stat;
+  const wanted = Array.isArray(markers) ? markers : [markers];
+  const hits = { n: 0 };
+  const watchedStat = async (target, ...rest) => {
+    try {
+      return await original.call(fs, target, ...rest);
+    } finally {
+      const text = String(target);
+      // A full path segment. `during-grace.json` must not count as `during-grace`.
+      if (wanted.some((marker) => text.endsWith(`${path.sep}${marker}`) || text.includes(`${path.sep}${marker}${path.sep}`))) {
+        hits.n += 1;
+      }
+    }
+  };
+  fs.stat = watchedStat;
+  return {
+    hits,
+    restore() {
+      if (fs.stat === watchedStat) fs.stat = original;
+    },
+  };
+}
+
 async function racePrompt(pending, ms = 15000) {
   let timer;
   const timeout = new Promise((resolve) => {
@@ -154,6 +202,31 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
   let rejectRun;
   let rejectDownload;
   let offloadBases;
+
+  /**
+   * Close the worker, but do not let the exit wait end the stop procedure
+   * until `count` new model-directory stats have finished. Parking awaits
+   * `fs.stat`. A 25 ms exit loses that race and rejects the download. The
+   * grace must already be long enough that this call, not the grace timer,
+   * starts the kill. Stats from before the close do not count.
+   * @param {{ hits: { n: number } }} watch
+   * @param {number} [count]
+   */
+  async function releaseKillAfterPark(watch, count = 1) {
+    const before = watch.hits.n;
+    engineManager.setDiffusersWorkerExitMs(60_000);
+    const killing = engineManager.expireDiffusersStopGrace();
+    try {
+      await waitFor(() => watch.hits.n >= before + count);
+    } finally {
+      if (typeof exitResolve === 'function') {
+        const finish = exitResolve;
+        exitResolve = null;
+        finish();
+      }
+    }
+    await awaitAlive(killing);
+  }
 
   before(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'glaux-diffusers-stop-'));
@@ -780,30 +853,38 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       });
     });
     const allocated = await allocateSessionImagePath(sessions, 'resume.json');
-    const pending = engineManager.sendPrompt('a red fox', {
-      outputPath: allocated.absolutePath,
-      reservationId: allocated.reservationId,
-    });
-    engineManager.cancelGeneration();
-    await awaitAlive(entered);
-    assert.equal(tracked.calls(), 1);
-    releaseReload();
-    const raced = await racePrompt(pending);
-    assert.equal(raced.kind, 'prompt');
-    await download;
-    assert.equal(tracked.calls(), 2);
-    assert.equal(
-      events.some((info) => info.phase === 'download' && info.status === 'starting'),
-      true
-    );
-    assert.equal(
-      events.some((info) => info.phase === 'download' && info.status === 'complete'),
-      true
-    );
-    assert.equal(
-      events.some((info) => info.status === 'error'),
-      false
-    );
+    const watch = watchStats('side');
+    engineManager.setDiffusersStopGraceMs(60_000);
+    try {
+      const pending = engineManager.sendPrompt('a red fox', {
+        outputPath: allocated.absolutePath,
+        reservationId: allocated.reservationId,
+      });
+      engineManager.cancelGeneration();
+      await releaseKillAfterPark(watch);
+      await awaitAlive(entered);
+      assert.equal(tracked.calls(), 1);
+      releaseReload();
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      await download;
+      assert.equal(tracked.calls(), 2);
+      assert.equal(
+        events.some((info) => info.phase === 'download' && info.status === 'starting'),
+        true
+      );
+      assert.equal(
+        events.some((info) => info.phase === 'download' && info.status === 'complete'),
+        true
+      );
+      assert.equal(
+        events.some((info) => info.status === 'error'),
+        false
+      );
+    } finally {
+      watch.restore();
+      releaseReload();
+    }
   });
 
   it('does not resume a download the user cancelled during reload', async () => {
@@ -819,6 +900,8 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
         releaseReload = resolve;
       });
     });
+    const watch = watchStats('cancel-me');
+    engineManager.setDiffusersStopGraceMs(60_000);
     try {
       const allocated = await allocateSessionImagePath(sessions, 'cancel-dl.json');
       const pending = engineManager.sendPrompt('a red fox', {
@@ -826,6 +909,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
         reservationId: allocated.reservationId,
       });
       engineManager.cancelGeneration();
+      await releaseKillAfterPark(watch);
       await awaitAlive(entered);
       const cancelled = download.then(
         () => null,
@@ -839,6 +923,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       await waitFor(() => engineManager.getStatus().phase === 'idle');
       assert.equal(tracked.calls(), 1);
     } finally {
+      watch.restore();
       releaseReload();
     }
   });
@@ -846,16 +931,23 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
   it('does not resume a download when reload fails or the model was deleted', async () => {
     const failed = await startParkedDownload('org/fail-dl');
     engineManager.setDiffusersKillRecovery(async () => ({ ok: false }));
-    const failedPath = await allocateSessionImagePath(sessions, 'fail-dl.json');
-    const failedPrompt = engineManager.sendPrompt('a red fox', {
-      outputPath: failedPath.absolutePath,
-      reservationId: failedPath.reservationId,
-    });
-    engineManager.cancelGeneration();
-    await awaitAlive(assert.rejects(failed.download, /Engine closed/));
-    const failedRace = await racePrompt(failedPrompt);
-    assert.equal(failedRace.kind, 'prompt');
-    assert.equal(failed.tracked.calls(), 1);
+    const failedWatch = watchStats('fail-dl');
+    engineManager.setDiffusersStopGraceMs(60_000);
+    try {
+      const failedPath = await allocateSessionImagePath(sessions, 'fail-dl.json');
+      const failedPrompt = engineManager.sendPrompt('a red fox', {
+        outputPath: failedPath.absolutePath,
+        reservationId: failedPath.reservationId,
+      });
+      engineManager.cancelGeneration();
+      await releaseKillAfterPark(failedWatch);
+      await awaitAlive(assert.rejects(failed.download, /Engine closed/));
+      const failedRace = await racePrompt(failedPrompt);
+      assert.equal(failedRace.kind, 'prompt');
+      assert.equal(failed.tracked.calls(), 1);
+    } finally {
+      failedWatch.restore();
+    }
 
     const deletedDir = path.join(cache, 'org', 'deleted-dl');
     await fs.mkdir(deletedDir, { recursive: true });
@@ -871,19 +963,27 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
         releaseReload = resolve;
       });
     });
-    const deletedPath = await allocateSessionImagePath(sessions, 'deleted-dl.json');
-    const deletedPrompt = engineManager.sendPrompt('a blue fox', {
-      outputPath: deletedPath.absolutePath,
-      reservationId: deletedPath.reservationId,
-    });
-    engineManager.cancelGeneration();
-    await awaitAlive(entered);
-    await fs.rm(deletedDir, { recursive: true, force: true });
-    releaseReload();
-    await assert.rejects(deleted.download, /Engine closed/);
-    const deletedRace = await racePrompt(deletedPrompt);
-    assert.equal(deletedRace.kind, 'prompt');
-    assert.equal(deleted.tracked.calls(), 1);
+    const deletedWatch = watchStats('deleted-dl');
+    engineManager.setDiffusersStopGraceMs(60_000);
+    try {
+      const deletedPath = await allocateSessionImagePath(sessions, 'deleted-dl.json');
+      const deletedPrompt = engineManager.sendPrompt('a blue fox', {
+        outputPath: deletedPath.absolutePath,
+        reservationId: deletedPath.reservationId,
+      });
+      engineManager.cancelGeneration();
+      await releaseKillAfterPark(deletedWatch);
+      await awaitAlive(entered);
+      await fs.rm(deletedDir, { recursive: true, force: true });
+      releaseReload();
+      await assert.rejects(deleted.download, /Engine closed/);
+      const deletedRace = await racePrompt(deletedPrompt);
+      assert.equal(deletedRace.kind, 'prompt');
+      assert.equal(deleted.tracked.calls(), 1);
+    } finally {
+      deletedWatch.restore();
+      releaseReload();
+    }
   });
 
   it('clears the active download rpc id when the worker is closed', async () => {
@@ -916,6 +1016,7 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       onProgress: (info) => events.push(info),
     });
     await waitFor(() => calls === 1);
+    const watch = watchStats(modelId.split('/').pop());
     let markEntered;
     const entered = new Promise((resolve) => {
       markEntered = resolve;
@@ -923,17 +1024,23 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     engineManager.setDiffusersKillRecovery(() => {
       markEntered();
     });
-    const allocated = await allocateSessionImagePath(sessions, `${modelId.split('/').pop()}.json`);
-    const pending = engineManager.sendPrompt('a red fox', {
-      outputPath: allocated.absolutePath,
-      reservationId: allocated.reservationId,
-    });
-    engineManager.cancelGeneration();
-    await awaitAlive(entered);
-    const raced = await racePrompt(pending);
-    assert.equal(raced.kind, 'prompt');
-    assert.equal(raced.value, STOP_MARKER);
-    await waitFor(() => engineManager.getStatus().phase === 'idle' && calls >= 2);
+    engineManager.setDiffusersStopGraceMs(60_000);
+    try {
+      const allocated = await allocateSessionImagePath(sessions, `${modelId.split('/').pop()}.json`);
+      const pending = engineManager.sendPrompt('a red fox', {
+        outputPath: allocated.absolutePath,
+        reservationId: allocated.reservationId,
+      });
+      engineManager.cancelGeneration();
+      await releaseKillAfterPark(watch);
+      await awaitAlive(entered);
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      assert.equal(raced.value, STOP_MARKER);
+      await waitFor(() => engineManager.getStatus().phase === 'idle' && calls >= 2);
+    } finally {
+      watch.restore();
+    }
     return {
       calls: () => calls,
       events,
@@ -1066,15 +1173,22 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     await waitFor(() => calls === 1);
 
     async function hungStop(name) {
-      const allocated = await allocateSessionImagePath(sessions, `${name}.json`);
-      const pending = engineManager.sendPrompt('a red fox', {
-        outputPath: allocated.absolutePath,
-        reservationId: allocated.reservationId,
-      });
-      engineManager.cancelGeneration();
-      const raced = await racePrompt(pending);
-      assert.equal(raced.kind, 'prompt');
-      assert.equal(raced.value, STOP_MARKER);
+      const watch = watchStats('two-stops');
+      engineManager.setDiffusersStopGraceMs(60_000);
+      try {
+        const allocated = await allocateSessionImagePath(sessions, `${name}.json`);
+        const pending = engineManager.sendPrompt('a red fox', {
+          outputPath: allocated.absolutePath,
+          reservationId: allocated.reservationId,
+        });
+        engineManager.cancelGeneration();
+        await releaseKillAfterPark(watch);
+        const raced = await racePrompt(pending);
+        assert.equal(raced.kind, 'prompt');
+        assert.equal(raced.value, STOP_MARKER);
+      } finally {
+        watch.restore();
+      }
     }
 
     await hungStop('two-stops-1');
@@ -1123,61 +1237,75 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       (err) => err
     );
     await waitFor(() => inflight.length === 1);
-    const first = await allocateSessionImagePath(sessions, 'second-grace-1.json');
-    const firstPrompt = engineManager.sendPrompt('a red fox', {
-      outputPath: first.absolutePath,
-      reservationId: first.reservationId,
-    });
-    engineManager.cancelGeneration();
-    const firstRace = await racePrompt(firstPrompt);
-    assert.equal(firstRace.kind, 'prompt');
-    await waitFor(() => inflight.length === 2 && engineManager.getStatus().phase === 'idle');
-
+    const firstWatch = watchStats('resume-a');
     engineManager.setDiffusersStopGraceMs(60_000);
-    const second = await allocateSessionImagePath(sessions, 'second-grace-2.json');
-    const secondPrompt = engineManager.sendPrompt('a blue fox', {
-      outputPath: second.absolutePath,
-      reservationId: second.reservationId,
-    });
-    engineManager.cancelGeneration();
-    assert.equal(engineManager.getStatus().phase, 'loading');
-    assert.equal(closes.length, 1);
-    const downloadB = engineManager.downloadModel({
-      modelId: 'org/during-second',
-      modelsCacheDir: cache,
-      onProgress: (info) => events.b.push(info),
-    });
-    const settledB = downloadB.then(
-      () => 'ok',
-      (err) => err
-    );
-    await waitFor(() => inflight.length === 3);
-    assert.equal(closes.length, 1);
-    await assertStillPending(settledB);
-    await awaitAlive(engineManager.expireDiffusersStopGrace());
+    try {
+      const first = await allocateSessionImagePath(sessions, 'second-grace-1.json');
+      const firstPrompt = engineManager.sendPrompt('a red fox', {
+        outputPath: first.absolutePath,
+        reservationId: first.reservationId,
+      });
+      engineManager.cancelGeneration();
+      await releaseKillAfterPark(firstWatch);
+      const firstRace = await racePrompt(firstPrompt);
+      assert.equal(firstRace.kind, 'prompt');
+      await waitFor(() => inflight.length === 2 && engineManager.getStatus().phase === 'idle');
+    } finally {
+      firstWatch.restore();
+    }
 
-    await waitFor(
-      () => engineManager.getStatus().phase === 'idle' && inflight.filter((item) => item.modelId === 'org/resume-a').length === 3
-    );
-    const thirdA = inflight.filter((item) => item.modelId === 'org/resume-a')[2];
-    thirdA.done = true;
-    thirdA.resolve();
-    await waitFor(
-      () => inflight.filter((item) => item.modelId === 'org/during-second').length === 2
-    );
-    const secondB = inflight.filter((item) => item.modelId === 'org/during-second')[1];
-    secondB.done = true;
-    secondB.resolve();
-    assert.equal(await settledA, 'ok');
-    assert.equal(await settledB, 'ok');
-    assert.equal(
-      events.a.some((info) => info.status === 'error') || events.b.some((info) => info.status === 'error'),
-      false
-    );
-    assert.equal(
-      events.b.some((info) => info.phase === 'download' && info.status === 'complete'),
-      true
-    );
+    const secondWatch = watchStats(['resume-a', 'during-second']);
+    engineManager.setDiffusersStopGraceMs(60_000);
+    try {
+      const second = await allocateSessionImagePath(sessions, 'second-grace-2.json');
+      const secondPrompt = engineManager.sendPrompt('a blue fox', {
+        outputPath: second.absolutePath,
+        reservationId: second.reservationId,
+      });
+      engineManager.cancelGeneration();
+      assert.equal(engineManager.getStatus().phase, 'loading');
+      assert.equal(closes.length, 1);
+      const downloadB = engineManager.downloadModel({
+        modelId: 'org/during-second',
+        modelsCacheDir: cache,
+        onProgress: (info) => events.b.push(info),
+      });
+      const settledB = downloadB.then(
+        () => 'ok',
+        (err) => err
+      );
+      await waitFor(() => inflight.length === 3);
+      assert.equal(closes.length, 1);
+      await assertStillPending(settledB);
+      // The resumed download and the one started during this stop each stat
+      // before they park. The exit wait stays open until both have.
+      await releaseKillAfterPark(secondWatch, 2);
+
+      await waitFor(
+        () => engineManager.getStatus().phase === 'idle' && inflight.filter((item) => item.modelId === 'org/resume-a').length === 3
+      );
+      const thirdA = inflight.filter((item) => item.modelId === 'org/resume-a')[2];
+      thirdA.done = true;
+      thirdA.resolve();
+      await waitFor(
+        () => inflight.filter((item) => item.modelId === 'org/during-second').length === 2
+      );
+      const secondB = inflight.filter((item) => item.modelId === 'org/during-second')[1];
+      secondB.done = true;
+      secondB.resolve();
+      assert.equal(await settledA, 'ok');
+      assert.equal(await settledB, 'ok');
+      assert.equal(
+        events.a.some((info) => info.status === 'error') || events.b.some((info) => info.status === 'error'),
+        false
+      );
+      assert.equal(
+        events.b.some((info) => info.phase === 'download' && info.status === 'complete'),
+        true
+      );
+    } finally {
+      secondWatch.restore();
+    }
   });
 
   it('rejects parked downloads when shutdown arrives during the worker exit wait', async () => {
@@ -1222,10 +1350,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     }
     assert.equal(exitSettled, false);
 
-    const outcome = await Promise.race([
-      engineManager.shutdown({ hfDestroyTimeoutMs: 20 }).then(() => 'done'),
-      delay(15000).then(() => 'hung'),
-    ]);
+    const outcome = await raceWithTimeout(
+      engineManager.shutdown({ hfDestroyTimeoutMs: 20 }).then(() => 'done')
+    );
     assert.equal(outcome, 'done');
     assert.equal(exitSettled, false);
     assert.equal(reloaded, false);
@@ -1280,35 +1407,40 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
       }
       return Promise.resolve();
     };
-    const allocated = await allocateSessionImagePath(sessions, 'during-grace.json');
-    const pending = engineManager.sendPrompt('a red fox', {
-      outputPath: allocated.absolutePath,
-      reservationId: allocated.reservationId,
-    });
-    engineManager.cancelGeneration();
-    assert.equal(engineManager.getStatus().phase, 'loading');
-    const events = [];
-    const download = engineManager.downloadModel({
-      modelId: 'org/during-grace',
-      modelsCacheDir: cache,
-      onProgress: (info) => events.push(info),
-    });
-    await waitFor(() => calls === 1);
-    assert.equal(closes.length, 0);
-    await awaitAlive(engineManager.expireDiffusersStopGrace());
-    await awaitAlive(download, 15000);
-    const raced = await racePrompt(pending);
-    assert.equal(raced.kind, 'prompt');
-    assert.equal(calls, 2);
-    assert.equal(
-      events.some((info) => info.phase === 'download' && info.status === 'complete'),
-      true
-    );
-    assert.equal(
-      events.some((info) => info.status === 'error'),
-      false
-    );
-    await waitFor(() => engineManager.getStatus().phase === 'idle');
+    const watch = watchStats('during-grace');
+    try {
+      const allocated = await allocateSessionImagePath(sessions, 'during-grace.json');
+      const pending = engineManager.sendPrompt('a red fox', {
+        outputPath: allocated.absolutePath,
+        reservationId: allocated.reservationId,
+      });
+      engineManager.cancelGeneration();
+      assert.equal(engineManager.getStatus().phase, 'loading');
+      const events = [];
+      const download = engineManager.downloadModel({
+        modelId: 'org/during-grace',
+        modelsCacheDir: cache,
+        onProgress: (info) => events.push(info),
+      });
+      await waitFor(() => calls === 1);
+      assert.equal(closes.length, 0);
+      await releaseKillAfterPark(watch);
+      await awaitAlive(download, 15000);
+      const raced = await racePrompt(pending);
+      assert.equal(raced.kind, 'prompt');
+      assert.equal(calls, 2);
+      assert.equal(
+        events.some((info) => info.phase === 'download' && info.status === 'complete'),
+        true
+      );
+      assert.equal(
+        events.some((info) => info.status === 'error'),
+        false
+      );
+      await waitFor(() => engineManager.getStatus().phase === 'idle');
+    } finally {
+      watch.restore();
+    }
   });
 
   it('parks a kill-error download started during reload and resumes it', async () => {
@@ -1484,10 +1616,9 @@ describe('Diffusers stop grace', { concurrency: 1 }, () => {
     assert.equal(raced.kind, 'prompt');
     assert.equal(exitSettled, false);
 
-    const outcome = await Promise.race([
-      engineManager.shutdown({ hfDestroyTimeoutMs: 20 }).then(() => 'done'),
-      delay(15000).then(() => 'hung'),
-    ]);
+    const outcome = await raceWithTimeout(
+      engineManager.shutdown({ hfDestroyTimeoutMs: 20 }).then(() => 'done')
+    );
     assert.equal(outcome, 'done');
     assert.equal(exitSettled, false);
     assert.equal(engineManager.getStatus().phase, 'idle');

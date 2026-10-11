@@ -1207,8 +1207,8 @@ def _empty_cuda_cache() -> None:
         return
     try:
         torch.cuda.empty_cache()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_ignored("release the CUDA cache", exc)
 
 
 def _release_failed_placement(pipe) -> None:
@@ -1440,8 +1440,8 @@ def _cast_encode_output(out, dtype):
         if torch.is_tensor(value) and value.dtype != dtype:
             try:
                 setattr(out, name, value.to(dtype=dtype))
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_ignored("cast encoded latents to the pipeline dtype", exc)
     if isinstance(out, tuple):
         return tuple(_cast_encode_output(item, dtype) for item in out)
     return out
@@ -1460,10 +1460,10 @@ def _install_vae_io_cast(vae, pipeline_dtype) -> bool:
     method's ``__self__`` is the VAE, and a closure that stored it would
     cycle through ``vae.decode`` until ``gc.collect()``. The next load
     measures free VRAM only after the previous pipeline is dropped, so that
-    cycle would keep the old weights resident. A bound method is called
-    through its unbound ``__func__``. A plain function attribute has no
-    ``__func__`` and is called as ``fn(tensor)``. Either way the closure
-    holds only a weak reference to the VAE.
+    cycle would keep the old weights resident. ``__func__`` is used only when
+    ``__self__`` is this VAE. A plain function, or a bound method of some
+    other object, is called as ``fn(tensor)``. Either way the closure holds
+    only a weak reference to the VAE.
 
     ``copy.deepcopy`` of a pipeline that carries these wrappers is
     unsupported. The copy's ``decode`` would still point at a weak
@@ -1477,10 +1477,15 @@ def _install_vae_io_cast(vae, pipeline_dtype) -> bool:
         return False
     import torch
 
-    # None when the attribute is a plain function, not a bound method.
-    # Reading ``__func__`` on that function raises AttributeError.
-    decode_func = getattr(decode, "__func__", None)
-    encode_func = getattr(encode, "__func__", None)
+    # ``__func__`` only for a method of this VAE. A plain function has no
+    # ``__self__``. A bound method of another object does, and calling its
+    # ``__func__`` with this VAE would pass the wrong ``self``.
+    decode_func = getattr(decode, "__func__", None) if getattr(decode, "__self__", None) is vae else None
+    encode_func = getattr(encode, "__func__", None) if getattr(encode, "__self__", None) is vae else None
+    if (getattr(decode, "__self__", None) is vae and decode_func is None) or (
+        getattr(encode, "__self__", None) is vae and encode_func is None
+    ):
+        return False
     # Captured before the nested defs rebind the names ``decode`` and ``encode``.
     plain_decode = decode if decode_func is None else None
     plain_encode = encode if encode_func is None else None
@@ -1584,6 +1589,7 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
         return False
     import torch
 
+    original_dtype = getattr(vae, "dtype", None)
     try:
         to(dtype=torch.float32)
     except Exception as exc:
@@ -1592,6 +1598,20 @@ def _prepare_fp16_vae(pipe, dtype) -> bool:
             file=sys.stderr,
             flush=True,
         )
+        # ``to`` may have moved some parameters before raising. Put the whole
+        # VAE back on the dtype it had, so decode does not mix fp16 and fp32.
+        if original_dtype is None:
+            print(
+                "Text-to-image could not restore the VAE dtype after the failed "
+                "upcast: the original dtype was not available.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            try:
+                to(dtype=original_dtype)
+            except Exception as restore_exc:
+                _log_ignored("restore the VAE dtype after a failed fp32 upcast", restore_exc)
         return False
     extra = _fp32_vae_extra_bytes(vae)
     extra_note = (
@@ -2156,8 +2176,8 @@ def _request_pipeline_interrupt(pipe) -> None:
         return
     try:
         pipe.interrupt = True
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_ignored("interrupt the pipeline", exc)
 
 
 def _release_pipeline_hooks(pipe) -> None:
@@ -2207,8 +2227,8 @@ def _sync_timing_device() -> None:
         return
     try:
         cuda.synchronize()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_ignored("synchronize the CUDA device", exc)
 
 
 class _StepTimer:

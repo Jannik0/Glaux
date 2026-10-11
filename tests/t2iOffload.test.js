@@ -2130,6 +2130,70 @@ try:
 finally:
     gc.enable()
 
+class ForeignOwner:
+    def __init__(self):
+        self.seen = []
+
+    def decode(self, z, *args, **kwargs):
+        self.seen.append(self)
+        return z
+
+    def encode(self, x, *args, **kwargs):
+        self.seen.append(self)
+        return x
+
+foreign = ForeignOwner()
+foreign_vae = PlainAttrVae()
+foreign_vae.proj = nn.Linear(4, 4, bias=False).to(dtype=torch.float16)
+foreign_vae.decode = foreign.decode
+foreign_vae.encode = foreign.encode
+assert foreign_vae.decode.__self__ is foreign
+assert foreign_vae.decode.__func__ is ForeignOwner.decode
+foreign_pipe = type("ForeignPipe", (), {})()
+foreign_pipe.vae = foreign_vae
+assert t2i._prepare_fp16_vae(foreign_pipe, torch.float16) is True
+with torch.no_grad():
+    foreign_out = foreign_vae.decode(torch.zeros(1, 4, dtype=torch.float16))
+assert foreign_out.dtype == torch.float32, foreign_out.dtype
+assert foreign.seen == [foreign], foreign.seen
+
+class PartialToVae(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.keep = nn.Linear(2, 2, bias=False)
+        self.moved = nn.Linear(2, 2, bias=False)
+        self.keep.to(dtype=torch.float16)
+        self.moved.to(dtype=torch.float16)
+        self.decode = plain_decode
+        self.encode = plain_encode
+
+    @property
+    def dtype(self):
+        return self.keep.weight.dtype
+
+    def to(self, *args, **kwargs):
+        dtype = kwargs.get("dtype")
+        self.moved.to(dtype=dtype)
+        if dtype == torch.float32:
+            raise RuntimeError("upcast stopped after one parameter")
+        self.keep.to(dtype=dtype)
+        return self
+
+partial = PartialToVae()
+partial_pipe = type("PartialPipe", (), {})()
+partial_pipe.vae = partial
+partial_log = io.StringIO()
+sys.stderr = partial_log
+try:
+    assert t2i._prepare_fp16_vae(partial_pipe, torch.float16) is False
+finally:
+    sys.stderr = _err
+partial_text = partial_log.getvalue()
+assert "could not upcast the VAE to fp32" in partial_text, partial_text
+assert "VAE is fp32" not in partial_text, partial_text
+for param in partial.parameters():
+    assert param.dtype == torch.float16, param.dtype
+
 class HookBoom:
     def maybe_free_model_hooks(self):
         raise RuntimeError("hook release failed\nsecond line")
@@ -2166,6 +2230,67 @@ finally:
         accelerator.empty_host_cache = previous_empty
 assert "RuntimeError: host cache failed" in host_log.getvalue(), host_log.getvalue()
 assert "second line" not in host_log.getvalue()
+
+class SealedLatent:
+    def __init__(self):
+        object.__setattr__(self, "latent", torch.zeros(1, dtype=torch.float32))
+        object.__setattr__(self, "sealed", True)
+
+    def __setattr__(self, name, value):
+        if name == "latent" and getattr(self, "sealed", False):
+            raise RuntimeError("sealed latent\nsecond line")
+        object.__setattr__(self, name, value)
+
+sealed_log = io.StringIO()
+sys.stderr = sealed_log
+try:
+    t2i._cast_encode_output(SealedLatent(), torch.float16)
+finally:
+    sys.stderr = _err
+assert "could not cast encoded latents" in sealed_log.getvalue(), sealed_log.getvalue()
+assert "second line" not in sealed_log.getvalue()
+
+class BadInterrupt:
+    def __setattr__(self, name, value):
+        if name == "interrupt":
+            raise RuntimeError("no interrupt\nsecond line")
+        object.__setattr__(self, name, value)
+
+interrupt_log = io.StringIO()
+sys.stderr = interrupt_log
+try:
+    t2i._request_pipeline_interrupt(BadInterrupt())
+finally:
+    sys.stderr = _err
+assert "could not interrupt the pipeline" in interrupt_log.getvalue(), interrupt_log.getvalue()
+assert "second line" not in interrupt_log.getvalue()
+
+was_available = torch.cuda.is_available
+empty_cache = torch.cuda.empty_cache
+synchronize = torch.cuda.synchronize
+torch.cuda.is_available = lambda: True
+
+def cache_boom():
+    raise RuntimeError("cuda cache failed\nsecond line")
+
+def sync_boom():
+    raise RuntimeError("cuda sync failed\nsecond line")
+
+torch.cuda.empty_cache = cache_boom
+torch.cuda.synchronize = sync_boom
+cuda_log = io.StringIO()
+sys.stderr = cuda_log
+try:
+    t2i._empty_cuda_cache()
+    t2i._sync_timing_device()
+finally:
+    sys.stderr = _err
+    torch.cuda.is_available = was_available
+    torch.cuda.empty_cache = empty_cache
+    torch.cuda.synchronize = synchronize
+assert "could not release the CUDA cache" in cuda_log.getvalue(), cuda_log.getvalue()
+assert "could not synchronize the CUDA device" in cuda_log.getvalue(), cuda_log.getvalue()
+assert "second line" not in cuda_log.getvalue()
 
 class Denoiser(nn.Module):
     def __init__(self, **config):
