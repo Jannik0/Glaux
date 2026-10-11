@@ -26,8 +26,10 @@ from . import download as _download
 from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_local_dir, read_model_pipeline_tag
 from .t2i import (
     DiffusionStopped,
+    _CUDA_TIER_ORDER,
     generate_text_to_image,
     load_text_to_image_pipeline,
+    lower_cuda_tier_after_oom,
     release_disk_offload,
 )
 from .thinking import (
@@ -174,6 +176,37 @@ def _cuda_failure_summary(exc: BaseException) -> str:
     if len(text) > 180:
         return text[:180] + "…"
     return text
+
+
+def _diffusion_uses_cuda() -> bool:
+    """True when the loaded diffusion pipeline is allowed to touch CUDA.
+
+    Group offload and Accelerate disk maps often report the pipeline device as
+    CPU or meta while the forward pass still runs on the GPU. The loader sets
+    ``_glaux_uses_cuda`` so an out-of-memory error still steps down a tier and,
+    at the bottom, still reloads on CPU.
+    """
+    pipe = CHATBOT
+    if getattr(pipe, "_glaux_uses_cuda", False):
+        return True
+    return _pipeline_uses_cuda()
+
+
+def _reload_same_diffusion_model() -> None:
+    """Drop the loaded pipeline and build it again. Caller holds ``_CHAT_LOCK``."""
+    model_id = CHATBOT_MODEL_ID
+    old = _chatbot_destroy_unlocked()
+    if old is not None:
+        del old
+    gc.collect()
+    try:
+        _release_torch_cache()
+    except Exception:
+        pass
+    release_disk_offload()
+    if not model_id:
+        raise RuntimeError("No diffusion model is loaded.")
+    chatbot_create(model_id)
 
 
 def _pipeline_uses_cuda() -> bool:
@@ -1009,8 +1042,10 @@ def _generate_text_to_image_turn(
         raise ValueError("Image generation output path is not configured.")
     saved: str | None = None
     stopped = False
+    tier_drops = 0
+    cpu_tried = False
     try:
-        for attempt in range(2):
+        while True:
             try:
                 saved = generate_text_to_image(CHATBOT, prompt, output_path, init_image)
                 break
@@ -1018,7 +1053,23 @@ def _generate_text_to_image_turn(
                 stopped = True
                 break
             except Exception as exc:
-                if attempt == 0 and _pipeline_uses_cuda() and _is_cuda_failure(exc):
+                # A too-eager CUDA tier retries one step down before the CPU reload.
+                if (
+                    tier_drops < len(_CUDA_TIER_ORDER)
+                    and _diffusion_uses_cuda()
+                    and _is_cuda_oom(exc)
+                    and lower_cuda_tier_after_oom(CHATBOT)
+                ):
+                    tier_drops += 1
+                    print(
+                        "Text-to-image ran out of GPU memory; retrying a lower CUDA placement.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _reload_same_diffusion_model()
+                    continue
+                if not cpu_tried and _diffusion_uses_cuda() and _is_cuda_failure(exc):
+                    cpu_tried = True
                     _fallback_pipeline_to_cpu(exc)
                     continue
                 raise
