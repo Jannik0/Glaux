@@ -124,10 +124,14 @@ def assert_text_to_image_repo(model_path: str, *, allow_img2img: bool = False) -
 # only when the single file is absent (``modeling_utils`` checkpoint
 # resolution, ``use_safetensors is not False``).
 # Sibling ``*.fp16.safetensors`` files and a root single-file checkpoint are
-# not selected. The pipeline passes ``use_safetensors=True``, so a ``.bin``
-# file is not loaded (diffusers then leaves ``allow_pickle`` false, and
-# transformers never reaches ``pytorch_model.bin``). A ``.bin`` size is still
-# measured so that checkpoint is not treated as empty.
+# not selected. Glaux does not pass ``use_safetensors``. Diffusers 0.41
+# ``from_pretrained`` pops that omitted argument as None and forwards it
+# (``pipeline_utils`` load path). It does not turn None into True; that
+# conversion is only in ``download()``. Transformers treats a value that is
+# not truthy as permission to load ``pytorch_model.bin`` when no safetensors
+# file is present. A ``.bin`` size is still measured so that checkpoint is
+# not treated as empty. Its largest layer stays unknown, so it gets no GPU
+# shard floor.
 _DIFFUSERS_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 _DIFFUSERS_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
 _DIFFUSERS_BIN_NAME = "diffusion_pytorch_model.bin"
@@ -211,7 +215,15 @@ def _shape_numel(shape) -> int | None:
 
 
 def _block_prefix(name: str) -> str | None:
-    """Module path through the first numeric segment, such as ``encoder.block.0``."""
+    """Module path through the first numeric segment, such as ``encoder.block.0``.
+
+    This overestimates an SDXL UNet. The first numeric segment is the whole
+    ``down_blocks.N`` stage, while Accelerate's no-split modules are
+    ``ResnetBlock2D`` and ``BasicTransformerBlock``, so the floor is about
+    twice ``get_max_layer_size``. A high floor only refuses a shard. It does
+    not publish a budget Accelerate would ignore. A finer grouping is not
+    guessed here: it needs a test against that reservation.
+    """
     parts = name.split(".")
     for index, part in enumerate(parts):
         if part.isdigit():
@@ -754,16 +766,23 @@ def _next_cuda_tier(tier: str) -> str | None:
     return order[1]
 
 
+# Distinguishes "argument omitted" from an explicit None. An explicit None
+# is a load-start sample that was unavailable, and must not be replaced by a
+# live read while the failed pipeline is still resident.
+_TIER_LIMIT_VRAM_OMITTED = object()
+
+
 def _note_tier_limit(
     model_path: str,
     failed_tier: str,
-    free_vram: int | None = None,
+    free_vram: int | None = _TIER_LIMIT_VRAM_OMITTED,
 ) -> str | None:
     """Remember the next lower tier for *model_path*. None at the disk tier.
 
-    The first call records *free_vram* (or a live sample when it is omitted).
-    Later drops do not overwrite that sample: the growth check compares
-    against the free VRAM from when the cap was set.
+    The first call records *free_vram*. A live sample is used only when the
+    argument is omitted. An explicit None is stored as "no sample" and is not
+    replaced. Later drops do not overwrite that sample: the growth check
+    compares against the free VRAM from when the cap was set.
     """
     model_path = str(Path(model_path).resolve())
     nxt = _next_cuda_tier(failed_tier)
@@ -773,7 +792,7 @@ def _note_tier_limit(
     if current is None or _CUDA_TIER_ORDER.index(nxt) > _CUDA_TIER_ORDER.index(current):
         _cuda_tier_limits[model_path] = nxt
     if model_path not in _cuda_tier_limit_vram:
-        if free_vram is None:
+        if free_vram is _TIER_LIMIT_VRAM_OMITTED:
             free_vram = _free_vram_bytes()
         if free_vram is not None:
             _cuda_tier_limit_vram[model_path] = int(free_vram)
@@ -816,11 +835,20 @@ def cuda_tier_limit_for(model_path: str, free_vram: int | None) -> str | None:
 
 
 def lower_cuda_tier_after_oom(pipe) -> bool:
-    """Record a lower tier after *pipe* ran out of GPU memory. False at disk."""
+    """Record a lower tier after *pipe* ran out of GPU memory. False at disk.
+
+    The free-VRAM sample is the one stamped at load start
+    (``pipe._glaux_free_vram``), not a live read. The caller runs this while
+    the failed pipeline is still resident, so a live read is the low
+    post-failure number. The reload then sees more than 1 GiB of growth and
+    would drop the cap that this call just set.
+    """
     tier = getattr(pipe, "_glaux_placement_tier", None)
     model_path = getattr(pipe, "_glaux_model_path", None)
     if not isinstance(tier, str) or not model_path:
         return False
+    if hasattr(pipe, "_glaux_free_vram"):
+        return _note_tier_limit(str(model_path), tier, pipe._glaux_free_vram) is not None
     return _note_tier_limit(str(model_path), tier) is not None
 
 
@@ -878,6 +906,12 @@ def _split_cpu_budgets(sizes: dict[str, int], total_budget: int) -> dict[str, in
     return budgets
 
 
+# Non-weight buffers are not in the safetensors header. A CLIP-G-like encoder
+# was 193 KiB over the header-derived grant, so the encoder slice keeps 32 MiB
+# of spare above that grant. The denoiser floor is still reserved.
+_ENCODER_GPU_SLACK_BYTES = 32 * 1024 * 1024
+
+
 def _gpu_budget_grant(spare: int, size: int, floor: int, keep: int) -> int:
     """GPU ``max_memory`` for one component, or 0 when it would not be placed.
 
@@ -887,7 +921,8 @@ def _gpu_budget_grant(spare: int, size: int, floor: int, keep: int) -> int:
     (the whole module is one block), the grant is the floor rather than the
     component size. *keep* is the floor that must remain for the denoiser
     before this component may take a slice. A floor of 0 means the largest
-    layer is unknown, so no shard is published.
+    layer is unknown, so no shard is published. An encoder (*keep* > 0) may
+    take ``_ENCODER_GPU_SLACK_BYTES`` more, and never past ``spare - keep``.
     """
     spare = max(0, int(spare))
     floor = max(0, int(floor))
@@ -896,12 +931,17 @@ def _gpu_budget_grant(spare: int, size: int, floor: int, keep: int) -> int:
         return 0
     full = max(int(size), floor)
     if spare - full >= keep:
-        return min(spare, full)
-    # The denoiser (keep == 0) takes every remaining byte once one block fits.
-    # An encoder leaves the rest for the denoiser and takes only its floor.
-    if keep == 0:
+        grant = min(spare, full)
+    elif keep == 0:
+        # The denoiser takes every remaining byte once one block fits.
         return spare
-    return floor
+    else:
+        # An encoder leaves the rest for the denoiser and takes only its floor.
+        grant = floor
+    if keep > 0 and grant > 0:
+        room = spare - keep
+        grant = min(room, grant + _ENCODER_GPU_SLACK_BYTES)
+    return grant
 
 
 def _disk_component_gpu_budgets(
@@ -1308,59 +1348,179 @@ def _enable_vae_tiling(pipe) -> bool:
     return True
 
 
-# Pipelines whose ``__call__`` decodes in ``vae.dtype`` and does not upcast.
-# SDXL (and SD1.5 via ``force_upcast``) already does ``pipe.vae.to(float32)``
-# inside the deprecated ``upcast_vae``. Flux, SD3, and Qwen do not.
-_FP16_VAE_UPCAST_MARKERS = ("flux", "stablediffusion3", "qwen")
+def _vae_force_upcast(vae) -> bool:
+    """``vae.config.force_upcast``, whether config is a dict or an object."""
+    config = getattr(vae, "config", None)
+    if isinstance(config, dict):
+        return bool(config.get("force_upcast"))
+    if config is None:
+        return False
+    return bool(getattr(config, "force_upcast", False))
 
 
-def _vae_needs_fp16_upcast(pipe) -> bool:
-    """True when an fp16 VAE should be moved to fp32 before placement.
+def _pipeline_owns_vae_upcast(pipe) -> bool:
+    """True when this pipeline upcasts the VAE itself during ``__call__``.
 
-    ``vae.config.force_upcast`` is what SDXL checks. Flux, Stable Diffusion 3,
-    and Qwen pipelines are matched by class name because their decode path
-    uses ``vae.dtype`` and never upcasts. The VAE class counts too, so a
-    wrapper around ``AutoencoderKLFlux2`` still matches.
+    The rule is structural, read from the pipeline object, not from the class
+    name. In diffusers 0.41, ``upcast_vae`` (SDXL and the pipelines that copy
+    it: ControlNet-SDXL, Kolors, AnimateDiff-SDXL, PAG-SDXL, SD upscale) runs
+    only when ``vae.dtype == torch.float16`` and ``vae.config.force_upcast``.
+    It then casts latents to the post-quant conv dtype, decodes, and casts
+    the VAE back. Moving the VAE to fp32 first makes that condition false, so
+    fp16 latents hit fp32 weights (``Input type (c10::Half) and bias type
+    (float)``). Img2img does the same with ``image.float()`` before encode.
+
+    Flux, SD3, Qwen, and base SD1.5 do not define ``upcast_vae``. Their
+    decode calls ``vae.decode`` on pipeline-dtype latents. Qwen casts decode
+    inputs to ``vae.dtype``; its img2img encode does not. An fp32 VAE on
+    those pipelines needs the input cast in :func:`_install_vae_io_cast`.
+
+    ``AutoencoderKL.force_upcast`` defaults to True and is not itself an
+    upcast: ``decode`` and ``encode`` do not read it. A pipeline with
+    ``upcast_vae`` but ``force_upcast`` false never enters the upcast branch,
+    so the VAE stays in the pipeline dtype and this returns False.
     """
     vae = getattr(pipe, "vae", None)
     if vae is None:
         return False
-    config = getattr(vae, "config", None)
-    if isinstance(config, dict):
-        force = bool(config.get("force_upcast"))
-    else:
-        force = bool(getattr(config, "force_upcast", False)) if config is not None else False
-    if force:
-        return True
-    blob = f"{type(pipe).__name__} {type(vae).__name__}".lower()
-    return any(marker in blob for marker in _FP16_VAE_UPCAST_MARKERS)
+    upcast = getattr(pipe, "upcast_vae", None)
+    if not callable(upcast):
+        return False
+    return _vae_force_upcast(vae)
 
 
-def _upcast_vae_for_fp16(pipe, dtype) -> bool:
-    """Move the VAE to fp32 for an fp16 load that is known to need it.
+def _cast_latent_distribution(dist, dtype) -> None:
+    """Make ``sample()`` and ``mode()`` return *dtype*.
 
-    Called after the pipeline exists and before offload hooks or ``.to``, so
-    those hooks store fp32 VAE weights. Diffusers' own advice for the SDXL
-    helper is ``pipe.vae.to(torch.float32)`` (the ``upcast_vae`` deprecation).
-    Doing it here also covers Flux, SD3, and Qwen, which decode in
-    ``vae.dtype`` and would otherwise run the VAE in fp16.
+    ``DiagonalGaussianDistribution`` draws in ``parameters.dtype`` and
+    ``mode()`` returns ``mean``, which was chunked from those parameters.
+    Rebinding the parameters and the chunked fields keeps both paths, and a
+    later ``retrieve_latents``, on the pipeline dtype. Img2img feeds that
+    tensor to an fp16 denoiser.
+    """
+    import torch
 
-    fp16 on compute capability below 8 can overflow those VAEs (inferred from
-    the missing upcast, not from a GPU run). Emulated bf16 for the whole
-    model was not chosen: ``is_bf16_supported(including_emulation=True)`` is
-    what Turing reports, and it is slower than the hardware dtype these
-    pipelines ship with. This only changes the VAE.
+    params = getattr(dist, "parameters", None)
+    if not torch.is_tensor(params) or params.dtype == dtype:
+        return
+    cast = params.to(dtype=dtype)
+    dist.parameters = cast
+    if not hasattr(dist, "mean") or not hasattr(dist, "logvar"):
+        return
+    mean, logvar = torch.chunk(cast, 2, dim=1)
+    dist.mean = mean
+    dist.logvar = torch.clamp(logvar, -30.0, 20.0)
+    dist.std = torch.exp(0.5 * dist.logvar)
+    dist.var = torch.exp(dist.logvar)
+    if getattr(dist, "deterministic", False):
+        zeros = torch.zeros_like(dist.mean)
+        dist.std = zeros
+        dist.var = zeros
+
+
+def _cast_encode_output(out, dtype):
+    """Return *out* with latents in *dtype*. Decode outputs are left alone."""
+    import torch
+
+    if torch.is_tensor(out):
+        if out.dtype == dtype:
+            return out
+        return out.to(dtype=dtype)
+    if hasattr(out, "parameters") and callable(getattr(out, "sample", None)):
+        _cast_latent_distribution(out, dtype)
+        return out
+    latent_dist = getattr(out, "latent_dist", None)
+    if latent_dist is not None:
+        _cast_latent_distribution(latent_dist, dtype)
+    latents = getattr(out, "latents", None)
+    if torch.is_tensor(latents) and latents.dtype != dtype:
+        try:
+            out.latents = latents.to(dtype=dtype)
+        except Exception:
+            pass
+    if isinstance(out, tuple):
+        return tuple(_cast_encode_output(item, dtype) for item in out)
+    return out
+
+
+def _install_vae_io_cast(vae, pipeline_dtype) -> bool:
+    """Cast VAE inputs to ``vae.dtype`` and encode latents back.
+
+    Idempotent (``vae._glaux_vae_io_cast``). The wrappers replace
+    ``decode`` and ``encode`` on the module. Group-offload and model-offload
+    hooks wrap submodule ``forward``, not these methods, and tiling is inside
+    the original ``decode``, so both keep working. A second call does not
+    wrap again.
+    """
+    if getattr(vae, "_glaux_vae_io_cast", False):
+        return False
+    import torch
+
+    original_decode = vae.decode
+    original_encode = vae.encode
+
+    def decode(z, *args, **kwargs):
+        if torch.is_tensor(z):
+            target = getattr(vae, "dtype", pipeline_dtype)
+            if z.dtype != target:
+                z = z.to(dtype=target)
+        return original_decode(z, *args, **kwargs)
+
+    def encode(x, *args, **kwargs):
+        if torch.is_tensor(x):
+            target = getattr(vae, "dtype", pipeline_dtype)
+            if x.dtype != target:
+                x = x.to(dtype=target)
+        return _cast_encode_output(original_encode(x, *args, **kwargs), pipeline_dtype)
+
+    vae.decode = decode
+    vae.encode = encode
+    vae._glaux_vae_io_cast = True
+    return True
+
+
+def _prepare_fp16_vae(pipe, dtype) -> bool:
+    """Prepare the VAE for an fp16 pipeline. True when this moved it to fp32.
+
+    Called after the pipeline exists and before offload hooks or ``.to``, on
+    the CUDA tier path, the disk path, and the CPU/MPS path.
+
+    Pipelines that own ``upcast_vae`` and set ``force_upcast`` keep an fp16
+    VAE so their own upcast still runs. Every other fp16 pipeline moves the
+    VAE to fp32 and installs :func:`_install_vae_io_cast`. Without that cast,
+    Flux, SD3, and base SD decode fp16 latents against fp32 biases and raise
+    after every denoising step. The error is not an out-of-memory error, so
+    the tier retry does not recover.
+
+    fp16 on compute capability below 8 can overflow a VAE that never upcasts
+    (inferred from the missing upcast, not from a GPU run). Emulated bf16 for
+    the whole model was not chosen: ``is_bf16_supported(including_emulation=True)``
+    is what Turing reports, and it is slower than the hardware dtype these
+    pipelines ship with.
 
     Residual risk: the denoiser and the text encoders stay fp16. A NaN from
-    the transformer is not repaired by an fp32 decode.
+    the transformer is not repaired by an fp32 decode. Streamed group offload
+    snapshots weights and would restore fp16 under an in-pipeline
+    ``vae.to(float32)``; that VAE is offloaded without a stream (see
+    :func:`_vae_group_offload_use_stream`). Accelerate disk hooks were not
+    executed here. If ``vae.to(dtype=float32)`` is a no-op under
+    ``dispatch_model``, SDXL's own upcast leaves the VAE fp16 and the latents
+    stay fp16 with it, so decode matches and the overflow risk remains.
     """
     if _dtype_name(dtype) != "float16":
         return False
-    if not _vae_needs_fp16_upcast(pipe):
+    if _pipeline_owns_vae_upcast(pipe):
+        print(
+            "Text-to-image leaves the VAE in fp16. This pipeline upcasts it "
+            "when vae.config.force_upcast is set, and casts the latents to "
+            "that dtype. A pre-upcast would skip that path.",
+            file=sys.stderr,
+            flush=True,
+        )
         return False
     vae = getattr(pipe, "vae", None)
     to = getattr(vae, "to", None)
-    if not callable(to):
+    if not callable(to) or not callable(getattr(vae, "decode", None)):
         return False
     import torch
 
@@ -1368,20 +1528,40 @@ def _upcast_vae_for_fp16(pipe, dtype) -> bool:
         to(dtype=torch.float32)
     except Exception as exc:
         print(
-            f"Text-to-image could not upcast the VAE to fp32: {exc}",
+            f"Text-to-image could not upcast the VAE to fp32: {type(exc).__name__}: {exc}",
             file=sys.stderr,
             flush=True,
         )
         return False
+    _install_vae_io_cast(vae, dtype)
     print(
-        "Text-to-image VAE is fp32 for this fp16 run "
-        "(force_upcast, or a Flux, SD3, or Qwen pipeline). "
-        "The denoiser and text encoders stay fp16; on compute capability "
-        "below 8 those can still produce NaNs.",
+        "Text-to-image VAE is fp32 for this fp16 run. Decode and encode cast "
+        "their inputs to the VAE dtype, and encode returns latents in the "
+        "pipeline dtype. The denoiser and text encoders stay fp16; on compute "
+        "capability below 8 those can still produce NaNs.",
         file=sys.stderr,
         flush=True,
     )
     return True
+
+
+def _vae_group_offload_use_stream(pipe, name: str, use_stream: bool) -> bool:
+    """False when a streamed host copy would undo this VAE's dtype.
+
+    Streamed group offload stores a host copy of the weights from hook
+    setup and writes it back on every offload. SDXL's ``upcast_vae`` does
+    ``vae.to(dtype=float32)`` and then casts latents to the post-quant conv
+    dtype. The decode forward restores the fp16 copy, so fp32 latents meet
+    fp16 biases. Leaf groups do not avoid that: the stream snapshot is what
+    reverts the dtype. The VAE of a pipeline that upcasts itself is therefore
+    group-offloaded without a stream, on CPU or on the CUDA device, and
+    ``vae.to(dtype)`` sticks. Other components keep the stream.
+    """
+    if not use_stream or name != "vae":
+        return bool(use_stream)
+    if not _pipeline_owns_vae_upcast(pipe):
+        return True
+    return False
 
 
 def _large_component_load_kwargs(dtype, budgets: dict, offload_folder: str) -> dict:
@@ -1500,7 +1680,7 @@ def _load_disk_offloaded(
             local_files_only=True,
             **preloaded,
         )
-        _upcast_vae_for_fp16(pipe, dtype)
+        _prepare_fp16_vae(pipe, dtype)
         _place_unmapped_modules(pipe, device)
         if device != "cuda":
             _keep_sampling_off_meta(pipe)
@@ -1594,12 +1774,16 @@ def _apply_group_offload(pipe, offload_type: str, *, pre_pin: bool, onload_devic
     use_stream = onload.type == "cuda"
     applied = 0
     choices: list[str] = []
+    vae_stream_dropped = False
     for name, component in components.items():
         if not isinstance(component, torch.nn.Module):
             continue
         chosen = _offload_type_for_component(name, component, offload_type)
+        component_stream = _vae_group_offload_use_stream(pipe, name, use_stream)
+        if use_stream and not component_stream:
+            vae_stream_dropped = True
         choices.append(f"{name}={chosen}")
-        kwargs = _group_offload_kwargs(chosen, pre_pin=pre_pin, use_stream=use_stream)
+        kwargs = _group_offload_kwargs(chosen, pre_pin=pre_pin, use_stream=component_stream)
         try:
             apply_group_offloading(
                 component,
@@ -1616,8 +1800,15 @@ def _apply_group_offload(pipe, offload_type: str, *, pre_pin: bool, onload_devic
             ) from exc
     if applied == 0:
         raise _PlacementUnsupported("pipeline has no modules to group-offload")
+    note = ""
+    if vae_stream_dropped:
+        note = (
+            " The VAE is not streamed: this pipeline upcasts it at decode "
+            "time, and a streamed host copy would restore fp16 weights under "
+            "the fp32 latents."
+        )
     print(
-        "Text-to-image group offload: " + ", ".join(choices) + ".",
+        "Text-to-image group offload: " + ", ".join(choices) + "." + note,
         file=sys.stderr,
         flush=True,
     )
@@ -1664,9 +1855,11 @@ def _place_cuda_tier(
             torch_dtype=dtype,
             local_files_only=True,
         )
-        # Before hooks and ``.to``, so a group-offload or CPU-offload copy of
-        # the VAE is already fp32. See ``_upcast_vae_for_fp16``.
-        _upcast_vae_for_fp16(pipe, dtype)
+        # Before hooks and ``.to``. A pipeline that upcasts its own VAE stays
+        # fp16 so that upcast still runs. Any other fp16 VAE is fp32, with
+        # decode/encode casts, before a group-offload snapshot. See
+        # ``_prepare_fp16_vae``.
+        _prepare_fp16_vae(pipe, dtype)
         if tier == TIER_CUDA:
             moved = pipe.to("cuda")
             if moved is not None:
@@ -1717,6 +1910,10 @@ def _load_cuda_pipeline(
 
     def publish(pipe, tier: str):
         _mark_cuda_pipe(pipe, tier, resolved)
+        # Load-start free VRAM. A later generation OOM must pass this back:
+        # sampling while the failed pipeline is still resident records the
+        # low number, and the reload then looks like more than 1 GiB of growth.
+        pipe._glaux_free_vram = free_vram
         print(
             _format_placement_log(tier, dtype_name, free_vram, available_ram, cast),
             file=sys.stderr,
@@ -1826,7 +2023,7 @@ def load_text_to_image_pipeline(model_path: str, device: str, *, allow_img2img: 
             torch_dtype=dtype,
             local_files_only=True,
         )
-        _upcast_vae_for_fp16(pipe, dtype)
+        _prepare_fp16_vae(pipe, dtype)
         pipe = pipe.to(device)
     loaded_name = type(pipe).__name__
     if _class_name_rejected(loaded_name, allow_img2img=allow_img2img):

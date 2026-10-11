@@ -386,6 +386,15 @@ def _configure_asr_generation_limits() -> None:
     if generation_config is not None:
         generation_config.max_new_tokens = None
 
+def _exception_first_line(exc: BaseException) -> str:
+    """Type and the first line. CUDA OOM text continues for many lines."""
+    text = str(exc).strip()
+    first = text.splitlines()[0].strip() if text else ""
+    if first:
+        return f"{type(exc).__name__}: {first}"
+    return type(exc).__name__
+
+
 def _release_torch_cache() -> None:
     """Return cached GPU/MPS allocations, and pinned host memory, to the driver."""
     try:
@@ -431,8 +440,13 @@ def chatbot_destroy():
     if model_id:
         try:
             clear_cuda_tier_limit(str(model_local_dir(model_id)))
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                "Text-to-image could not clear the CUDA tier cap: "
+                f"{_exception_first_line(exc)}",
+                file=sys.stderr,
+                flush=True,
+            )
     if chatbot is not None:
         del chatbot
     gc.collect()
@@ -1109,7 +1123,7 @@ def _generate_text_to_image_turn(
                 if CHAT_GENERATION_STOP:
                     print(
                         "Text-to-image stopped; not retrying "
-                        f"({type(exc).__name__}: {exc}).",
+                        f"({_exception_first_line(exc)}).",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -1134,8 +1148,13 @@ def _generate_text_to_image_turn(
             gc.collect()
             try:
                 _release_torch_cache()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(
+                    "Text-to-image could not release the torch cache: "
+                    f"{_exception_first_line(exc)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if CHAT_GENERATION_STOP:
                 stopped = True
                 break

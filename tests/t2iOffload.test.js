@@ -453,8 +453,9 @@ wide = t2i._component_disk_budgets(
     gpu_floors={"transformer": 1, "text_encoder": 1, "vae": 1},
 )
 denoiser_spare = 20 * GiB - head - 100
-assert wide["text_encoder"][0] == 5 * GiB
-assert wide["transformer"][0] == denoiser_spare - 5 * GiB
+slack = t2i._ENCODER_GPU_SLACK_BYTES
+assert wide["text_encoder"][0] == 5 * GiB + slack
+assert wide["transformer"][0] == denoiser_spare - 5 * GiB - slack
 assert "vae" not in wide
 assert wide["transformer"]["cpu"] == 12 * GiB
 assert wide["text_encoder"]["cpu"] == 5 * GiB
@@ -470,10 +471,10 @@ tight = t2i._component_disk_budgets(
 )
 assert tight["transformer"]["cpu"] == tight_budget - t2i._CPU_BUDGET_FLOOR
 assert tight["text_encoder"]["cpu"] == t2i._CPU_BUDGET_FLOOR
-assert tight["text_encoder"][0] == 2 * GiB
+assert tight["text_encoder"][0] == 2 * GiB + slack
 # The remainder is larger than the transformer, so the grant is the cast size.
-# A grant below the floor would place nothing; a grant of the whole spare is
-# not required once the cast size already covers the floor.
+# Encoder slack comes out of the spare before that grant and does not shrink
+# a denoiser that still fits.
 assert tight["transformer"][0] == 8 * GiB
 
 cpu_budgets = t2i._component_disk_budgets(
@@ -524,8 +525,9 @@ partial_encoder = t2i._component_disk_budgets(
     cuda_visible=True,
     gpu_floors={"transformer": 2 * GiB, "text_encoder": GiB},
 )
-assert partial_encoder["text_encoder"][0] == GiB
-assert partial_encoder["transformer"][0] == 5 * GiB - GiB
+assert partial_encoder["text_encoder"][0] == GiB + slack
+assert partial_encoder["transformer"][0] == 5 * GiB - GiB - slack
+assert partial_encoder["transformer"][0] >= 2 * GiB
 # Unknown layer sizes publish no GPU shard, including when spare VRAM is large.
 unknown_floor = t2i._component_disk_budgets(
     {"transformer": 12 * GiB, "text_encoder": 5 * GiB},
@@ -556,7 +558,7 @@ tiny_grant = t2i._disk_component_gpu_budgets(
     20 * GiB,
     {"text_encoder": 200, "transformer": 400},
 )
-assert tiny_grant["text_encoder"] == 200
+assert tiny_grant["text_encoder"] == 200 + slack
 assert tiny_grant["transformer"] == 5000
 
 assert t2i.cuda_tiers_from("cuda") == [
@@ -837,23 +839,67 @@ class ForceVae:
     def __init__(self):
         self.config = types.SimpleNamespace(force_upcast=True)
 
-force_pipe = type("StableDiffusionXLPipeline", (), {})()
+def upcast_vae(self):
+    return None
+
+# The pipeline method plus force_upcast decides. The class name does not.
+force_pipe = type("StableDiffusionXLPipeline", (), {"upcast_vae": upcast_vae})()
 force_pipe.vae = ForceVae()
-assert t2i._vae_needs_fp16_upcast(force_pipe) is True
+assert t2i._pipeline_owns_vae_upcast(force_pipe) is True
+assert t2i._prepare_fp16_vae(force_pipe, "float16") is False
+assert not hasattr(force_pipe.vae, "_glaux_vae_io_cast")
 flux_pipe = type("FluxPipeline", (), {})()
-flux_pipe.vae = type("AutoencoderKL", (), {})()
-assert t2i._vae_needs_fp16_upcast(flux_pipe) is True
+flux_pipe.vae = type("AutoencoderKL", (), {"config": types.SimpleNamespace(force_upcast=True)})()
+assert t2i._pipeline_owns_vae_upcast(flux_pipe) is False
 sd3_pipe = type("StableDiffusion3Pipeline", (), {})()
 sd3_pipe.vae = type("AutoencoderKL", (), {})()
-assert t2i._vae_needs_fp16_upcast(sd3_pipe) is True
+assert t2i._pipeline_owns_vae_upcast(sd3_pipe) is False
 qwen_pipe = type("QwenImagePipeline", (), {})()
 qwen_pipe.vae = type("AutoencoderKLQwenImage", (), {})()
-assert t2i._vae_needs_fp16_upcast(qwen_pipe) is True
-plain_pipe = type("CustomPipeline", (), {})()
+assert t2i._pipeline_owns_vae_upcast(qwen_pipe) is False
+plain_pipe = type("StableDiffusionXLPipeline", (), {"upcast_vae": upcast_vae})()
 plain_pipe.vae = type("AutoencoderKL", (), {})()
 plain_pipe.vae.config = types.SimpleNamespace(force_upcast=False)
-assert t2i._vae_needs_fp16_upcast(plain_pipe) is False
-assert t2i._vae_needs_fp16_upcast(type("FluxPipeline", (), {})()) is False
+assert t2i._pipeline_owns_vae_upcast(plain_pipe) is False
+assert t2i._pipeline_owns_vae_upcast(type("FluxPipeline", (), {})()) is False
+
+oom_path = "/models/oom-stamp"
+oom_resolved = str(Path(oom_path).resolve())
+stamp = 8 * GiB
+resident = GiB
+post_reload = 8 * GiB
+
+class ResidentPipe:
+    _glaux_placement_tier = "cuda"
+    _glaux_model_path = oom_path
+    _glaux_free_vram = stamp
+
+t2i._free_vram_bytes = lambda: resident
+assert t2i.lower_cuda_tier_after_oom(ResidentPipe()) is True
+assert t2i._cuda_tier_limits[oom_resolved] == "model_cpu_offload"
+assert t2i._cuda_tier_limit_vram[oom_resolved] == stamp
+assert t2i.cuda_tier_limit_for(oom_path, post_reload) == "model_cpu_offload"
+assert t2i.cuda_tier_limit_for(oom_path, stamp + growth) == "model_cpu_offload"
+t2i.clear_cuda_tier_limit(oom_path)
+
+class UnstampedPipe:
+    _glaux_placement_tier = "cuda"
+    _glaux_model_path = oom_path
+
+assert t2i.lower_cuda_tier_after_oom(UnstampedPipe()) is True
+assert t2i._cuda_tier_limit_vram[oom_resolved] == resident
+assert t2i.cuda_tier_limit_for(oom_path, post_reload) is None
+
+class NoneStamp:
+    _glaux_placement_tier = "cuda"
+    _glaux_model_path = "/models/none-stamp"
+    _glaux_free_vram = None
+
+assert t2i.lower_cuda_tier_after_oom(NoneStamp()) is True
+none_resolved = str(Path("/models/none-stamp").resolve())
+assert none_resolved not in t2i._cuda_tier_limit_vram
+assert t2i.cuda_tier_limit_for("/models/none-stamp", 100 * GiB) == "model_cpu_offload"
+t2i.clear_cuda_tier_limit("/models/none-stamp")
 
 class Blockless:
     def named_children(self):
@@ -1228,6 +1274,30 @@ by_name = {name: rest for name, *rest in applied}
 assert by_name["vae"] == ["leaf_level", "cpu", False, False], by_name
 assert by_name["text_encoder"][0] == "leaf_level"
 assert by_name["unet"] == ["block_level", "cpu", False, False], by_name
+class SdxlPipe(Pipe):
+    def upcast_vae(self):
+        return None
+
+sdxl = SdxlPipe()
+sdxl.vae.config = types.SimpleNamespace(force_upcast=True)
+applied.clear()
+stream_log = io.StringIO()
+old_stream_err = sys.stderr
+sys.stderr = stream_log
+try:
+    t2i._apply_group_offload(sdxl, "block_level", pre_pin=True, onload_device="cuda")
+finally:
+    sys.stderr = old_stream_err
+sdxl_by_name = {name: rest for name, *rest in applied}
+assert sdxl_by_name["vae"][3] is False, sdxl_by_name
+assert sdxl_by_name["unet"][3] is True, sdxl_by_name
+assert "not streamed" in stream_log.getvalue(), stream_log.getvalue()
+flux_stream = Pipe()
+applied.clear()
+t2i._apply_group_offload(flux_stream, "block_level", pre_pin=True, onload_device="cuda")
+flux_by_name = {name: rest for name, *rest in applied}
+assert flux_by_name["vae"][3] is True, flux_by_name
+
 pipe.vae.fail = True
 try:
     t2i._apply_group_offload(pipe, "block_level", pre_pin=False, onload_device="cpu")
@@ -1311,6 +1381,7 @@ assert seen == [
 assert t2i._cuda_tier_limits.get(resolved) == "group_offload"
 assert "low_cpu_mem_usage=True" in buf.getvalue()
 assert isinstance(loaded, FakePipe)
+assert loaded._glaux_free_vram == 8 * 1024**3
 host_calls.clear()
 t2i._empty_host_cache()
 assert host_calls == ["host"]
@@ -1430,6 +1501,95 @@ assert calls["n"] == 1
 assert creates == []
 assert "not retrying" in stop_log.getvalue(), stop_log.getvalue()
 assert "RuntimeError: CUDA out of memory" in stop_log.getvalue()
+
+def generate_multiline(pipe, prompt, output_path, image_path=None):
+    calls["n"] += 1
+    chat.CHAT_GENERATION_STOP = True
+    raise RuntimeError("CUDA out of memory.\nTried to allocate 20.00 GiB")
+
+chat.CHATBOT = make_pipe()
+chat.CHATBOT_MODEL_ID = "org/repo"
+chat.generate_text_to_image = generate_multiline
+multi_log = io.StringIO()
+sys.stderr = multi_log
+try:
+    assert chat._generate_text_to_image_turn("a cat", None, None, None, "/tmp/out.png") == ""
+finally:
+    sys.stderr = old_err
+assert calls["n"] == 2
+assert "RuntimeError: CUDA out of memory." in multi_log.getvalue(), multi_log.getvalue()
+assert "Tried to allocate" not in multi_log.getvalue()
+
+creates.clear()
+calls["n"] = 0
+GiB = 1024 ** 3
+stamp = 8 * GiB
+resident = GiB
+
+def live_vram():
+    return resident
+
+t2i._free_vram_bytes = live_vram
+stamped = make_pipe("cuda")
+stamped._glaux_free_vram = stamp
+chat.CHATBOT = stamped
+chat.CHATBOT_MODEL_ID = "org/repo"
+chat.CHATBOT_PIPELINE_TAG = "text-to-image"
+box.clear()
+
+def generate_oom_stamp(pipe, prompt, output_path, image_path=None):
+    if box.get("phase") == "retry":
+        return "/tmp/out.png"
+    box["phase"] = "retry"
+    raise RuntimeError("CUDA out of memory")
+
+chat.generate_text_to_image = generate_oom_stamp
+assert chat._generate_text_to_image_turn("a cat", None, None, None, "/tmp/out.png") == "/tmp/out.png"
+cap_resolved = str(Path("/models/org/repo").resolve())
+assert t2i._cuda_tier_limits[cap_resolved] == "model_cpu_offload"
+assert t2i._cuda_tier_limit_vram[cap_resolved] == stamp
+assert t2i.cuda_tier_limit_for("/models/org/repo", stamp) == "model_cpu_offload"
+t2i.clear_cuda_tier_limit("/models/org/repo")
+bare = make_pipe("cuda")
+assert t2i.lower_cuda_tier_after_oom(bare) is True
+assert t2i._cuda_tier_limit_vram[cap_resolved] == resident
+assert t2i.cuda_tier_limit_for("/models/org/repo", stamp) is None
+
+def clear_boom(path):
+    raise RuntimeError("cap clear failed\nsecond line")
+
+chat.clear_cuda_tier_limit = clear_boom
+chat.CHATBOT_MODEL_ID = "org/repo"
+chat.CHATBOT = make_pipe()
+cap_log = io.StringIO()
+sys.stderr = cap_log
+try:
+    chat.chatbot_destroy()
+finally:
+    sys.stderr = old_err
+assert "RuntimeError: cap clear failed" in cap_log.getvalue(), cap_log.getvalue()
+assert "second line" not in cap_log.getvalue()
+
+def release_boom():
+    raise RuntimeError("cache release failed\nsecond line")
+
+chat._release_torch_cache = release_boom
+chat.chatbot_create = fake_create
+chat.CHATBOT = make_pipe()
+chat.CHATBOT_MODEL_ID = "org/repo"
+chat.CHATBOT_PIPELINE_TAG = "text-to-image"
+t2i._cuda_tier_limits.clear()
+t2i._cuda_tier_limit_vram.clear()
+box.clear()
+chat.generate_text_to_image = generate_oom_stamp
+cache_log = io.StringIO()
+sys.stderr = cache_log
+try:
+    assert chat._generate_text_to_image_turn("a cat", None, None, None, "/tmp/out.png") == "/tmp/out.png"
+finally:
+    sys.stderr = old_err
+assert "RuntimeError: cache release failed" in cache_log.getvalue(), cache_log.getvalue()
+assert "second line" not in cache_log.getvalue()
 
 creates.clear()
 calls["n"] = 0
@@ -1575,7 +1735,7 @@ def flux_components(self):
     return {"vae": self.vae}
 
 type(flux_pipe).components = property(flux_components)
-assert t2i._vae_needs_fp16_upcast(flux_pipe) is True
+assert t2i._pipeline_owns_vae_upcast(flux_pipe) is False
 t2i._apply_group_offload(flux_pipe, "block_level", pre_pin=False, onload_device=torch.device("cpu"))
 pixels = torch.zeros(1, 3, 32, 32)
 with torch.no_grad():
@@ -1583,13 +1743,193 @@ with torch.no_grad():
     flux_decoded = flux_pipe.vae.decode(posterior.latent_dist.mode())
 assert tuple(flux_decoded.sample.shape) == (1, 3, 32, 32)
 
-fp16_vae = torch.nn.Conv2d(1, 1, 1).half()
-fp16_vae.config = types.SimpleNamespace(force_upcast=True)
-fp16_pipe = type("StableDiffusionPipeline", (), {})()
-fp16_pipe.vae = fp16_vae
-assert t2i._upcast_vae_for_fp16(fp16_pipe, torch.float16) is True
-assert fp16_vae.weight.dtype == torch.float32
-assert t2i._upcast_vae_for_fp16(fp16_pipe, torch.float32) is False
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    FluxImg2ImgPipeline,
+    FluxPipeline,
+    StableDiffusion3Img2ImgPipeline,
+    StableDiffusion3Pipeline,
+    StableDiffusionXLImg2ImgPipeline,
+    StableDiffusionXLPipeline,
+)
+
+def tiny_vae(dtype, force_upcast):
+    vae = AutoencoderKL(
+        in_channels=3,
+        out_channels=3,
+        down_block_types=("DownEncoderBlock2D",),
+        up_block_types=("UpDecoderBlock2D",),
+        block_out_channels=(32,),
+        layers_per_block=1,
+        latent_channels=4,
+        norm_num_groups=32,
+        sample_size=32,
+        mid_block_add_attention=False,
+        force_upcast=force_upcast,
+        shift_factor=0.0,
+    )
+    return vae.to(dtype=dtype)
+
+class Stub(nn.Module):
+    def __init__(self, **config):
+        super().__init__()
+        self.config = types.SimpleNamespace(**config)
+        self.proj = nn.Linear(4, 4, bias=False)
+
+    @property
+    def dtype(self):
+        return self.proj.weight.dtype
+
+class Tok:
+    model_max_length = 77
+
+def flux_kwargs(vae):
+    return {
+        "scheduler": FlowMatchEulerDiscreteScheduler(),
+        "vae": vae,
+        "text_encoder": Stub(),
+        "tokenizer": Tok(),
+        "text_encoder_2": Stub(),
+        "tokenizer_2": Tok(),
+        "transformer": Stub(sample_size=32, patch_size=2),
+    }
+
+def sdxl_kwargs(vae):
+    return {
+        "vae": vae,
+        "text_encoder": Stub(),
+        "text_encoder_2": Stub(projection_dim=32),
+        "tokenizer": Tok(),
+        "tokenizer_2": Tok(),
+        "unet": Stub(sample_size=32),
+        "scheduler": DDIMScheduler(),
+        "add_watermarker": False,
+    }
+
+def sd3_kwargs(vae):
+    return {
+        "transformer": Stub(sample_size=32, patch_size=2, joint_attention_dim=32),
+        "scheduler": FlowMatchEulerDiscreteScheduler(),
+        "vae": vae,
+        "text_encoder": Stub(),
+        "tokenizer": Tok(),
+        "text_encoder_2": Stub(),
+        "tokenizer_2": Tok(),
+        "text_encoder_3": Stub(),
+        "tokenizer_3": Tok(),
+    }
+
+# fp32 VAE + fp16 latents is the crash. The helper upcasts and casts.
+bare = tiny_vae(torch.float16, force_upcast=True).to(dtype=torch.float32)
+fp16_latents = torch.zeros(1, 4, 32, 32, dtype=torch.float16)
+try:
+    with torch.no_grad():
+        bare.decode(fp16_latents)
+    raise SystemExit("fp32 VAE accepted fp16 latents")
+except RuntimeError as exc:
+    assert "Half" in str(exc) or "half" in str(exc).lower() or "same" in str(exc), exc
+
+flux = FluxPipeline(**flux_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+assert t2i._prepare_fp16_vae(flux, torch.float16) is True
+assert flux.vae.dtype == torch.float32
+assert t2i._prepare_fp16_vae(flux, torch.float16) is True
+assert flux.vae._glaux_vae_io_cast is True
+wrapped = flux.vae.decode
+assert t2i._install_vae_io_cast(flux.vae, torch.float16) is False
+assert flux.vae.decode is wrapped
+with torch.no_grad():
+    decoded = flux.vae.decode(fp16_latents, return_dict=False)[0]
+    encoded = flux.vae.encode(torch.zeros(1, 3, 32, 32, dtype=torch.float16))
+assert decoded.dtype == torch.float32, decoded.dtype
+assert encoded.latent_dist.sample().dtype == torch.float16
+assert encoded.latent_dist.mode().dtype == torch.float16
+assert t2i._enable_vae_tiling(flux) is True
+flux.vae.tile_latent_min_size = 16
+flux.vae.tile_sample_min_size = 16
+assert flux.vae.use_tiling is True
+with torch.no_grad():
+    tiled = flux.vae.decode(fp16_latents, return_dict=False)[0]
+assert tiled.dtype == torch.float32
+assert tuple(tiled.shape) == tuple(decoded.shape)
+# The CPU/MPS loader calls pipe.to after the wrapper. The wrapper is an
+# attribute of the VAE, so the move must leave decode and encode in place.
+moved = flux.to("cpu")
+assert moved.vae._glaux_vae_io_cast is True
+with torch.no_grad():
+    moved_image = moved.vae.decode(fp16_latents, return_dict=False)[0]
+assert moved_image.dtype == torch.float32
+
+flux_i2i = FluxImg2ImgPipeline(**flux_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+assert t2i._prepare_fp16_vae(flux_i2i, torch.float16) is True
+with torch.no_grad():
+    i2i_latents = flux_i2i._encode_vae_image(
+        torch.zeros(1, 3, 32, 32, dtype=torch.float16), None
+    )
+assert i2i_latents.dtype == torch.float16, i2i_latents.dtype
+
+t2i._apply_group_offload(flux, "leaf_level", pre_pin=False, onload_device=torch.device("cpu"))
+with torch.no_grad():
+    hooked = flux.vae.decode(fp16_latents, return_dict=False)[0]
+    hooked_enc = flux.vae.encode(torch.zeros(1, 3, 32, 32, dtype=torch.float16))
+assert hooked.dtype == torch.float32
+assert hooked_enc.latent_dist.mode().dtype == torch.float16
+
+# SDXL keeps fp16 and uses its own upcast, including under leaf group offload.
+sdxl = StableDiffusionXLPipeline(**sdxl_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+assert t2i._pipeline_owns_vae_upcast(sdxl) is True
+assert t2i._prepare_fp16_vae(sdxl, torch.float16) is False
+assert sdxl.vae.dtype == torch.float16
+t2i._apply_group_offload(sdxl, "leaf_level", pre_pin=False, onload_device=torch.device("cpu"))
+assert sdxl.vae.dtype == torch.float16
+needs = sdxl.vae.dtype == torch.float16 and sdxl.vae.config.force_upcast
+assert needs is True
+sdxl.upcast_vae()
+cast_dtype = next(iter(sdxl.vae.post_quant_conv.parameters())).dtype
+assert cast_dtype == torch.float32
+with torch.no_grad():
+    sdxl_image = sdxl.vae.decode(fp16_latents.to(dtype=cast_dtype), return_dict=False)[0]
+assert sdxl_image.dtype == torch.float32, sdxl_image.dtype
+sdxl.vae.to(dtype=torch.float16)
+assert sdxl.vae.dtype == torch.float16
+
+sdxl_i2i = StableDiffusionXLImg2ImgPipeline(**sdxl_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+assert t2i._prepare_fp16_vae(sdxl_i2i, torch.float16) is False
+image = torch.zeros(1, 3, 32, 32, dtype=torch.float16)
+image = image.float()
+sdxl_i2i.vae.to(dtype=torch.float32)
+with torch.no_grad():
+    init_latents = sdxl_i2i.vae.encode(image).latent_dist.sample()
+sdxl_i2i.vae.to(dtype=torch.float16)
+init_latents = init_latents.to(dtype=torch.float16)
+assert init_latents.dtype == torch.float16
+
+# A streamed host copy restores fp16 after upcast_vae. That is why the VAE
+# of an upcast pipeline is group-offloaded without a stream.
+stream_vae = tiny_vae(torch.float16, force_upcast=True)
+snapshot = {name: param.detach().clone() for name, param in stream_vae.named_parameters()}
+stream_vae.to(dtype=torch.float32)
+for name, param in stream_vae.named_parameters():
+    param.data = snapshot[name]
+try:
+    with torch.no_grad():
+        stream_vae.decode(fp16_latents.to(dtype=torch.float32))
+    raise SystemExit("restored fp16 weights accepted fp32 latents")
+except RuntimeError as exc:
+    assert "same" in str(exc).lower() or "float" in str(exc).lower(), exc
+
+sd3 = StableDiffusion3Pipeline(**sd3_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+assert t2i._pipeline_owns_vae_upcast(sd3) is False
+assert t2i._prepare_fp16_vae(sd3, torch.float16) is True
+with torch.no_grad():
+    sd3_image = sd3.vae.decode(fp16_latents, return_dict=False)[0]
+assert sd3_image.dtype == torch.float32
+sd3_i2i = StableDiffusion3Img2ImgPipeline(**sd3_kwargs(tiny_vae(torch.float16, force_upcast=True)))
+assert t2i._prepare_fp16_vae(sd3_i2i, torch.float16) is True
+with torch.no_grad():
+    sd3_latents = sd3_i2i.vae.encode(torch.zeros(1, 3, 32, 32, dtype=torch.float16)).latent_dist.mode()
+assert sd3_latents.dtype == torch.float16, sd3_latents.dtype
 `;
 
 function runPython(script, label, command = PYTHON) {
