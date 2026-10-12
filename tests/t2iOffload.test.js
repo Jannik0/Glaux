@@ -614,12 +614,13 @@ class Pipe:
     _glaux_placement_tier = "cuda"
     _glaux_model_path = "/models/org/repo"
 
+repo_resolved = str(Path("/models/org/repo").resolve())
 assert t2i.lower_cuda_tier_after_oom(Pipe()) is True
-assert t2i._cuda_tier_limits["/models/org/repo"] == "model_cpu_offload"
+assert t2i._cuda_tier_limits[repo_resolved] == "model_cpu_offload"
 Pipe._glaux_placement_tier = "disk"
 assert t2i.lower_cuda_tier_after_oom(Pipe()) is False
-assert t2i._cuda_tier_limits["/models/org/repo"] == "model_cpu_offload"
-assert t2i.cuda_tiers_from("cuda", t2i._cuda_tier_limits["/models/org/repo"])[0] == "model_cpu_offload"
+assert t2i._cuda_tier_limits[repo_resolved] == "model_cpu_offload"
+assert t2i.cuda_tiers_from("cuda", t2i._cuda_tier_limits[repo_resolved])[0] == "model_cpu_offload"
 
 noted = []
 
@@ -633,7 +634,8 @@ assert t2i._run_placement_attempts(
     note,
 ) == "model_cpu_offload"
 assert noted == [("cuda", "model_cpu_offload")]
-assert t2i._cuda_tier_limits["/models/again"] == "model_cpu_offload"
+again_resolved = str(Path("/models/again").resolve())
+assert t2i._cuda_tier_limits[again_resolved] == "model_cpu_offload"
 
 log = t2i._format_placement_log(
     "model_cpu_offload",
@@ -811,11 +813,12 @@ def leaking_attempt(tier):
 
 assert t2i._run_placement_attempts(["cuda", "model_cpu_offload"], leaking_attempt) == "collected"
 
-t2i._cuda_tier_limits["/models/sticky"] = "disk"
-t2i._cuda_tier_limit_vram["/models/sticky"] = 3 * GiB
+sticky = str(Path("/models/sticky").resolve())
+t2i._cuda_tier_limits[sticky] = "disk"
+t2i._cuda_tier_limit_vram[sticky] = 3 * GiB
 t2i.clear_cuda_tier_limit("/models/sticky")
-assert "/models/sticky" not in t2i._cuda_tier_limits
-assert "/models/sticky" not in t2i._cuda_tier_limit_vram
+assert sticky not in t2i._cuda_tier_limits
+assert sticky not in t2i._cuda_tier_limit_vram
 
 cap_path = "/models/sticky-cap"
 cap_resolved = str(Path(cap_path).resolve())
@@ -1462,6 +1465,7 @@ chat.CHATBOT_MODEL_ID = "org/repo"
 chat._cuda_unavailable = False
 chat._cuda_oom_model_ids.clear()
 t2i._cuda_tier_limits.clear()
+t2i._cuda_tier_limit_vram.clear()
 
 box = {}
 
@@ -1478,10 +1482,12 @@ chat.generate_text_to_image = generate_oom
 saved = chat._generate_text_to_image_turn("a cat", None, None, None, "/tmp/out.png")
 assert saved == "/tmp/out.png", saved
 assert creates == ["org/repo"], creates
-assert t2i._cuda_tier_limits["/models/org/repo"] == "model_cpu_offload"
+repo_resolved = str(Path("/models/org/repo").resolve())
+assert t2i._cuda_tier_limits[repo_resolved] == "model_cpu_offload"
 
 creates.clear()
 t2i._cuda_tier_limits.clear()
+t2i._cuda_tier_limit_vram.clear()
 chat.CHATBOT = make_pipe()
 chat.CHATBOT_MODEL_ID = "org/repo"
 chat.CHATBOT_PIPELINE_TAG = "text-to-image"
