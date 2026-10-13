@@ -17,7 +17,13 @@ _spec.loader.exec_module(model_downloader)
 DownloadCancelledError = model_downloader.DownloadCancelledError
 
 _HF_REPO_ID_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
-_PIPELINE_TAG_RE = re.compile(r"^pipeline_tag:\s*(.+)\s*$", re.MULTILINE)
+_FRONT_MATTER_RE = re.compile(r"^---\r?\n([\s\S]*?)\r?\n---")
+_PIPELINE_TAG_RE = re.compile(r"^pipeline_tag:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+_TAGS_FLOW_RE = re.compile(r"^tags:[ \t]*\[([^\]]*)\]", re.MULTILINE)
+_TAGS_BLOCK_RE = re.compile(r"^tags:[ \t]*\r?\n((?:[ \t]*-[^\n]*(?:\r?\n|$))*)", re.MULTILINE)
+_TAGS_SCALAR_RE = re.compile(r"^tags:[ \t]*(\S.*?)[ \t]*$", re.MULTILINE)
+_TAG_ITEM_RE = re.compile(r"^[ \t]*-[ \t]*(.*?)\s*$")
+_TASK_TAGS = ("automatic-speech-recognition", "text-to-image", "image-to-image")
 MODEL_CACHE_DIR: Path | None = None
 
 
@@ -28,8 +34,8 @@ def _assert_valid_model_id(model_id: str) -> str:
     return model_id
 
 
-def set_download_progress_callback(callback):
-    model_downloader.set_download_progress_callback(callback)
+def set_download_progress_callback(callback, progress_id=None):
+    model_downloader.set_download_progress_callback(callback, progress_id)
 
 
 def request_download_cancel(model_id: str) -> None:
@@ -160,31 +166,120 @@ def model_local_dir(model_id: str) -> Path:
     return local
 
 
+def _unquote(value: str) -> str:
+    return value.strip().strip("'\"").strip()
+
+
+def _task_tag(tags) -> str | None:
+    """First ASR, text-to-image, or image-to-image tag, in card order."""
+    if not tags:
+        return None
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        text = _unquote(tag)
+        if text in _TASK_TAGS:
+            return text
+    return None
+
+
+def _card_tags(card: str) -> list[str]:
+    flow = _TAGS_FLOW_RE.search(card)
+    if flow:
+        return [text for text in (_unquote(part) for part in flow.group(1).split(",")) if text]
+    block = _TAGS_BLOCK_RE.search(card)
+    if block and block.group(1).strip():
+        tags: list[str] = []
+        for line in block.group(1).splitlines():
+            item = _TAG_ITEM_RE.match(line)
+            if not item:
+                continue
+            text = _unquote(item.group(1))
+            if text:
+                tags.append(text)
+        return tags
+    scalar = _TAGS_SCALAR_RE.search(card)
+    if not scalar or scalar.group(1).startswith(("|", ">")):
+        return []
+    text = _unquote(scalar.group(1))
+    return [text] if text else []
+
+
+def pipeline_tag_from_card(content: str) -> str | None:
+    """``pipeline_tag``, or an ASR / diffusion task from ``tags`` when it is absent."""
+    front = _FRONT_MATTER_RE.search(content or "")
+    card = front.group(1) if front else (content or "")
+    declared = _PIPELINE_TAG_RE.search(card)
+    if declared:
+        value = _unquote(declared.group(1))
+        if value:
+            return value
+    return _task_tag(_card_tags(card))
+
+
 def read_model_pipeline_tag(model_id: str) -> str | None:
-    """Read ``pipeline_tag`` from a cached model's README.md YAML frontmatter."""
+    """Task id from a cached model's README.md model card."""
     readme_path = model_local_dir(model_id) / "README.md"
     try:
         content = readme_path.read_text(encoding="utf-8")
     except OSError:
         return None
-    match = _PIPELINE_TAG_RE.search(content)
-    if not match:
+    return pipeline_tag_from_card(content)
+
+
+_BASE_MODEL_ID_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+
+def _base_model_id(value) -> str | None:
+    """First ``org/name`` in a model-card ``base_model`` scalar or list."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _base_model_id(item)
+            if found:
+                return found
         return None
-    value = match.group(1).strip()
-    return value.strip("'\"")
+    if not isinstance(value, str):
+        return None
+    text = value.strip().strip("'\"")
+    return text if _BASE_MODEL_ID_RE.fullmatch(text) else None
+
+
+def read_hub_model_card(model_id: str) -> dict:
+    """``pipeline_tag`` and ``base_model`` from the Hub model card, before any files are cached."""
+    from huggingface_hub import HfApi
+
+    model_id = _assert_valid_model_id(model_id)
+    info = HfApi().model_info(repo_id=model_id)
+    card = info.card_data
+    raw = None
+    if card is not None:
+        raw = card.get("base_model") if isinstance(card, dict) else getattr(card, "base_model", None)
+    tag = _unquote(info.pipeline_tag) if isinstance(info.pipeline_tag, str) else ""
+    if not tag:
+        tag = _task_tag(getattr(info, "tags", None)) or ""
+    if not tag and card is not None:
+        card_tags = card.get("tags") if isinstance(card, dict) else getattr(card, "tags", None)
+        tag = _task_tag(card_tags) or ""
+    return {
+        "pipeline_tag": tag or None,
+        "base_model": _base_model_id(raw),
+    }
 
 
 def download_model(
     model_id: str,
     allow_patterns: list[str] | None = None,
     gguf_variant: str | None = None,
+    progress_id: str | None = None,
 ) -> str:
     model_id = _assert_valid_model_id(model_id)
     local_dir = model_local_dir(model_id)
+    tracked = _assert_valid_model_id(progress_id) if progress_id else model_id
     result = model_downloader.download_model(
         model_id,
         local_dir,
         allow_patterns=allow_patterns,
+        progress_id=tracked,
     )
     if gguf_variant:
         selection = {

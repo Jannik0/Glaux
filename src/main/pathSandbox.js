@@ -7,6 +7,7 @@
 const path = require('path');
 const { t } = require('../i18n');
 const { isValidOsFolderName } = require('../renderer/shared/osFolderName');
+const { isSubPath } = require('../../engines/common/fileInside');
 
 /**
  * @param {unknown} name
@@ -86,21 +87,6 @@ function resolveWorkspacePath(root, relativePath = '', escapeMessage) {
   }
 
   return resolvedPath;
-}
-
-/**
- * @param {string} parentPath
- * @param {string} candidatePath
- * @returns {boolean}
- */
-function isSubPath(parentPath, candidatePath) {
-  const relative = path.relative(parentPath, candidatePath);
-  return (
-    relative === '' ||
-    (!relative.startsWith(`..${path.sep}`) &&
-      relative !== '..' &&
-      !path.isAbsolute(relative))
-  );
 }
 
 module.exports = {

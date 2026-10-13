@@ -14,6 +14,7 @@ import gc
 import os
 import sys
 import threading
+import traceback
 import types
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -24,6 +25,17 @@ from transformers.generation.stopping_criteria import StoppingCriteria, Stopping
 from . import context
 from . import download as _download
 from .download import _assert_valid_model_id, _load_progress_tqdm_hook, model_local_dir, read_model_pipeline_tag
+from .t2i import (
+    DiffusionStopped,
+    _CUDA_TIER_ORDER,
+    _log_ignored,
+    _release_pipeline_hooks,
+    clear_cuda_tier_limit,
+    generate_text_to_image,
+    load_text_to_image_pipeline,
+    lower_cuda_tier_after_oom,
+    release_disk_offload,
+)
 from .thinking import (
     _iter_stripped_non_thinking_markup,
     _parse_tags_and_answer,
@@ -49,6 +61,11 @@ CHAT_GENERATION_STOP = False
 _cuda_unavailable = False
 # Models that did not fit in VRAM. A different model tries CUDA again.
 _cuda_oom_model_ids: set[str] = set()
+# Paths written by the current text-to-image call. Node reads them after the stream.
+_GENERATED_IMAGE_PATHS: list[str] = []
+TEXT_TO_IMAGE_PIPELINE_TAG = "text-to-image"
+IMAGE_TO_IMAGE_PIPELINE_TAG = "image-to-image"
+_DIFFUSION_PIPELINE_TAGS = frozenset({TEXT_TO_IMAGE_PIPELINE_TAG, IMAGE_TO_IMAGE_PIPELINE_TAG})
 
 
 def _force_cpu() -> bool:
@@ -165,6 +182,78 @@ def _cuda_failure_summary(exc: BaseException) -> str:
     return text
 
 
+def _diffusion_uses_cuda() -> bool:
+    """True when the loaded diffusion pipeline is allowed to touch CUDA.
+
+    Group offload and Accelerate disk maps often report the pipeline device as
+    CPU or meta while the forward pass still runs on the GPU. The loader sets
+    ``_glaux_uses_cuda`` so an out-of-memory error still steps down a tier and,
+    at the bottom, still reloads on CPU.
+    """
+    pipe = CHATBOT
+    if getattr(pipe, "_glaux_uses_cuda", False):
+        return True
+    return _pipeline_uses_cuda()
+
+
+def _free_replaced_pipeline(pipe) -> None:
+    """Drop *pipe* and reclaim caches before the next load measures memory.
+
+    Caller holds ``_CHAT_LOCK`` and must not keep another name for *pipe*.
+    Free VRAM is read inside the next ``chatbot_create``. A local that still
+    points at the previous pipeline makes that read too small, and the load
+    stamps that low value on ``_glaux_free_vram``. Hooks are released first.
+    ``gc.collect()`` then collects anything the hooks still cycle.
+    ``_release_torch_cache`` includes ``empty_host_cache``.
+    """
+    if pipe is not None:
+        _release_pipeline_hooks(pipe)
+        del pipe
+    gc.collect()
+    try:
+        _release_torch_cache()
+    except Exception as exc:
+        print(
+            "Text-to-image could not release the torch cache: "
+            f"{_exception_first_line(exc)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    release_disk_offload()
+
+
+def _reload_same_diffusion_model() -> None:
+    """Drop the loaded pipeline and build it again. Caller holds ``_CHAT_LOCK``.
+
+    Call this only after the ``except`` that caught the failure has exited.
+    While that handler is on the stack, ``sys.exception()`` keeps the traceback,
+    and the traceback keeps the failed pipeline alive, so the ``gc.collect()``
+    here cannot free it before the next load measures memory.
+    """
+    model_id = CHATBOT_MODEL_ID
+    _free_replaced_pipeline(_chatbot_destroy_unlocked())
+    if not model_id:
+        raise RuntimeError("No diffusion model is loaded.")
+    chatbot_create(model_id)
+
+
+def _reload_diffusion_on_cpu(summary: str) -> None:
+    """Drop the CUDA pipeline and load the same model on CPU. Caller holds ``_CHAT_LOCK``.
+
+    *summary* is text only. The exception object is not accepted here, because
+    this reload runs after the handler that caught it has exited.
+    """
+    model_id = CHATBOT_MODEL_ID
+    print(
+        f"CUDA failed ({summary}); retrying on CPU.",
+        file=sys.stderr,
+        flush=True,
+    )
+    _free_replaced_pipeline(_chatbot_destroy_unlocked())
+    if model_id:
+        chatbot_create(model_id)
+
+
 def _pipeline_uses_cuda() -> bool:
     if CHATBOT is None or _cuda_unavailable:
         return False
@@ -179,24 +268,16 @@ def _pipeline_uses_cuda() -> bool:
 
 
 def _fallback_pipeline_to_cpu(exc: BaseException) -> None:
-    """Drop the CUDA pipeline and load the same model on CPU. Caller holds ``_CHAT_LOCK``."""
-    model_id = CHATBOT_MODEL_ID
-    _note_cuda_failure(exc, model_id)
-    print(
-        f"CUDA failed ({_cuda_failure_summary(exc)}); retrying on CPU.",
-        file=sys.stderr,
-        flush=True,
-    )
-    old = _chatbot_destroy_unlocked()
-    if old is not None:
-        del old
-    gc.collect()
-    try:
-        _release_torch_cache()
-    except Exception:
-        pass
-    if model_id:
-        chatbot_create(model_id)
+    """Drop the CUDA pipeline and load the same model on CPU. Caller holds ``_CHAT_LOCK``.
+
+    Chat generation does not call this from inside the ``except`` that owns
+    *exc*. That path records the failure, clears the traceback, and calls
+    :func:`_reload_diffusion_on_cpu` after the handler exits. This helper
+    remains for the text-generation stream, which reloads before another
+    pipeline is measured.
+    """
+    _note_cuda_failure(exc, CHATBOT_MODEL_ID)
+    _reload_diffusion_on_cpu(_cuda_failure_summary(exc))
 
 
 @contextmanager
@@ -222,9 +303,19 @@ def _chat_template_backend():
     return CHATBOT.tokenizer
 
 
+def take_generated_image_paths() -> list[str]:
+    """Return image files from the latest text-to-image call and clear the buffer."""
+    global _GENERATED_IMAGE_PATHS
+    paths = list(_GENERATED_IMAGE_PATHS)
+    _GENERATED_IMAGE_PATHS = []
+    return paths
+
+
 def chatbot_has_chat_template() -> bool:
     """True when the loaded tokenizer/processor defines a usable chat template."""
-    if CHATBOT is None:
+    # Diffusion pipelines are not chat models. Reporting no template keeps the
+    # thinking UI and context-usage gauge off.
+    if CHATBOT is None or CHATBOT_PIPELINE_TAG in _DIFFUSION_PIPELINE_TAGS:
         return False
     backend = _chat_template_backend()
     if backend is None or not hasattr(backend, "apply_chat_template"):
@@ -247,7 +338,21 @@ def chatbot_create(model_id: str):
     model_path = str(model_local_dir(model_id))
     CHATBOT_PIPELINE_TAG = read_model_pipeline_tag(model_id) or DEFAULT_PIPELINE_TAG
 
+    def _diffusion_device(placement: dict) -> str:
+        if placement.get("device") == "cpu":
+            return "cpu"
+        mapped = placement.get("device_map")
+        if mapped in ("cuda", "mps"):
+            return str(mapped)
+        return "cpu"
+
     def _build_pipeline(placement: dict):
+        if CHATBOT_PIPELINE_TAG in _DIFFUSION_PIPELINE_TAGS:
+            return load_text_to_image_pipeline(
+                model_path,
+                _diffusion_device(placement),
+                allow_img2img=CHATBOT_PIPELINE_TAG == IMAGE_TO_IMAGE_PIPELINE_TAG,
+            )
         return pipeline(
             CHATBOT_PIPELINE_TAG,
             model=model_path,
@@ -263,17 +368,20 @@ def chatbot_create(model_id: str):
             if _force_cpu() or _cuda_unavailable or not _is_cuda_failure(exc):
                 raise
             _note_cuda_failure(exc, CHATBOT_MODEL_ID)
-            gc.collect()
-            try:
-                _release_torch_cache()
-            except Exception:
-                pass
-            print(
-                f"CUDA failed while loading the model ({_cuda_failure_summary(exc)}); retrying on CPU.",
-                file=sys.stderr,
-                flush=True,
-            )
-            return _build_pipeline({"device": "cpu"})
+            summary = _cuda_failure_summary(exc)
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
+        gc.collect()
+        try:
+            _release_torch_cache()
+        except Exception as exc:
+            _log_ignored("release the torch cache", exc)
+        print(
+            f"CUDA failed while loading the model ({summary}); retrying on CPU.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _build_pipeline({"device": "cpu"})
 
     if _download._load_progress_callback is not None:
         with _load_progress_tqdm_hook():
@@ -290,12 +398,28 @@ def _configure_asr_generation_limits() -> None:
     if generation_config is not None:
         generation_config.max_new_tokens = None
 
+def _exception_first_line(exc: BaseException) -> str:
+    """Type and the first line. CUDA OOM text continues for many lines."""
+    text = str(exc).strip()
+    first = text.splitlines()[0].strip() if text else ""
+    if first:
+        return f"{type(exc).__name__}: {first}"
+    return type(exc).__name__
+
+
 def _release_torch_cache() -> None:
-    """Return cached GPU/MPS allocations to the driver when torch is available."""
+    """Return cached GPU/MPS allocations, and pinned host memory, to the driver."""
     try:
         import torch
     except ImportError:
         return
+    accelerator = getattr(torch, "accelerator", None)
+    empty_host = getattr(accelerator, "empty_host_cache", None)
+    if callable(empty_host):
+        try:
+            empty_host()
+        except Exception as exc:
+            _log_ignored("release the pinned host cache", exc)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -315,13 +439,30 @@ def _chatbot_destroy_unlocked():
 
 
 def chatbot_destroy():
-    """Drop the in-process chat pipeline and encourage the OS to reclaim weight memory."""
+    """Drop the in-process chat pipeline and encourage the OS to reclaim weight memory.
+
+    An explicit unload clears a lowered CUDA tier for this model. The immediate
+    retry after an out-of-memory error uses ``_chatbot_destroy_unlocked`` and
+    leaves the cap in place. A later successful load keeps it as well, until
+    this unload or until free VRAM has grown by more than 1 GiB.
+
+    The pipeline is released before the lock is dropped. The next
+    ``chatbot_create`` would otherwise measure free VRAM while this frame
+    still held the weights.
+    """
     with _chat_lock_guard():
-        chatbot = _chatbot_destroy_unlocked()
-    if chatbot is not None:
-        del chatbot
-    gc.collect()
-    _release_torch_cache()
+        model_id = CHATBOT_MODEL_ID
+        _free_replaced_pipeline(_chatbot_destroy_unlocked())
+    if model_id:
+        try:
+            clear_cuda_tier_limit(str(model_local_dir(model_id)))
+        except Exception as exc:
+            print(
+                "Text-to-image could not clear the CUDA tier cap: "
+                f"{_exception_first_line(exc)}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 _THINKING_TEMPLATE_PARAMS = ("enable_thinking",)
@@ -502,6 +643,8 @@ def chat_generation_starts_in_thinking(
     model_id = _assert_valid_model_id(model_id)
     with _chat_lock_guard():
         if CHATBOT_MODEL_ID != model_id or CHATBOT is None:
+            if CHATBOT is not None:
+                _free_replaced_pipeline(_chatbot_destroy_unlocked())
             chatbot_create(model_id)
         if not chatbot_has_chat_template():
             return False
@@ -922,6 +1065,137 @@ def _iter_direct_pipeline_stream(
     yield from _iter_direct_pipeline_batch(pipeline_input)
 
 
+def _reject_diffusion_media(
+    image_paths: list[str] | None,
+    audio_paths: list[str] | None,
+    video_paths: list[str] | None,
+    *,
+    allow_image: bool,
+) -> str | None:
+    """Return the optional init-image path. Reject anything else."""
+    images = [path for path in (image_paths or []) if path]
+    if audio_paths or video_paths or (images and not allow_image):
+        raise RuntimeError(
+            "Image-to-image models accept a text prompt and an optional image."
+            if allow_image
+            else "Text-to-image models accept a text prompt only."
+        )
+    if len(images) > 1:
+        raise RuntimeError("Image-to-image models accept at most one image.")
+    return images[0] if images else None
+
+
+def _generate_text_to_image_turn(
+    message: str,
+    image_paths: list[str] | None,
+    audio_paths: list[str] | None,
+    video_paths: list[str] | None,
+    output_path: str | None,
+) -> str:
+    """One image from the current prompt. Caller holds ``_CHAT_LOCK``.
+
+    Chat history is ignored. Size, steps, seed, and CFG stay at pipeline defaults.
+    ``chat_stop()`` ends sampling at the next denoising step and yields no image.
+    """
+    global CHAT_GENERATION_STOP, _GENERATED_IMAGE_PATHS
+    _GENERATED_IMAGE_PATHS = []
+    # Same as the chat and ASR streams: a stop from an earlier turn must not
+    # cancel this one. Stops that arrive after this point are seen at the next step.
+    CHAT_GENERATION_STOP = False
+    init_image = _reject_diffusion_media(
+        image_paths,
+        audio_paths,
+        video_paths,
+        allow_image=_active_pipeline_tag() == IMAGE_TO_IMAGE_PIPELINE_TAG,
+    )
+    prompt = (message or "").strip()
+    if not prompt:
+        raise ValueError("Image generation requires a prompt.")
+    if not output_path:
+        raise ValueError("Image generation output path is not configured.")
+    saved: str | None = None
+    stopped = False
+    tier_drops = 0
+    cpu_tried = False
+    try:
+        while True:
+            action = None
+            failure_summary = None
+            try:
+                saved = generate_text_to_image(CHATBOT, prompt, output_path, init_image)
+                break
+            except DiffusionStopped:
+                stopped = True
+                break
+            except Exception as exc:
+                # Decide here and reload only after this handler exits. The
+                # traceback keeps the failed pipeline in ``generate_text_to_image``'s
+                # frame, so a reload inside this block measures memory while
+                # that pipeline is still resident. A stop never becomes a retry
+                # or a second generation.
+                if CHAT_GENERATION_STOP:
+                    print(
+                        "Text-to-image stopped; not retrying "
+                        f"({_exception_first_line(exc)}).",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    stopped = True
+                    break
+                can_lower = (
+                    tier_drops < len(_CUDA_TIER_ORDER)
+                    and _diffusion_uses_cuda()
+                    and _is_cuda_oom(exc)
+                    and lower_cuda_tier_after_oom(CHATBOT)
+                )
+                if can_lower:
+                    action = "lower"
+                elif not cpu_tried and _diffusion_uses_cuda() and _is_cuda_failure(exc):
+                    action = "cpu"
+                    _note_cuda_failure(exc, CHATBOT_MODEL_ID)
+                else:
+                    raise
+                failure_summary = _cuda_failure_summary(exc)
+                if exc.__traceback__ is not None:
+                    traceback.clear_frames(exc.__traceback__)
+            gc.collect()
+            try:
+                _release_torch_cache()
+            except Exception as exc:
+                print(
+                    "Text-to-image could not release the torch cache: "
+                    f"{_exception_first_line(exc)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if CHAT_GENERATION_STOP:
+                stopped = True
+                break
+            if action == "lower":
+                tier_drops += 1
+                print(
+                    "Text-to-image ran out of GPU memory; retrying a lower CUDA placement.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _reload_same_diffusion_model()
+                continue
+            if action == "cpu":
+                cpu_tried = True
+                _reload_diffusion_on_cpu(failure_summary or "CUDA error")
+                continue
+    finally:
+        if CHAT_GENERATION_STOP:
+            stopped = True
+        CHAT_GENERATION_STOP = False
+    if stopped:
+        return ""
+    if not saved:
+        raise RuntimeError("Text-to-image pipeline returned no images.")
+    _GENERATED_IMAGE_PATHS = [saved]
+    return saved
+
+
 def chat_stream(
     model_id: str,
     thinking: bool,
@@ -932,23 +1206,39 @@ def chat_stream(
     *,
     resubmit: bool = True,
     messages: list | None = None,
+    output_path: str | None = None,
 ):
     """Stream a chat response.
 
     When ``messages`` is provided (canonical history from contextManager, already
     including the new user turn), it becomes the working CONTEXT for this call and
     assistant text is *not* appended here — the Node contextManager owns commits.
+
+    Text-to-image ignores ``messages`` and writes one image to ``output_path``.
     """
-    global CHAT_GENERATION_STOP
+    global CHAT_GENERATION_STOP, _GENERATED_IMAGE_PATHS
     model_id = _assert_valid_model_id(model_id)
     owns_history = messages is None
     with _chat_lock_guard():
+        # Free the previous pipeline before the new load reads free VRAM.
+        # Keeping it in a local until the end of the turn picked a lower
+        # tier and stamped that low free-VRAM sample on the new pipeline.
         if CHATBOT_MODEL_ID != model_id:
-            old = _chatbot_destroy_unlocked()
-        else:
-            old = None
+            _free_replaced_pipeline(_chatbot_destroy_unlocked())
         if CHATBOT is None:
             chatbot_create(model_id)
+        if _active_pipeline_tag() in _DIFFUSION_PIPELINE_TAGS:
+            _generate_text_to_image_turn(
+                message,
+                image_paths,
+                audio_paths,
+                video_paths,
+                output_path,
+            )
+            return
+        # Drop any image paths left by a failed text-to-image call so a later
+        # chat turn is not reported as an image result.
+        _GENERATED_IMAGE_PATHS = []
         if messages is not None:
             context._validate_context_messages(messages)
             context.CONTEXT.clear()
@@ -1016,12 +1306,6 @@ def chat_stream(
                 if owns_history:
                     context._context_rollback_last_user()
                 context._invalidate_context_usage_cache()
-            # Always release the outgoing model's memory, whether the stream
-            # finished cleanly, was stopped, or raised partway through.
-            if old is not None:
-                del old
-                gc.collect()
-                _release_torch_cache()
 
 
 def run_chat(
@@ -1034,6 +1318,7 @@ def run_chat(
     *,
     resubmit: bool = True,
     messages: list | None = None,
+    output_path: str | None = None,
 ) -> str:
     return "".join(
         chat_stream(
@@ -1045,5 +1330,6 @@ def run_chat(
             video_paths=video_paths,
             resubmit=resubmit,
             messages=messages,
+            output_path=output_path,
         )
     )

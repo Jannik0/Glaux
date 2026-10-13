@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Shared GPU backend helpers for native llama.cpp / transcribe.cpp builds
+ * Shared GPU backend helpers for native llama.cpp / transcribe.cpp / stable-diffusion.cpp builds
  * and packaging checks. One installer per OS ships every backend that OS
  * supports; missing NVIDIA/Vulkan drivers at runtime skip those modules.
  */
@@ -790,18 +790,33 @@ function resolveBuildBackends(opts = {}) {
 }
 
 /**
- * @param {'ggml' | 'transcribe'} kind
+ * @param {'ggml' | 'transcribe' | 'sd'} kind
  * @param {{ cuda: boolean, vulkan: boolean, metal: boolean }} backends
  * @returns {string[]}
  */
 function cmakeGpuArgs(kind, backends) {
-  const prefix = kind === 'transcribe' ? 'TRANSCRIBE' : 'GGML';
+  const prefix = kind === 'transcribe' ? 'TRANSCRIBE' : kind === 'sd' ? 'SD' : 'GGML';
   const onOff = (on) => (on ? 'ON' : 'OFF');
   return [
     `-D${prefix}_CUDA=${onOff(backends.cuda)}`,
     `-D${prefix}_VULKAN=${onOff(backends.vulkan)}`,
     `-D${prefix}_METAL=${onOff(backends.metal)}`,
   ];
+}
+
+/**
+ * Compile llama.cpp and transcribe.cpp with the same tensor-name size as
+ * stable-diffusion.cpp. CMAKE_PROJECT_INCLUDE runs at the end of project(),
+ * before ggml is added, so the definition covers the host library and the
+ * CUDA module. CMake 3.15 or newer is required for that hook.
+ * @returns {string[]}
+ */
+function ggmlMaxNameCmakeArgs() {
+  const file = path.join(__dirname, 'ggmlMaxName.cmake').replace(/\\/g, '/');
+  if (process.platform === 'win32') {
+    return [`-DCMAKE_PROJECT_INCLUDE="${file}"`];
+  }
+  return [`-DCMAKE_PROJECT_INCLUDE=${file}`];
 }
 
 /**
@@ -921,7 +936,7 @@ function cudaBuildJobs(requestedJobs, backends) {
   return Math.min(n, 4);
 }
 
-const STAGED_LIB_NAME_RE = /^(lib)?(ggml|llama|mtmd|transcribe)/i;
+const STAGED_LIB_NAME_RE = /^(lib)?(ggml|llama|mtmd|transcribe|stable-diffusion)/i;
 
 /**
  * @param {string} buildDir
@@ -961,7 +976,7 @@ function stageLibsFromDir(fromDir, outDir) {
 }
 
 /**
- * Walk the build tree for ggml/llama/transcribe shared modules that did not
+ * Walk the build tree for ggml/llama/transcribe/stable-diffusion shared modules that did not
  * land next to the binary.
  * @param {string} dir
  * @param {string} outDir
@@ -1029,8 +1044,41 @@ function findBackendModule(dir, backend) {
  * @param {string[]} backends
  * @returns {string[]} missing backend ids
  */
-function missingBackendModules(dir, backends) {
-  return backends.filter((backend) => !findBackendModule(dir, backend));
+/**
+ * @param {string} dir
+ * @param {string[]} backends
+ * @param {{ cudaDir?: string }} [opts]
+ *   When cudaDir is set, the CUDA module is required there (vendor/cuda) and
+ *   is not expected beside the engine.
+ * @returns {string[]} missing backend ids
+ */
+function missingBackendModules(dir, backends, opts = {}) {
+  const cudaDir = opts && opts.cudaDir;
+  return backends.filter((backend) => {
+    if (backend === 'cuda' && cudaDir) {
+      return !findBackendModule(cudaDir, 'cuda');
+    }
+    return !findBackendModule(dir, backend);
+  });
+}
+
+/**
+ * ggml-cuda staged beside an engine. The shared copy belongs in vendor/cuda.
+ * @param {string} dir
+ * @returns {string | null}
+ */
+function localGgmlCudaModule(dir) {
+  const name = ggmlCudaBackendFileName();
+  if (!name || !dir) {
+    return null;
+  }
+  const file = path.join(dir, name);
+  try {
+    fs.lstatSync(file);
+  } catch {
+    return null;
+  }
+  return file;
 }
 
 const CUDA_WIN_PATTERNS = [
@@ -1216,7 +1264,7 @@ function copyCudaRedistributables(outDir = sharedCudaDir(), cudaRoot = findCudaT
     throw new Error(
       `Staged CUDA redistributables from ${cudaRoot} are not CUDA 13 ` +
         `(found: ${copied.join(', ')}). Install CUDA Toolkit 13.x so Torch cu130, ` +
-        `llama.cpp, and transcribe.cpp can share one runtime.`
+        `llama.cpp, transcribe.cpp, and stable-diffusion.cpp can share one runtime.`
     );
   }
   const collapsed = collapseDuplicateLibs(outDir);
@@ -1459,54 +1507,149 @@ function ggmlCudaBackendFileName(platform = process.platform) {
 }
 
 /**
- * Keep one ggml CUDA fatbin. llama.cpp's module is the canonical copy;
- * transcribe.cpp's directory gets a relative symlink (hard link if Windows
- * cannot create a symlink) so both CLIs still load `ggml-cuda` from their
- * own folder. Vulkan modules stay per engine: they compress to a few MB.
- * No-op when either side has not been built yet.
+ * Follow a symlink chain to a regular file.
+ * @param {string} file
+ * @returns {string | null}
+ */
+function resolveRealFile(file) {
+  let current = file;
+  const seen = new Set();
+  for (let hop = 0; hop < 8; hop += 1) {
+    const key = path.resolve(current);
+    if (seen.has(key)) {
+      return null;
+    }
+    seen.add(key);
+    let st;
+    try {
+      st = fs.lstatSync(current);
+    } catch {
+      return null;
+    }
+    if (st.isSymbolicLink()) {
+      const target = fs.readlinkSync(current);
+      current = path.resolve(path.dirname(current), target);
+      continue;
+    }
+    return st.isFile() ? current : null;
+  }
+  return null;
+}
+
+/**
+ * Teach ggml_backend_load_best to also scan `<search>/../cuda`. llama.cpp and
+ * stable-diffusion.cpp search the executable directory; transcribe.cpp searches
+ * the directory that contains its library. The sibling `cuda` folder is
+ * vendor/cuda in a dev tree and resources/cuda in a packaged app. Idempotent.
  *
- * @param {string} llamaDir vendor/llamacpp or resources/llamacpp
- * @param {string} transcribeDir vendor/transcribe or resources/transcribe
+ * @param {string} file path to ggml-backend-reg.cpp
+ * @returns {boolean} true when the file was modified
+ */
+function patchGlauxCudaBackendSearch(file) {
+  const raw = fs.readFileSync(file, 'utf8');
+  const marker = 'GLAUX_CUDA_BACKEND_DIR';
+  if (raw.includes(marker)) {
+    return false;
+  }
+  const nl = raw.includes('\r\n') ? '\r\n' : '\n';
+  const text = raw.replace(/\r\n/g, '\n');
+  const needle = [
+    '    } else {',
+    '        search_paths.push_back(fs::u8path(user_search_path));',
+    '    }',
+    '',
+    '    int best_score = 0;',
+  ].join('\n');
+  if (!text.includes(needle)) {
+    throw new Error(`Could not patch ggml backend search in ${file}`);
+  }
+  const replacement = [
+    '    } else {',
+    '        search_paths.push_back(fs::u8path(user_search_path));',
+    '    }',
+    '',
+    `    // ${marker}: one ggml-cuda module lives in ../cuda beside each engine.`,
+    '    {',
+    '        const size_t n = search_paths.size();',
+    '        for (size_t i = 0; i < n; ++i) {',
+    '            search_paths.push_back(search_paths[i] / ".." / "cuda");',
+    '        }',
+    '    }',
+    '',
+    '    int best_score = 0;',
+  ].join('\n');
+  fs.writeFileSync(file, text.replace(needle, replacement).replace(/\n/g, nl));
+  console.log(`Patched ggml CUDA backend search in ${file}`);
+  return true;
+}
+
+/**
+ * Copy the canonical ggml-cuda module into vendor/cuda and delete the copies
+ * next to each engine. stable-diffusion.cpp's file wins when it is a real
+ * file: it is built with GGML_MAX_NAME=160 and includes the diffusion kernels.
+ * Until that build exists, llama.cpp's module is used. Archives then store
+ * the fatbin once. Vulkan and the other ggml modules stay per engine.
+ *
+ * @param {{ llamacpp?: string, transcribe?: string, stablediffusion?: string }} dirs
+ * @param {string} [cudaDir]
  * @returns {boolean}
  */
-function shareGgmlCudaBackend(llamaDir, transcribeDir) {
+function stageSharedGgmlCudaBackend(dirs, cudaDir = sharedCudaDir()) {
   const name = ggmlCudaBackendFileName();
-  if (!name || !llamaDir || !transcribeDir) {
+  if (!name) {
     return false;
   }
-  const source = path.join(llamaDir, name);
-  const dest = path.join(transcribeDir, name);
-  if (!fs.existsSync(transcribeDir) || !fs.existsSync(source)) {
-    return false;
+  const engineDirs = [dirs && dirs.stablediffusion, dirs && dirs.llamacpp, dirs && dirs.transcribe].filter(Boolean);
+  const engineFiles = engineDirs.map((dir) => path.join(dir, name));
+  const realEngineFile = (dir) => {
+    if (!dir) {
+      return null;
+    }
+    const file = path.join(dir, name);
+    const real = resolveRealFile(file);
+    if (!real) {
+      return null;
+    }
+    let st;
+    try {
+      st = fs.lstatSync(file);
+    } catch {
+      return null;
+    }
+    return st.isFile() && !st.isSymbolicLink() ? real : null;
+  };
+  // stable-diffusion.cpp's module includes the diffusion kernels. A later
+  // llama.cpp or transcribe.cpp rebuild must not replace that file.
+  const dest = path.join(cudaDir, name);
+  let source = realEngineFile(dirs && dirs.stablediffusion);
+  if (!source) {
+    source = resolveRealFile(dest);
   }
-  let sourceStat;
-  try {
-    sourceStat = fs.lstatSync(source);
-  } catch {
-    return false;
+  if (!source) {
+    source = realEngineFile(dirs && dirs.llamacpp) || realEngineFile(dirs && dirs.transcribe);
   }
-  if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+  if (!source) {
     return false;
   }
 
-  const rel = path.relative(transcribeDir, source);
-  try {
-    if (fs.lstatSync(dest).isSymbolicLink() && fs.readlinkSync(dest) === rel) {
-      return true;
-    }
-  } catch {
-    /* dest absent */
-  }
-  fs.rmSync(dest, { force: true });
-  try {
-    fs.symlinkSync(rel, dest);
-  } catch (err) {
+  fs.mkdirSync(cudaDir, { recursive: true });
+  if (path.resolve(source) !== path.resolve(dest)) {
+    fs.copyFileSync(source, dest);
     if (process.platform !== 'win32') {
-      throw err;
+      try {
+        fs.chmodSync(dest, 0o755);
+      } catch {
+        /* ignore */
+      }
     }
-    fs.linkSync(source, dest);
   }
-  console.log(`Shared ggml CUDA backend ${name} -> ${rel}`);
+  for (const file of engineFiles) {
+    if (path.resolve(file) === path.resolve(dest)) {
+      continue;
+    }
+    fs.rmSync(file, { force: true });
+  }
+  console.log(`Staged shared ggml CUDA backend ${path.relative(path.join(__dirname, '..'), dest)}`);
   return true;
 }
 
@@ -1537,6 +1680,7 @@ module.exports = {
   resolveBuildBackends,
   cmakeGpuArgs,
   cudaCompilerCmakeArgs,
+  ggmlMaxNameCmakeArgs,
   cudaArchitectureCmakeArgs,
   GGML_CUDA_ARCHITECTURES,
   rpathCmakeArgs,
@@ -1547,6 +1691,7 @@ module.exports = {
   stageNativeRuntime,
   findBackendModule,
   missingBackendModules,
+  localGgmlCudaModule,
   sharedCudaDir,
   isCudaRedistributableName,
   isCuda13RedistName,
@@ -1563,5 +1708,6 @@ module.exports = {
   shareTorchCuda13WithVendor,
   findSharedCudaMatch,
   ggmlCudaBackendFileName,
-  shareGgmlCudaBackend,
+  patchGlauxCudaBackendSearch,
+  stageSharedGgmlCudaBackend,
 };

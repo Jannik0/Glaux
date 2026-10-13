@@ -155,19 +155,43 @@
     }
   }
 
+  /**
+   * Open a workspace file the same way a Resources or Outputs tree row does:
+   * markdown/text in the editor, and images, audio, video, and PDF in the viewer.
+   * Rejects with the opener error so callers can surface it.
+   *
+   * @param {string} panel
+   * @param {string} relativePath
+   * @param {string} [fileName]
+   * @returns {Promise<boolean>} true when an opener was started
+   */
+  async function openPanelFile(panel, relativePath, fileName) {
+    const name = fileName || (relativePath ? String(relativePath).split('/').pop() : '');
+    if (!panel || !relativePath) {
+      return false;
+    }
+    if (isMarkdownFile(name)) {
+      await window.api.markdown.openEditor(panel, relativePath);
+      return true;
+    }
+    if (isOpenableMediaFile(name)) {
+      await window.api.media.openViewer(panel, relativePath);
+      return true;
+    }
+    return false;
+  }
+
   function tryOpenTreeFile(node, panel) {
     if (!node || node.type !== 'file') {
       return false;
     }
-    if (isMarkdownFile(node.name)) {
-      void openMarkdownEditor(panel, node.relativePath);
-      return true;
+    if (!isMarkdownFile(node.name) && !isOpenableMediaFile(node.name)) {
+      return false;
     }
-    if (isOpenableMediaFile(node.name)) {
-      void openMediaViewer(panel, node.relativePath);
-      return true;
-    }
-    return false;
+    void openPanelFile(panel, node.relativePath, node.name).catch((err) => {
+      reportPanelError(panel, err);
+    });
+    return true;
   }
 
   window.Glaux.MediaKinds = {
@@ -186,6 +210,7 @@
     registerStatusSetter,
     openMarkdownEditor,
     openMediaViewer,
+    openPanelFile,
     tryOpenTreeFile,
   };
 })();

@@ -114,6 +114,7 @@ contextBridge.exposeInMainWorld('api', {
     const onSnapshot = typeof handlers.onSnapshot === 'function' ? handlers.onSnapshot : null;
     const onStarted = typeof handlers.onStarted === 'function' ? handlers.onStarted : null;
     const onDone = typeof handlers.onDone === 'function' ? handlers.onDone : null;
+    const onImages = typeof handlers.onImages === 'function' ? handlers.onImages : null;
     const onError = typeof handlers.onError === 'function' ? handlers.onError : null;
 
     let settled = false;
@@ -154,6 +155,9 @@ contextBridge.exposeInMainWorld('api', {
         if (settled) return;
         settled = true;
         cleanup();
+        if (onImages && Array.isArray(payload.images) && payload.images.length) {
+          onImages(payload.images);
+        }
         if (onDone) {
           onDone(payload.response || '');
         }

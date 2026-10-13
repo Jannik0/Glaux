@@ -11,6 +11,7 @@ const {
   getModelsRoot,
   getResourcesRoot,
   getOutputsRoot,
+  getSessionsRoot,
   listWorkspaceNames,
   resolveWorkspaceDir,
   setActiveWorkspacePaths,
@@ -20,6 +21,7 @@ const {
   pathExists,
 } = require('../paths');
 const { getPreferences, updatePreferences } = require('./preferences');
+const { clearPendingSessionFilename } = require('./sessions');
 const { t } = require('../../i18n');
 
 const DEFAULT_WORKSPACE_NAME = 'Default';
@@ -95,6 +97,7 @@ async function reconfigureEnginePathsIfReady() {
     await engineManager.configurePaths({
       resourcesRoot,
       outputsRoot,
+      sessionsRoot: getSessionsRoot(),
       modelsCacheDir: getModelsRoot(),
     });
   } catch (err) {
@@ -107,14 +110,20 @@ async function reconfigureEnginePathsIfReady() {
  * @param {string} name
  * @returns {Promise<string>}
  */
-async function activateWorkspace(name) {
-  const safeName = setActiveWorkspacePaths(name);
-  await ensureWorkspaceDirectories(safeName);
+async function activateWorkspace(name, deps = {}) {
+  const setPaths = deps.setActiveWorkspacePaths || setActiveWorkspacePaths;
+  const ensureDirs = deps.ensureWorkspaceDirectories || ensureWorkspaceDirectories;
+  const persistName = deps.persistActiveWorkspaceName || persistActiveWorkspaceName;
+  const reconfigure = deps.reconfigureEnginePathsIfReady || reconfigureEnginePathsIfReady;
+  const closeWindows = deps.closeWorkspaceDependentWindows || closeWorkspaceDependentWindows;
+  const safeName = setPaths(name);
+  await ensureDirs(safeName);
   state.activeWorkspaceName = safeName;
   state.activeSessionFilename = null;
-  closeWorkspaceDependentWindows();
-  await persistActiveWorkspaceName(safeName);
-  await reconfigureEnginePathsIfReady();
+  clearPendingSessionFilename();
+  closeWindows();
+  await persistName(safeName);
+  await reconfigure();
   return safeName;
 }
 

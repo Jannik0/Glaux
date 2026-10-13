@@ -1520,6 +1520,10 @@ body {
   border-top-color: var(--bubble-divider);
 }
 
+.message-attachment-chip.is-openable {
+  cursor: pointer;
+}
+
 .message-attachment-chip {
   display: inline-flex;
   align-items: center;

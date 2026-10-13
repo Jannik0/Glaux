@@ -11,6 +11,7 @@ const {
   resolveWorkspacePath,
   isSubPath,
 } = require('../src/main/pathSandbox');
+const { isSubPath: isSubPathFromEngine } = require('../engines/common/fileInside');
 
 describe('pathSandbox', () => {
   it('accepts and trims valid entry names', () => {
@@ -89,5 +90,6 @@ describe('pathSandbox', () => {
     assert.equal(isSubPath(parent, parent), true);
     assert.equal(isSubPath(parent, path.join(parent, 'a')), true);
     assert.equal(isSubPath(parent, path.resolve('/tmp/other')), false);
+    assert.equal(isSubPath, isSubPathFromEngine);
   });
 });

@@ -3,6 +3,7 @@ const state = require('../state');
 const {
   getResourcesRoot,
   getOutputsRoot,
+  getSessionsRoot,
   getModelsRoot,
 } = require('../paths');
 const { updatePreferences } = require('./preferences');
@@ -28,8 +29,13 @@ async function persistSelectedModelId(modelId) {
 async function enterNoModelState(opts = {}) {
   const { emitProgress = true } = opts;
   try {
-    await engineManager.ejectModel();
-  } catch {
+    await engineManager.ejectModel(
+      opts.allowDuringDiffusersStop ? { allowDuringDiffusersStop: true } : undefined
+    );
+  } catch (err) {
+    if (!opts.allowDuringDiffusersStop && err && err.message === 'Engine is busy.') {
+      throw err;
+    }
     /* worker may not be running */
   }
   await persistSelectedModelId(null);
@@ -136,12 +142,25 @@ function getEngineInitOptions() {
   return {
     resourcesRoot: getResourcesRoot(),
     outputsRoot: getOutputsRoot(),
+    sessionsRoot: getSessionsRoot(),
     modelsCacheDir: getModelsRoot(),
     modelId: getEngineInitModelId(),
     onProgress: (info) => {
       emitInitProgress(info);
     },
   };
+}
+
+/**
+ * The selected diffusion GGUF still needs its VAE and text encoder. The fetch
+ * is already running. Leave no model loaded.
+ *
+ * @param {string} modelId
+ */
+async function noteCompanionDownloadRequired(modelId) {
+  await persistSelectedModelId(null);
+  state.engineBootstrapped = false;
+  emitInitProgress({ status: 'downloadRequired', modelId });
 }
 
 /**
@@ -153,7 +172,18 @@ function getEngineInitOptions() {
  */
 async function finishEngineBootstrapModelLoad(modelId, clearedMissing) {
   try {
-    await engineManager.initialize(getEngineInitOptions());
+    const loaded = await engineManager.initialize(getEngineInitOptions());
+    if (loaded && loaded.downloadRequired) {
+      await noteCompanionDownloadRequired(modelId);
+      return {
+        modelId: null,
+        fellBack: false,
+        clearedPreference: true,
+        loadFailed: false,
+        pending: false,
+        downloadRequired: true,
+      };
+    }
     state.engineBootstrapped = true;
     emitInitProgress({ phase: 'loading', status: 'complete', modelId });
     return {
@@ -188,4 +218,5 @@ module.exports = {
   buildEngineStatusForRenderer,
   getEngineInitOptions,
   finishEngineBootstrapModelLoad,
+  noteCompanionDownloadRequired,
 };

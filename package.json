@@ -2,8 +2,8 @@
   "name": "Glaux",
   "productName": "Glaux",
   "desktopName": "com.glaux.app",
-  "version": "1.2.0",
-  "description": "Local AI workspace with on-device inference - chat, multimodal input, document analysis, audio transcription.",
+  "version": "1.3.0",
+  "description": "Local AI workspace with on-device inference - chat, multimodal input, document analysis, audio transcription, image generation.",
   "main": "src/main/index.js",
   "author": "Jannik Lehmkuhl",
   "scripts": {
@@ -13,8 +13,9 @@
     "build:ffmpeg": "node scripts/build-ffmpeg.js",
     "build:llamacpp": "node scripts/build-llamacpp.js",
     "build:transcribe": "node scripts/build-transcribe.js",
-    "build": "npm run build:python && npm run build:ffmpeg && npm run build:llamacpp && npm run build:transcribe",
-    "predist": "node scripts/check-python-runtime.js && node scripts/check-cuda-runtime.js && node scripts/check-ffmpeg-runtime.js && node scripts/check-llamacpp-runtime.js && node scripts/check-transcribe-runtime.js",
+    "build:stablediffusion": "node scripts/build-stablediffusion.js",
+    "build": "npm run build:python && npm run build:ffmpeg && npm run build:llamacpp && npm run build:transcribe && npm run build:stablediffusion",
+    "predist": "node scripts/check-python-runtime.js && node scripts/check-cuda-runtime.js && node scripts/check-ffmpeg-runtime.js && node scripts/check-llamacpp-runtime.js && node scripts/check-transcribe-runtime.js && node scripts/check-stablediffusion-runtime.js",
     "dist": "node scripts/run-electron-builder.js",
     "dist:dir": "node scripts/run-electron-builder.js --dir",
     "dist:win": "node scripts/run-electron-builder.js --win",
@@ -26,6 +27,8 @@
     "huggingface",
     "llama.cpp",
     "transcribe.cpp",
+    "stable-diffusion.cpp",
+    "diffusers",
     "transformers",
     "pytorch",
     "safetensors",
@@ -90,6 +93,10 @@
       {
         "from": "vendor/transcribe",
         "to": "transcribe"
+      },
+      {
+        "from": "vendor/stablediffusion",
+        "to": "stablediffusion"
       },
       {
         "from": "engines/huggingface",

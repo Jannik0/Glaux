@@ -7,7 +7,7 @@ This file is about how to work on Glaux. Full product setup, GPU notes, and pack
 
 ## Ways to help
 
-- Test Hub models and real workflows; note OS, GPU, engine (safetensors / llama.cpp / transcribe.cpp), and model id.
+- Test Hub models and real workflows; note OS, GPU, engine (safetensors / llama.cpp / transcribe.cpp / stable-diffusion.cpp), and model id.
 - Reproduce and fix bugs. Include steps, OS, whether you used `npm start` or a packaged build, and any relevant logs.
 - Improve docs, translations, or accessibility.
 - Add features that stay local: Glaux is an on-device workspace, not a cloud API client.
@@ -17,7 +17,6 @@ This file is about how to work on Glaux. Full product setup, GPU notes, and pack
 
 These are on the roadmap. Please open an issue before starting a large implementation so the approach can be aligned:
 
-- **Image generation** — generate images on the user’s machine from a prompt, using an on-device model.
 - **Cross-session memory** — persist useful context across chats and sessions, not only within one conversation.
 - **Web research** — let the model look up current information on the web when the user asks for it.
 - **Tool usage** — let the model call tools (files, commands, and similar) as part of a turn.
@@ -28,8 +27,8 @@ These are on the roadmap. Please open an issue before starting a large implement
 Follow [Development setup](README.md#development-setup) in the README (`npm install`, Python or `npm run build:python`, optional native engines). Then:
 
 ```bash
-npm start
 npm test
+npm start
 ```
 
 Windows and Linux are tested platforms. macOS still needs validation. GPU backends are compiled into the vendor trees at build time; end users only need a driver.
@@ -50,8 +49,8 @@ There is no CLA. By contributing you agree the work is licensed under the projec
 
 ## Scope notes
 
-- Inference stays on the user’s machine. Do not add telemetry or cloud inference as a default path.
-- Packaged Windows NSIS installers and Linux DEB and RPM packages must stay under GitHub’s **2 GiB** per-file limit. Size-sensitive Python/native cuts belong in `build:python` / `build:ffmpeg` / `build:llamacpp` / `build:transcribe`, not extra shrink scripts or one-off copies in `dist/`.
-- llama.cpp and transcribe.cpp are **pinned clones** in `deps/` (gitignored). Prefer Glaux-side engine bridges and build scripts over vendoring a full fork unless the change truly belongs upstream.
+- Inference stays on the user’s machine. Do not add telemetry or cloud inference.
+- Packaged Windows NSIS installers and Linux DEB and RPM packages must stay under GitHub’s **2 GiB** per-file limit. Size-sensitive Python/native cuts belong in the existing build scripts, not extra shrink scripts or one-off copies in `dist/`.
+- GGUF engines are **pinned clones** in `deps/` (gitignored). Prefer Glaux-side engine bridges and build scripts over vendoring a full fork unless the change truly belongs upstream.
 
 Questions about a change are fine as an issue before you invest in a large PR.

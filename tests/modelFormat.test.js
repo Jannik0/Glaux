@@ -1,5 +1,8 @@
 'use strict';
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const {
@@ -9,6 +12,7 @@ const {
   isMmprojName,
   classifyHubRepoFiles,
   buildGgufAllowPatterns,
+  directoryContainsModelWeights,
 } = require('../engines/common/modelFormat');
 
 describe('modelFormat', () => {
@@ -54,13 +58,16 @@ describe('modelFormat', () => {
     assert.ok(classified.variants.length >= 2);
   });
 
-  it('builds GGUF allow patterns including mmproj and README', () => {
+  it('builds GGUF allow patterns including mmproj, README, and companion weights', () => {
     const allFiles = [
       'model-Q4_K_M.gguf',
       'model-Q8_0.gguf',
       'mmproj-f16.gguf',
       'README.md',
       'tokenizer.json',
+      'vae/diffusion_pytorch_model.safetensors',
+      'text_encoder/model.safetensors',
+      'transformer/diffusion_pytorch_model.safetensors',
     ];
     const variant = { key: 'Q4_K_M', files: ['model-Q4_K_M.gguf'], size: 50 };
     const patterns = buildGgufAllowPatterns(allFiles, variant);
@@ -68,6 +75,45 @@ describe('modelFormat', () => {
     assert.ok(patterns.includes('mmproj-f16.gguf'));
     assert.ok(patterns.includes('README.md'));
     assert.ok(patterns.includes('tokenizer.json'));
+    assert.ok(patterns.includes('vae/diffusion_pytorch_model.safetensors'));
+    assert.ok(patterns.includes('text_encoder/model.safetensors'));
     assert.ok(!patterns.includes('model-Q8_0.gguf'));
+    assert.ok(!patterns.includes('transformer/diffusion_pytorch_model.safetensors'));
+  });
+
+  it('keeps a GGUF repo that also ships a VAE on the GGUF path', () => {
+    const classified = classifyHubRepoFiles([
+      { path: 'model-Q4_K_M.gguf', size: 50 },
+      { path: 'vae/diffusion_pytorch_model.safetensors', size: 10 },
+      { path: 'README.md', size: 1 },
+    ]);
+    assert.equal(classified.kind, 'gguf');
+    assert.ok(classified.variants.length >= 1);
+  });
+
+  it('treats a VAE and text encoder folder as weights only when a model file is present', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'glaux-companions-'));
+    const base = path.join(root, 'org', 'image');
+    fs.mkdirSync(path.join(base, 'vae'), { recursive: true });
+    fs.mkdirSync(path.join(base, 'text_encoder'), { recursive: true });
+    fs.writeFileSync(path.join(base, 'vae', 'config.json'), '{}');
+    fs.writeFileSync(path.join(base, 'vae', 'diffusion_pytorch_model.safetensors'), '');
+    fs.writeFileSync(path.join(base, 'text_encoder', 'config.json'), '{}');
+    fs.writeFileSync(path.join(base, 'text_encoder', 'model.safetensors'), '');
+    assert.equal(await directoryContainsModelWeights(base), false);
+
+    fs.mkdirSync(path.join(base, 'transformer'), { recursive: true });
+    fs.writeFileSync(path.join(base, 'transformer', 'diffusion_pytorch_model.safetensors'), '');
+    assert.equal(await directoryContainsModelWeights(base), true);
+  });
+
+  it('keeps a diffusers repo on the safetensors path when model_index.json is present', () => {
+    const classified = classifyHubRepoFiles([
+      { path: 'model_index.json', size: 1 },
+      { path: 'transformer/diffusion_pytorch_model.safetensors', size: 100 },
+      { path: 'extra-Q4_K_M.gguf', size: 10 },
+    ]);
+    assert.equal(classified.kind, 'huggingface');
+    assert.deepEqual(classified.variants, []);
   });
 });
