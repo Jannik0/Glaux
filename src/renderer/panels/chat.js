@@ -751,6 +751,26 @@ function updateSendButton() {
   if (labelEl) labelEl.textContent = t('chat.send');
 }
 
+function syncComposerInteraction() {
+  if (inputEl) {
+    inputEl.disabled = chatRestorePending || !modelReady || engineBusy || engineLoading;
+  }
+  const locked = Boolean(chatRestorePending);
+  if (chatAttachmentsDropEl) {
+    chatAttachmentsDropEl.classList.toggle('is-disabled', locked);
+    if (locked) {
+      chatAttachmentsDropEl.setAttribute('aria-disabled', 'true');
+    } else {
+      chatAttachmentsDropEl.removeAttribute('aria-disabled');
+    }
+  }
+  if (chatAttachmentsListEl) {
+    chatAttachmentsListEl.querySelectorAll('.chat-attachment-remove').forEach((btn) => {
+      btn.disabled = locked;
+    });
+  }
+}
+
 function setReady(isReady) {
   // pollStatus reports ready=false while generating; keep modelReady until the stream ends.
   if (isReady || !engineBusy) {
@@ -759,14 +779,14 @@ function setReady(isReady) {
   if (isReady) {
     setEngineLoading(false);
   }
-  inputEl.disabled = !modelReady || engineBusy || engineLoading;
+  syncComposerInteraction();
   updateSendButton();
   syncModelPanelDisabled();
 }
 
 function setBusy(isBusy) {
   engineBusy = isBusy;
-  inputEl.disabled = isBusy || !modelReady || engineLoading;
+  syncComposerInteraction();
   if (reasoningToggleEl) reasoningToggleEl.disabled = isBusy;
   if (resubmitToggleEl) resubmitToggleEl.disabled = isBusy;
   syncModelPanelDisabled();
@@ -869,6 +889,7 @@ function renderChatAttachments() {
 }
 
 function addChatAttachment(file) {
+  if (chatRestorePending) return;
   if (!file || !file.relativePath) return;
   const key = chatAttachmentKey(file);
   if (pendingChatAttachments.some((entry) => chatAttachmentKey(entry) === key)) {
@@ -879,6 +900,7 @@ function addChatAttachment(file) {
 }
 
 function removeChatAttachment(file) {
+  if (chatRestorePending) return;
   const key = chatAttachmentKey(file);
   pendingChatAttachments = pendingChatAttachments.filter(
     (entry) => chatAttachmentKey(entry) !== key
@@ -966,6 +988,13 @@ function initializeChatAttachmentsDrop() {
   };
 
   const onDragOver = (event) => {
+    if (chatRestorePending) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'none';
+      setDragHighlight('none');
+      return;
+    }
     const state = getChatAttachmentDragState(event.dataTransfer);
     if (state === 'none') return;
     event.preventDefault();
@@ -974,6 +1003,12 @@ function initializeChatAttachmentsDrop() {
   };
 
   const onDragEnter = (event) => {
+    if (chatRestorePending) {
+      event.preventDefault();
+      event.stopPropagation();
+      setDragHighlight('none');
+      return;
+    }
     const state = getChatAttachmentDragState(event.dataTransfer);
     if (state === 'none') return;
     event.preventDefault();
@@ -987,6 +1022,12 @@ function initializeChatAttachmentsDrop() {
   };
 
   const onDrop = (event) => {
+    if (chatRestorePending) {
+      event.preventDefault();
+      event.stopPropagation();
+      setDragHighlight('none');
+      return;
+    }
     const state = getChatAttachmentDragState(event.dataTransfer);
     setDragHighlight('none');
     if (state !== 'accept') {
@@ -1072,12 +1113,6 @@ function watchAssistantStream(opts) {
     },
     onFullText: (full) => {
       const next = typeof full === 'string' ? full : '';
-      // A status poll can deliver a snapshot taken before the latest token.
-      // Replacing with that shorter text rewinds the bubble, and the newer
-      // seq will not be applied again.
-      if (next.length < streamed.length) {
-        return false;
-      }
       if (streamParser && next.startsWith(streamed)) {
         const delta = next.slice(streamed.length);
         streamed = next;
@@ -1100,6 +1135,7 @@ function watchAssistantStream(opts) {
       streamParser(next);
       scrollMessagesToBottomAfterRender();
     },
+    shownText: () => streamed,
   };
 
   let stream;
@@ -1388,6 +1424,9 @@ function holdSettlingStream(streamInfo, hooks) {
  * restored from the transfer that outlived the reload.
  */
 async function restoreChatAfterReload() {
+  chatRestorePending = true;
+  syncComposerInteraction();
+  updateSendButton();
   let unsubscribe = () => {};
   let handedOff = false;
   const buffered = [];
@@ -1518,31 +1557,40 @@ async function restoreChatAfterReload() {
           if (typeof payload.seq === 'number' && payload.seq <= applied.seq) {
             return;
           }
-          if (typeof payload.seq === 'number') {
-            applied.seq = payload.seq;
-          }
+          const acceptSeq = () => {
+            if (typeof payload.seq === 'number' && payload.seq > applied.seq) {
+              applied.seq = payload.seq;
+            }
+          };
           if (payload.type === 'started') {
             handlers.onStarted({ startsInThinking: Boolean(payload.startsInThinking) });
+            acceptSeq();
             return;
           }
-          if (payload.type === 'chunk' || payload.type === 'snapshot') {
+          if (payload.type === 'snapshot') {
+            handlers.onSnapshot(typeof payload.text === 'string' ? payload.text : '');
+            acceptSeq();
+            return;
+          }
+          if (payload.type === 'chunk') {
             if (typeof payload.text === 'string') {
               handlers.onFullText(payload.text);
-            } else if (payload.type === 'chunk') {
-              handlers.onToken(payload.chunk || '');
             } else {
-              handlers.onSnapshot(typeof payload.text === 'string' ? payload.text : '');
+              handlers.onToken(payload.chunk || '');
             }
+            acceptSeq();
             return;
           }
           if (payload.type === 'done') {
             if (handlers.onImages && Array.isArray(payload.images) && payload.images.length) {
               handlers.onImages(payload.images);
             }
+            acceptSeq();
             finish(payload.response || '');
             return;
           }
           if (payload.type === 'canceled' || payload.type === 'error') {
+            acceptSeq();
             fail(streamErrorFromPayload(payload));
           }
         };
@@ -1561,9 +1609,13 @@ async function restoreChatAfterReload() {
             if (typeof seq === 'number' && seq < applied.seq) {
               return;
             }
-            if (handlers.onFullText(next) === false) {
+            // Status polls can return a read that started before the latest token.
+            // Live snapshot events replace through onSnapshot and are not filtered here.
+            const shown = typeof handlers.shownText === 'function' ? handlers.shownText() : '';
+            if (next.length < shown.length) {
               return;
             }
+            handlers.onFullText(next);
             if (typeof seq === 'number' && seq > applied.seq) {
               applied.seq = seq;
             }
@@ -1581,6 +1633,7 @@ async function restoreChatAfterReload() {
   } finally {
     const aborted = epoch !== chatViewEpoch;
     chatRestorePending = false;
+    syncComposerInteraction();
     if (!aborted) {
       const appliedScroll = restoreChatComposerAfterReload(restoreScroll);
       if (restoreScroll && !appliedScroll) {
@@ -1676,6 +1729,21 @@ sendButtonEl.addEventListener('click', () => {
   }
 });
 
+function blockComposerEditsDuringRestore(event) {
+  if (!chatRestorePending) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+for (const composerEl of [formEl, inputEl, chatAttachmentsDropEl]) {
+  if (!composerEl) {
+    continue;
+  }
+  composerEl.addEventListener('paste', blockComposerEditsDuringRestore);
+}
+
 inputEl.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
@@ -1755,6 +1823,20 @@ function setLoadingStatusMessage(text) {
   }, ENGINE_STATUS_CLEAR_MS);
 }
 
+function visibleChatTurnKey() {
+  if (!messagesEl) {
+    return '';
+  }
+  return [...messagesEl.querySelectorAll('.message.user, .message.assistant')]
+    .map((el) => {
+      const role = el.classList.contains('user') ? 'user' : 'assistant';
+      const thoughts = el.querySelector('.thoughts-content');
+      const body = el.querySelector('.message-body') || el.querySelector('.answer-content');
+      return `${role}:${thoughts ? thoughts.textContent : ''}:${body ? body.textContent : ''}`;
+    })
+    .join('\n');
+}
+
 let reconcileRestoredGenerationInFlight = false;
 
 /**
@@ -1783,6 +1865,8 @@ async function reconcileRestoredGeneration() {
       }
       return;
     }
+    const keptScroll = messagesEl ? messagesEl.scrollTop : 0;
+    const turnBefore = visibleChatTurnKey();
     stream.abandonDom = true;
     const messages = snap && Array.isArray(snap.messages) ? snap.messages : [];
     clearChatMessages();
@@ -1791,7 +1875,11 @@ async function reconcileRestoredGeneration() {
     if (sessionsListReady() && typeof renderSessionsList === 'function') {
       renderSessionsList();
     }
-    scrollMessagesToBottomAfterRender();
+    if (visibleChatTurnKey() === turnBefore && messagesEl) {
+      messagesEl.scrollTop = keptScroll;
+    } else {
+      scrollMessagesToBottomAfterRender();
+    }
     void updateContextUsageIndicator({ refresh: true });
     if (typeof stream.complete === 'function') {
       stream.complete('');
