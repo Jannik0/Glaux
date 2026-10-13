@@ -231,6 +231,25 @@ function installElement(el) {
   };
   el.focus = () => {};
   el.select = () => {};
+  el.dispatchEvent = (event) => {
+    const evt = event || {};
+    const type = evt.type;
+    if (typeof evt.preventDefault !== 'function') {
+      evt.preventDefault = () => {
+        evt.defaultPrevented = true;
+      };
+    }
+    if (typeof evt.stopPropagation !== 'function') {
+      evt.stopPropagation = () => {
+        evt.stopped = true;
+      };
+    }
+    evt.target = evt.target || el;
+    for (const fn of el.listeners[type] || []) {
+      fn(evt);
+    }
+    return evt.defaultPrevented !== true;
+  };
   return el;
 }
 
@@ -319,21 +338,36 @@ function bootRenderer() {
     getElementById: (id) => elementFor(id),
     createElement,
     addEventListener() {},
-    body: createElement('body'),
+    hidden: false,
+    activeElement: null,
+    body: null,
+    querySelector(sel) {
+      return queryAll(document.body, sel)[0] || null;
+    },
+    querySelectorAll(sel) {
+      return queryAll(document.body, sel);
+    },
   };
+  document.body = createElement('body');
 
   const sandbox = {
     console,
     setTimeout,
     clearTimeout,
-    setInterval,
-    clearInterval,
     queueMicrotask,
     requestAnimationFrame(cb) {
       cb();
       return 1;
     },
     cancelAnimationFrame() {},
+    setInterval() {
+      return 0;
+    },
+    clearInterval() {},
+    matchMedia() {
+      return { matches: false, addEventListener() {}, removeEventListener() {} };
+    },
+    addEventListener() {},
     HTMLElement,
     HTMLSelectElement,
     HTMLButtonElement,
@@ -349,7 +383,50 @@ function bootRenderer() {
     i18n: {
       t: (key) => key,
       language: 'en',
-      available: [{ code: 'en', nativeName: 'English' }],
+      available: [
+        { code: 'en', nativeName: 'English' },
+        { code: 'de', nativeName: 'Deutsch' },
+      ],
+    },
+    Dialogs: {
+      elements: {
+        confirmOverlayEl: null,
+        confirmCancelEl: null,
+        confirmAltEl: null,
+        confirmConfirmEl: null,
+        nameOverlayEl: null,
+        nameInputEl: null,
+        progressOverlayEl: null,
+        nameCancelEl: null,
+        nameConfirmEl: null,
+      },
+      isConfirmDialogActive() {
+        return false;
+      },
+      isNameDialogActive() {
+        return false;
+      },
+      closeNameDialog() {},
+    },
+    Resources: {
+      panel: {
+        closeContextMenu() {},
+        clearSelection() {},
+        draggedPath: '',
+        refreshTree: async () => {},
+      },
+    },
+    Outputs: {
+      panel: {
+        closeContextMenu() {},
+        clearSelection() {},
+        draggedPath: '',
+        refreshTree: async () => {},
+        setStatus() {},
+      },
+    },
+    Tour: {
+      startIfFirstLaunch() {},
     },
   };
   const api = {
@@ -362,6 +439,11 @@ function bootRenderer() {
     onEngineStreamEvent(callback) {
       api._listeners.push(callback);
       return () => {};
+    },
+    preferences: [],
+    updatePreferences(patch) {
+      api.preferences.push(patch);
+      return Promise.resolve();
     },
     cancelGeneration() {
       api.cancels.push('engine:cancel');
@@ -406,6 +488,23 @@ function bootRenderer() {
     const source = fs.readFileSync(path.join(rendererRoot, file), 'utf8');
     vm.runInContext(source, context, { filename: file });
   }
+  vm.runInContext(
+    `
+      function initializeResourcesPanel() {}
+      function initializeOutputsPanel() {}
+      function initializeModelsPanel() {}
+      let modelsPanelEl = null;
+      let resourcesPanelEl = null;
+      let outputsPanelEl = null;
+      globalThis.__realInitSessions = initializeSessionsPanel;
+      initializeSessionsPanel = function () {};
+    `,
+    context
+  );
+  vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'main.js'), 'utf8'), context, {
+    filename: 'main.js',
+  });
+  vm.runInContext('initializeSessionsPanel = globalThis.__realInitSessions;', context);
 
   function run(code) {
     return vm.runInContext(code, context);
@@ -699,6 +798,161 @@ describe('chat restore renderer', { concurrency: 1 }, () => {
     assert.equal(env.run(`messagesEl.querySelector('.message.user .message-body').textContent`), 'keep me');
     assert.equal(env.run('chatViewEpoch'), env.run('globalThis.__epoch'));
     assert.equal(env.run('inputEl.value'), '');
+  });
+
+  it('replaces a restored bubble with a shorter live ASR snapshot and ignores a stale shorter poll', async () => {
+    reset();
+    env.api.getChatRestoreState = async () => ({
+      sessionName: 'chat.json',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      stream: {
+        requestId: 'asr',
+        text: 'Hello there',
+        seq: 4,
+        userPending: false,
+        settling: false,
+        startsInThinking: false,
+      },
+    });
+    await env.run('restoreChatAfterReload()');
+    const listener = env.api._listeners[0];
+    assert.equal(typeof listener, 'function');
+    listener({
+      requestId: 'asr',
+      type: 'snapshot',
+      seq: 5,
+      text: 'Hi',
+    });
+    assert.equal(env.run(`messagesEl.querySelector('.answer-content').textContent`), 'Hi');
+    env.api.getChatRestoreState = async () => ({
+      sessionName: 'chat.json',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      stream: {
+        requestId: 'asr',
+        text: 'H',
+        seq: 9,
+        userPending: false,
+        settling: false,
+      },
+    });
+    await env.run('reconcileRestoredGeneration()');
+    assert.equal(env.run(`messagesEl.querySelector('.answer-content').textContent`), 'Hi');
+  });
+
+  it('disables the composer during restore and re-enables it when restore ends', async () => {
+    reset();
+    env.run('setReady(true);');
+    assert.equal(env.ids.get('message-input').disabled, false);
+    let release;
+    env.api.getChatRestoreState = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    const pending = env.run('restoreChatAfterReload()');
+    assert.equal(env.run('chatRestorePending'), true);
+    assert.equal(env.ids.get('message-input').disabled, true);
+    assert.equal(env.ids.get('send-button').disabled, false);
+    assert.equal(env.run(`sendButtonEl.querySelector('.icon + span').textContent`), 'chat.stop');
+    assert.equal(env.ids.get('chat-attachments-drop').getAttribute('aria-disabled'), 'true');
+    env.run('setReady(true);');
+    assert.equal(env.ids.get('message-input').disabled, true);
+    assert.equal(env.ids.get('send-button').disabled, false);
+
+    let pastePrevented = false;
+    env.ids.get('message-input').dispatchEvent({
+      type: 'paste',
+      preventDefault() {
+        pastePrevented = true;
+      },
+      stopPropagation() {},
+    });
+    assert.equal(pastePrevented, true);
+
+    let dropPrevented = false;
+    env.ids.get('chat-attachments-drop').dispatchEvent({
+      type: 'drop',
+      preventDefault() {
+        dropPrevented = true;
+      },
+      stopPropagation() {},
+      dataTransfer: {
+        dropEffect: 'copy',
+        getData() {
+          return 'pics/b.png';
+        },
+      },
+    });
+    assert.equal(dropPrevented, true);
+    env.run(`addChatAttachment({ source: 'resources', relativePath: 'pics/b.png', name: 'b.png' });`);
+    assert.equal(env.run('pendingChatAttachments.length'), 0);
+
+    release({ sessionName: null, messages: [], stream: null });
+    await pending;
+    assert.equal(env.run('chatRestorePending'), false);
+    assert.equal(env.ids.get('message-input').disabled, false);
+    assert.equal(env.ids.get('chat-attachments-drop').getAttribute('aria-disabled'), null);
+
+    env.api.getChatRestoreState = async () => {
+      throw new Error('restore failed');
+    };
+    await env.run('restoreChatAfterReload()');
+    assert.equal(env.run('chatRestorePending'), false);
+    assert.equal(env.run('chatRestoreFailed'), true);
+    assert.equal(env.ids.get('message-input').disabled, false);
+    assert.equal(env.ids.get('send-button').disabled, false);
+  });
+
+  it('saves the composer when the language select changes', () => {
+    reset();
+    env.run(`
+      inputEl.value = 'before reload';
+      pendingChatAttachments = [{ source: 'outputs', relativePath: 'note.txt', name: 'note.txt' }];
+      messagesEl.scrollTop = 55;
+    `);
+    const select = env.ids.get('language-select');
+    select.value = 'de';
+    select.dispatchEvent({ type: 'change' });
+    const saved = JSON.parse(env.run(`sessionStorage.getItem('glaux.chatComposer')`));
+    assert.equal(saved.draft, 'before reload');
+    assert.equal(saved.attachments[0].name, 'note.txt');
+    assert.equal(saved.scrollTop, 55);
+    assert.equal(env.api.preferences.at(-1).language, 'de');
+  });
+
+  it('keeps the restored scroll when a settling stop persists the same turn', async () => {
+    reset();
+    env.run(`
+      messagesEl.scrollTop = 80;
+      saveChatComposerForReload();
+      messagesEl.scrollTop = 0;
+    `);
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Hello [STOP]' }] },
+    ];
+    env.api.getChatRestoreState = async () => ({
+      sessionName: 'chat.json',
+      messages,
+      stream: {
+        requestId: 'stop',
+        text: 'Hello',
+        seq: 3,
+        userPending: false,
+        settling: true,
+        startsInThinking: false,
+      },
+    });
+    await env.run('restoreChatAfterReload()');
+    assert.equal(env.run('messagesEl.scrollTop'), 80);
+    env.api.getChatRestoreState = async () => ({
+      sessionName: 'chat.json',
+      messages,
+      stream: null,
+    });
+    await env.run('reconcileRestoredGeneration()');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(env.run('messagesEl.scrollTop'), 80);
+    assert.notEqual(env.run('messagesEl.scrollTop'), env.run('messagesEl.scrollHeight'));
   });
 
   it('calls engine:cancel from the send button while restore is still pending', () => {
