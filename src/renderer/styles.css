@@ -1439,6 +1439,17 @@ body {
   box-shadow: none;
 }
 
+.chat-attachments-drop.is-disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.chat-attachments-drop.is-disabled.drag-over,
+.chat-attachments-drop.is-disabled.drag-over-reject {
+  border-color: var(--border-app);
+  box-shadow: none;
+}
+
 .chat-attachments-drop:not(.empty) {
   border-style: solid;
 }
@@ -1502,9 +1513,14 @@ body {
   cursor: pointer;
 }
 
-.chat-attachment-remove:hover {
+.chat-attachment-remove:hover:not(:disabled) {
   background: var(--bg-input);
   color: var(--text-body);
+}
+
+.chat-attachment-remove:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .message-attachments {
