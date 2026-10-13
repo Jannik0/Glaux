@@ -92,6 +92,9 @@ function renderWorkspaceSelect() {
  * active session when switching workspaces.
  */
 async function refreshPanelsForWorkspaceChange() {
+  if (typeof noteChatViewChange === 'function') {
+    noteChatViewChange();
+  }
   if (window.api && window.api.sessions && typeof window.api.sessions.new === 'function') {
     try {
       await window.api.sessions.new();

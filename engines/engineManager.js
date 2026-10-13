@@ -1886,6 +1886,26 @@ function activeRunStopSealed() {
   return Boolean(activeGeneration && activeGeneration.stopSealed);
 }
 
+/**
+ * Whether the active run with this request id has appended its user turn.
+ * Null when this id does not own the in-flight run.
+ *
+ * @param {string} requestId
+ * @returns {boolean | null}
+ */
+function streamRunUserPending(requestId) {
+  if (
+    !requestId ||
+    !generationInFlight ||
+    !activeGeneration ||
+    activeGeneration.settled ||
+    activeGeneration.requestId !== requestId
+  ) {
+    return null;
+  }
+  return activeGeneration.userId == null;
+}
+
 function configuredSessionsRoot() {
   const root = initOptions && initOptions.sessionsRoot;
   return typeof root === 'string' ? root : '';
@@ -1903,6 +1923,25 @@ async function sendPrompt(message, options = {}) {
   if (generationInFlight || diffusersStopPending || diffusersReloadPromise) {
     throw engineBusyError();
   }
+
+  // Fired synchronously when this run leaves the generating phase, before the
+  // returned promise settles, so a reload can tell a live turn from one that
+  // is already in context.
+  let settleNotified = false;
+  const notifySettled = () => {
+    if (settleNotified) {
+      return;
+    }
+    settleNotified = true;
+    if (typeof options.onSettle !== 'function') {
+      return;
+    }
+    try {
+      options.onSettle();
+    } catch {
+      /* bookkeeping must not fail the turn */
+    }
+  };
 
   if (isDiffusionPipelineTag(activePipelineTag)) {
     const imageToImage = activePipelineTag === IMAGE_TO_IMAGE_PIPELINE_TAG;
@@ -1975,11 +2014,13 @@ async function sendPrompt(message, options = {}) {
       }
       // Drop this turn and settle before the await. A Stop during the discard
       // must not seal a run whose user message is about to be removed.
+      notifySettled();
       contextManager.removeMessageById(userId);
       settleOwnedRun(run);
       await discardGeneratedOutput(outputPath, reservationId);
       throw err;
     } finally {
+      notifySettled();
       releaseSessionImagePath(outputPath, reservationId);
       settleOwnedRun(run);
     }
@@ -2054,6 +2095,7 @@ async function sendPrompt(message, options = {}) {
       throw err;
     }
   } finally {
+    notifySettled();
     settleOwnedRun(run);
   }
 }
@@ -2178,6 +2220,7 @@ module.exports = {
   cancelRequestGeneration,
   requestRunTokenCount,
   activeRunStopSealed,
+  streamRunUserPending,
   MAX_TRACKED_REQUEST_RUNS,
   configuredSessionsRoot,
   discardSessionOutput: discardGeneratedOutput,

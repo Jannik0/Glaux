@@ -28,6 +28,23 @@ let lastEngineStableSignature = '';
 
 let chatContextTargetIndex = -1;
 
+/**
+ * True while a language-switch reload is still repainting the open session.
+ * Clicks during that window would load a session over the restore.
+ */
+let chatRestorePending = Boolean(
+  window.api && typeof window.api.getChatRestoreState === 'function'
+);
+let chatViewEpoch = 0;
+
+function noteChatViewChange() {
+  chatViewEpoch += 1;
+}
+
+function chatTranscriptVisible() {
+  return Boolean(messagesEl && messagesEl.querySelector('.message.user, .message.assistant'));
+}
+
 /** In-memory mirrors of preferences.json toggle values. */
 let reasoningEnabledPref = false;
 let resubmitEnabledPref = false;
@@ -992,8 +1009,411 @@ function initializeChatAttachmentsDrop() {
   });
 }
 
+/**
+ * Paint one assistant bubble for a live stream and keep it updated until the
+ * run finishes. `openStream` receives the token handlers and returns
+ * `{ completion, cancel }`.
+ *
+ * @param {{
+ *   container: HTMLElement,
+ *   details: HTMLElement,
+ *   thoughtsContent: HTMLElement,
+ *   answerContent: HTMLElement,
+ *   userMessageEl: HTMLElement | null,
+ *   seedText?: string,
+ *   startsInThinking?: boolean,
+ *   openStream: (handlers: object) => { completion: Promise<string>, cancel?: () => void },
+ *   onIdle?: () => void,
+ * }} opts
+ */
+function watchAssistantStream(opts) {
+  const { container, details, thoughtsContent, answerContent, userMessageEl, openStream } = opts;
+  const { renderFormattedMessage, parseTagsAndAnswer, createTagStreamParser } = window.Glaux.ThinkingParse;
+
+  let streamed = '';
+  let streamParser = null;
+  let streamStartsInThinking = Boolean(opts.startsInThinking);
+  const ensureStreamParser = () => {
+    if (!streamParser) {
+      streamParser = createTagStreamParser(thoughtsContent, answerContent, details, {
+        startInThinking: streamStartsInThinking,
+      });
+    }
+  };
+  const handlers = {
+    onImages: (images) => {
+      appendAttachmentChips(container, images);
+      scrollMessagesToBottomAfterRender();
+    },
+    onStarted: (meta) => {
+      streamStartsInThinking = Boolean(meta && meta.startsInThinking);
+      ensureStreamParser();
+    },
+    onToken: (chunk) => {
+      ensureStreamParser();
+      streamed += chunk;
+      streamParser(chunk);
+    },
+    onSnapshot: (text) => {
+      // ASR (and similar) send full hypothesis snapshots; replace the bubble
+      // instead of appending so rewrites do not loop and progress continues.
+      streamParser = null;
+      streamed = typeof text === 'string' ? text : '';
+      details.style.display = 'none';
+      thoughtsContent.textContent = '';
+      answerContent.textContent = '';
+      renderFormattedMessage(answerContent, streamed);
+      scrollMessagesToBottomAfterRender();
+    },
+    onFullText: (full) => {
+      const next = typeof full === 'string' ? full : '';
+      if (streamParser && next.startsWith(streamed)) {
+        const delta = next.slice(streamed.length);
+        streamed = next;
+        if (delta) {
+          streamParser(delta);
+        }
+        scrollMessagesToBottomAfterRender();
+        return;
+      }
+      streamParser = null;
+      streamed = next;
+      details.style.display = 'none';
+      thoughtsContent.textContent = '';
+      answerContent.textContent = '';
+      if (!next) {
+        scrollMessagesToBottomAfterRender();
+        return;
+      }
+      ensureStreamParser();
+      streamParser(next);
+      scrollMessagesToBottomAfterRender();
+    },
+  };
+
+  let stream;
+  try {
+    if (opts.seedText) {
+      handlers.onFullText(opts.seedText);
+    }
+    stream = openStream(handlers);
+  } catch (err) {
+    if (typeof opts.onIdle === 'function') {
+      opts.onIdle();
+    }
+    answerContent.textContent = '';
+    renderFormattedMessage(answerContent, t('chat.errorPrefix', { message: err.message || String(err) }));
+    container.classList.remove('thinking');
+    markFailedTurn(container, userMessageEl);
+    return;
+  }
+
+  activeStream = stream;
+  setBusy(true);
+  void (async () => {
+    try {
+      const response = await stream.completion;
+      if (stream.abandonDom) {
+        return;
+      }
+      if (streamParser) {
+        streamParser.flush();
+      }
+      // If streamed chunks drifted from the authoritative final (e.g. ASR
+      // hypothesis rewrites), replace the live answer with the final text.
+      if (typeof response === 'string' && response !== streamed) {
+        const { thinking, answer } = parseTagsAndAnswer(response);
+        if (thinking) {
+          details.style.display = '';
+          thoughtsContent.textContent = '';
+          renderFormattedMessage(thoughtsContent, thinking);
+        }
+        answerContent.textContent = '';
+        renderFormattedMessage(answerContent, answer || response);
+        streamed = response;
+      }
+      container.classList.remove('thinking');
+    } catch (err) {
+      if (stream.abandonDom) {
+        return;
+      }
+      const canceled = isGenerationCanceledError(err);
+      if (canceled) {
+        const stopMarker = '[STOP]';
+        const afterFlush =
+          streamParser && typeof streamParser.flush === 'function'
+            ? streamParser.flush()
+            : { state: 'detect' };
+        const endState = afterFlush && afterFlush.state;
+
+        if (endState === 'thinking') {
+          // flush() already committed partial thinking to the thoughts panel; only show [STOP] in the answer.
+          details.style.display = '';
+          answerContent.textContent = '';
+          renderFormattedMessage(answerContent, stopMarker);
+        } else if (endState === 'answering') {
+          const body = (afterFlush && afterFlush.answer) || answerContent.textContent || '';
+          answerContent.textContent = '';
+          renderFormattedMessage(answerContent, body ? `${body}\n\n${stopMarker}` : stopMarker);
+        } else {
+          const fullText = streamed ? `${streamed}\n\n${stopMarker}` : stopMarker;
+          const { thinking, answer } = parseTagsAndAnswer(fullText);
+          if (thinking) {
+            details.style.display = '';
+            thoughtsContent.textContent = '';
+            renderFormattedMessage(thoughtsContent, thinking);
+          }
+          answerContent.textContent = '';
+          renderFormattedMessage(answerContent, answer);
+        }
+        container.classList.remove('thinking');
+        markStoppedTurn(container, userMessageEl);
+      } else {
+        answerContent.textContent = '';
+        renderFormattedMessage(
+          answerContent,
+          t('chat.errorPrefix', { message: err.message || String(err) })
+        );
+        container.classList.remove('thinking');
+        markFailedTurn(container, userMessageEl);
+      }
+    } finally {
+      activeStream = null;
+      setBusy(false);
+      scrollMessagesToBottom();
+      void refreshSessionsList();
+      void updateContextUsageIndicator();
+      if (typeof opts.onIdle === 'function') {
+        opts.onIdle();
+      }
+    }
+  })();
+}
+
+function displayFilesFromPayload(files) {
+  if (!Array.isArray(files)) {
+    return [];
+  }
+  const out = [];
+  for (const file of files) {
+    if (!file || typeof file.relativePath !== 'string' || !file.relativePath) {
+      continue;
+    }
+    out.push({
+      source: file.source === 'outputs' ? 'outputs' : 'resources',
+      relativePath: file.relativePath,
+      name: fileNameFromPath(file.relativePath),
+    });
+  }
+  return out;
+}
+
+function lastUserMessageElement() {
+  if (!messagesEl) {
+    return null;
+  }
+  const all = messagesEl.querySelectorAll('.message.user');
+  return all.length ? /** @type {HTMLElement} */ (all[all.length - 1]) : null;
+}
+
+function streamErrorFromPayload(payload) {
+  if (payload && payload.type === 'canceled') {
+    const error = new Error(t('preload.generationCanceled'));
+    error.name = 'E_CANCELED';
+    error.code = 'E_CANCELED';
+    return error;
+  }
+  const info = payload && payload.errorInfo;
+  const error = new Error(
+    info && info.message ? info.message : t('preload.unknownStreamError')
+  );
+  if (info && info.code) {
+    error.code = info.code;
+  }
+  return error;
+}
+
+/**
+ * Language switches reload this page. The main process keeps the session and
+ * any in-flight generation; paint both again, the same way model downloads are
+ * restored from the transfer that outlived the reload.
+ */
+async function restoreChatAfterReload() {
+  let unsubscribe = () => {};
+  let handedOff = false;
+  const buffered = [];
+  /** @type {((payload: object) => void) | null} */
+  let live = null;
+  if (window.api && typeof window.api.onEngineStreamEvent === 'function') {
+    const remove = window.api.onEngineStreamEvent((payload) => {
+      if (live) {
+        live(payload);
+      } else {
+        buffered.push(payload);
+      }
+    });
+    if (typeof remove === 'function') {
+      unsubscribe = remove;
+    }
+  }
+
+  const epoch = chatViewEpoch;
+  try {
+    if (!(window.api && typeof window.api.getChatRestoreState === 'function')) {
+      return;
+    }
+    let snap;
+    try {
+      snap = await window.api.getChatRestoreState();
+    } catch {
+      return;
+    }
+    if (epoch !== chatViewEpoch) {
+      return;
+    }
+    if (!snap) {
+      return;
+    }
+
+    activeSessionName = snap.sessionName || null;
+    if (typeof renderSessionsList === 'function') {
+      renderSessionsList();
+    }
+
+    const messages = Array.isArray(snap.messages) ? snap.messages : [];
+    const streamInfo = snap.stream;
+    if (!messages.length && !streamInfo) {
+      return;
+    }
+
+    clearChatMessages();
+    rebuildChatFromContext(messages);
+
+    if (!streamInfo || !streamInfo.requestId) {
+      scrollMessagesToBottomAfterRender();
+      void updateContextUsageIndicator({ refresh: true });
+      return;
+    }
+
+    if (streamInfo.userPending) {
+      appendMessage(
+        'user',
+        typeof streamInfo.userText === 'string' ? streamInfo.userText : '',
+        displayFilesFromPayload(streamInfo.userFiles)
+      );
+    }
+
+    const { container, details, thoughtsContent, answerContent } = createAssistantMessageStructure();
+    container.classList.add('thinking');
+    messagesEl.appendChild(container);
+    scrollMessagesToBottomAfterRender();
+
+    const requestId = String(streamInfo.requestId);
+    const applied = { seq: Number(streamInfo.seq) || 0 };
+    // A running generation means a model is already loaded. Keep Send able to
+    // become Stop, and stay enabled when this turn ends, without waiting for
+    // the next status poll (that poll reports ready=false while generating).
+    modelReady = true;
+    handedOff = true;
+    watchAssistantStream({
+      container,
+      details,
+      thoughtsContent,
+      answerContent,
+      userMessageEl: lastUserMessageElement(),
+      seedText: typeof streamInfo.text === 'string' ? streamInfo.text : '',
+      startsInThinking: Boolean(streamInfo.startsInThinking),
+      onIdle: () => {
+        unsubscribe();
+      },
+      openStream: (handlers) => {
+        let settled = false;
+        let resolveCompletion;
+        let rejectCompletion;
+        const completion = new Promise((resolve, reject) => {
+          resolveCompletion = resolve;
+          rejectCompletion = reject;
+        });
+        const finish = (response) => {
+          if (settled) return;
+          settled = true;
+          resolveCompletion(response || '');
+        };
+        const fail = (err) => {
+          if (settled) return;
+          settled = true;
+          rejectCompletion(err);
+        };
+        live = (payload) => {
+          if (!payload || payload.requestId !== requestId || settled) {
+            return;
+          }
+          if (typeof payload.seq === 'number' && payload.seq <= applied.seq) {
+            return;
+          }
+          if (typeof payload.seq === 'number') {
+            applied.seq = payload.seq;
+          }
+          if (payload.type === 'started') {
+            handlers.onStarted({ startsInThinking: Boolean(payload.startsInThinking) });
+            return;
+          }
+          if (payload.type === 'chunk' || payload.type === 'snapshot') {
+            if (typeof payload.text === 'string') {
+              handlers.onFullText(payload.text);
+            } else if (payload.type === 'chunk') {
+              handlers.onToken(payload.chunk || '');
+            } else {
+              handlers.onSnapshot(typeof payload.text === 'string' ? payload.text : '');
+            }
+            return;
+          }
+          if (payload.type === 'done') {
+            if (handlers.onImages && Array.isArray(payload.images) && payload.images.length) {
+              handlers.onImages(payload.images);
+            }
+            finish(payload.response || '');
+            return;
+          }
+          if (payload.type === 'canceled' || payload.type === 'error') {
+            fail(streamErrorFromPayload(payload));
+          }
+        };
+        for (const payload of buffered.splice(0, buffered.length)) {
+          live(payload);
+        }
+        return {
+          requestId,
+          restored: true,
+          completion,
+          applyText: (text) => {
+            if (!settled) {
+              handlers.onFullText(text);
+            }
+          },
+          complete: (response) => finish(response),
+          cancel: () => {
+            if (settled) return;
+            if (window.api && typeof window.api.cancelStream === 'function') {
+              window.api.cancelStream(requestId);
+            }
+          },
+        };
+      },
+    });
+  } finally {
+    chatRestorePending = false;
+    if (!handedOff) {
+      unsubscribe();
+    }
+  }
+}
+
 formEl.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (chatRestorePending) {
+    return;
+  }
   if (activeStream) {
     stopActiveGeneration();
     return;
@@ -1002,6 +1422,7 @@ formEl.addEventListener('submit', async (event) => {
   const attachmentPayload = getPendingChatAttachmentsPayload();
   const attachmentDisplay = getPendingChatAttachmentsForDisplay();
   if ((!raw.trim() && attachmentPayload.length === 0) || !modelReady) return;
+  noteChatViewChange();
   let text = raw.replace(/\s+$/, '');
   if (!text.trim() && attachmentPayload.length > 0) {
     await syncActiveEnginePipelineTag();
@@ -1025,116 +1446,29 @@ formEl.addEventListener('submit', async (event) => {
   messagesEl.appendChild(container);
   scrollMessagesToBottomAfterRender();
 
-  const { renderFormattedMessage, parseTagsAndAnswer, createTagStreamParser } = window.Glaux.ThinkingParse;
-
-  let streamed = '';
-  let streamParser = null;
-  let streamStartsInThinking = false;
-  const ensureStreamParser = () => {
-    if (!streamParser) {
-      streamParser = createTagStreamParser(thoughtsContent, answerContent, details, {
-        startInThinking: streamStartsInThinking,
-      });
-    }
-  };
-  try {
-    const stream = window.api.sendMessageStream(text, {
-      enableThinking,
-      resubmit,
-      files,
-      onImages: (images) => {
-        appendAttachmentChips(container, images);
-        scrollMessagesToBottomAfterRender();
-      },
-      onStarted: (meta) => {
-        streamStartsInThinking = Boolean(meta && meta.startsInThinking);
-        ensureStreamParser();
-      },
-      onToken: (chunk) => {
-        ensureStreamParser();
-        streamed += chunk;
-        streamParser(chunk);
-      },
-      onSnapshot: (text) => {
-        // ASR (and similar) send full hypothesis snapshots; replace the bubble
-        // instead of appending so rewrites do not loop and progress continues.
-        streamParser = null;
-        streamed = typeof text === 'string' ? text : '';
-        details.style.display = 'none';
-        thoughtsContent.textContent = '';
-        answerContent.textContent = '';
-        renderFormattedMessage(answerContent, streamed);
-        scrollMessagesToBottomAfterRender();
-      },
-    });
-    activeStream = stream;
-    setBusy(true);
-    const response = await stream.completion;
-    if (streamParser) {
-      streamParser.flush();
-    }
-    // If streamed chunks drifted from the authoritative final (e.g. ASR
-    // hypothesis rewrites), replace the live answer with the final text.
-    if (typeof response === 'string' && response !== streamed) {
-      const { thinking, answer } = parseTagsAndAnswer(response);
-      if (thinking) {
-        details.style.display = '';
-        thoughtsContent.textContent = '';
-        renderFormattedMessage(thoughtsContent, thinking);
-      }
-      answerContent.textContent = '';
-      renderFormattedMessage(answerContent, answer || response);
-      streamed = response;
-    }
-    container.classList.remove('thinking');
-  } catch (err) {
-    const canceled = isGenerationCanceledError(err);
-    if (canceled) {
-      const stopMarker = '[STOP]';
-      const afterFlush =
-        streamParser && typeof streamParser.flush === 'function'
-          ? streamParser.flush()
-          : { state: 'detect' };
-      const endState = afterFlush && afterFlush.state;
-
-      if (endState === 'thinking') {
-        // flush() already committed partial thinking to the thoughts panel; only show [STOP] in the answer.
-        details.style.display = '';
-        answerContent.textContent = '';
-        renderFormattedMessage(answerContent, stopMarker);
-      } else if (endState === 'answering') {
-        const body = (afterFlush && afterFlush.answer) || answerContent.textContent || '';
-        answerContent.textContent = '';
-        renderFormattedMessage(answerContent, body ? `${body}\n\n${stopMarker}` : stopMarker);
-      } else {
-        const fullText = streamed ? `${streamed}\n\n${stopMarker}` : stopMarker;
-        const { thinking, answer } = parseTagsAndAnswer(fullText);
-        if (thinking) {
-          details.style.display = '';
-          thoughtsContent.textContent = '';
-          renderFormattedMessage(thoughtsContent, thinking);
-        }
-        answerContent.textContent = '';
-        renderFormattedMessage(answerContent, answer);
-      }
-      container.classList.remove('thinking');
-      markStoppedTurn(container, userMessageEl);
-    } else {
-      answerContent.textContent = '';
-      renderFormattedMessage(answerContent, t('chat.errorPrefix', { message: err.message || String(err) }));
-      container.classList.remove('thinking');
-      markFailedTurn(container, userMessageEl);
-    }
-  } finally {
-    activeStream = null;
-    setBusy(false);
-    scrollMessagesToBottom();
-    void refreshSessionsList();
-    void updateContextUsageIndicator();
-  }
+  watchAssistantStream({
+    container,
+    details,
+    thoughtsContent,
+    answerContent,
+    userMessageEl,
+    openStream: (handlers) =>
+      window.api.sendMessageStream(text, {
+        enableThinking,
+        resubmit,
+        files,
+        onImages: handlers.onImages,
+        onStarted: handlers.onStarted,
+        onToken: handlers.onToken,
+        onSnapshot: handlers.onSnapshot,
+      }),
+  });
 });
 
 sendButtonEl.addEventListener('click', () => {
+  if (chatRestorePending) {
+    return;
+  }
   if (activeStream) {
     stopActiveGeneration();
     return;
@@ -1149,7 +1483,7 @@ sendButtonEl.addEventListener('click', () => {
 inputEl.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    if (activeStream) {
+    if (chatRestorePending || activeStream) {
       return;
     }
     if (typeof formEl.requestSubmit === 'function') {
@@ -1225,6 +1559,54 @@ function setLoadingStatusMessage(text) {
   }, ENGINE_STATUS_CLEAR_MS);
 }
 
+let reconcileRestoredGenerationInFlight = false;
+
+/**
+ * A language-switch reload keeps the run in the main process. If its terminal
+ * event never reaches this page, the restored watcher stays busy and session
+ * rows ignore clicks. When the run is gone, paint the finished transcript and
+ * release that lock.
+ */
+async function reconcileRestoredGeneration() {
+  if (!activeStream || !activeStream.restored || reconcileRestoredGenerationInFlight) {
+    return;
+  }
+  const stream = activeStream;
+  reconcileRestoredGenerationInFlight = true;
+  try {
+    if (!(window.api && typeof window.api.getChatRestoreState === 'function')) {
+      return;
+    }
+    const snap = await window.api.getChatRestoreState();
+    if (activeStream !== stream) {
+      return;
+    }
+    if (snap && snap.stream && String(snap.stream.requestId) === String(stream.requestId)) {
+      if (typeof snap.stream.text === 'string' && typeof stream.applyText === 'function') {
+        stream.applyText(snap.stream.text);
+      }
+      return;
+    }
+    stream.abandonDom = true;
+    const messages = snap && Array.isArray(snap.messages) ? snap.messages : [];
+    clearChatMessages();
+    rebuildChatFromContext(messages);
+    activeSessionName = snap && snap.sessionName ? snap.sessionName : null;
+    if (typeof renderSessionsList === 'function') {
+      renderSessionsList();
+    }
+    scrollMessagesToBottomAfterRender();
+    void updateContextUsageIndicator({ refresh: true });
+    if (typeof stream.complete === 'function') {
+      stream.complete('');
+    }
+  } catch {
+    /* the next status poll tries again */
+  } finally {
+    reconcileRestoredGenerationInFlight = false;
+  }
+}
+
 async function pollStatus() {
   if (!(window.api && typeof window.api.getStatus === 'function')) {
     return;
@@ -1239,6 +1621,9 @@ async function pollStatus() {
     setEngineLoading(status.phase === 'loading');
     const isReady = Boolean(status.ready);
     setReady(isReady);
+    if (activeStream && activeStream.restored) {
+      void reconcileRestoredGeneration();
+    }
     const stableSignature = JSON.stringify({
       ready: isReady,
       modelPath: status.modelPath,
@@ -1273,4 +1658,8 @@ function reportEngineLoadError(message) {
 function showNoModelLoadedMessage() {
   modelProgressHeading = t('chat.noModelLoadedHeading');
   setLoadingStatusMessage(t('chat.noModelLoadedBody'));
+}
+
+if (chatRestorePending) {
+  void restoreChatAfterReload();
 }

@@ -202,6 +202,35 @@ contextBridge.exposeInMainWorld('api', {
       },
     };
   },
+  cancelStream: (requestId) => {
+    const id = requestId ? String(requestId) : '';
+    if (!id) {
+      return;
+    }
+    ipcRenderer.send('engine:streamCancel', { requestId: id });
+    void ipcRenderer.invoke('engine:cancel');
+  },
+  onEngineStreamEvent: (callback) => {
+    if (typeof callback !== 'function') {
+      return () => {};
+    }
+    const listener = (_event, payload) => {
+      callback(payload);
+    };
+    ipcRenderer.on('engine:streamEvent', listener);
+    return () => ipcRenderer.removeListener('engine:streamEvent', listener);
+  },
+  getChatRestoreState: async () => {
+    const result = await ipcRenderer.invoke('engine:getChatRestoreState');
+    if (!result.ok) {
+      throw toStructuredRendererError(result, tf('preload.unknownStreamError', 'Unknown stream error'));
+    }
+    return {
+      sessionName: result.sessionName ?? null,
+      messages: Array.isArray(result.messages) ? result.messages : [],
+      stream: result.stream && typeof result.stream === 'object' ? result.stream : null,
+    };
+  },
   getStatus: async () => {
     const result = await ipcRenderer.invoke('engine:getStatus');
     if (!result.ok) {

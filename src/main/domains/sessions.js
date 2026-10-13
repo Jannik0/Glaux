@@ -245,6 +245,17 @@ function getPendingSessionFilename() {
 }
 
 /**
+ * Saved transcript for the active session, without touching engine context.
+ * @returns {Promise<Array<object>>}
+ */
+async function readActiveSessionFile() {
+  if (!state.activeSessionFilename) {
+    return [];
+  }
+  return readSessionFile(state.activeSessionFilename);
+}
+
+/**
  * @param {{ contextClear?: () => Promise<void> }} [deps]
  */
 async function startNewSession(deps = {}) {
@@ -512,6 +523,7 @@ module.exports = {
   reserveActiveSessionFilename,
   clearPendingSessionFilename,
   getPendingSessionFilename,
+  readActiveSessionFile,
   startNewSession,
   loadSession,
   trashNamedSession,

@@ -13,6 +13,7 @@ const {
   persistActiveSession,
   reserveActiveSessionFilename,
   clearPendingSessionFilename,
+  readActiveSessionFile,
 } = require('./sessions');
 const { allocateSessionImagePath, releaseSessionImagePath } = require('../sessionImages');
 const { isDiffusionPipelineTag } = require('../../../engines/common/resolveEngineId');
@@ -284,6 +285,91 @@ function parseInferenceRequest(payload) {
   throw new Error(t('errors.engineBridge.invalidInferencePayload'));
 }
 
+/**
+ * @param {{ seq?: number } | null | undefined} streamState
+ * @param {object} payload
+ * @returns {object}
+ */
+function stampStreamEvent(streamState, payload) {
+  if (!streamState) {
+    return payload;
+  }
+  streamState.seq = (streamState.seq || 0) + 1;
+  return { ...payload, seq: streamState.seq };
+}
+
+/**
+ * @param {string} requestId
+ * @param {{ text?: string, seq?: number, startsInThinking?: boolean, userText?: string, userFiles?: Array<object> }} streamState
+ * @param {boolean} userPending
+ */
+function describeStreamState(requestId, streamState, userPending) {
+  return {
+    requestId,
+    text: typeof streamState.text === 'string' ? streamState.text : '',
+    startsInThinking: Boolean(streamState.startsInThinking),
+    seq: streamState.seq || 0,
+    userPending: Boolean(userPending),
+    userText: userPending && typeof streamState.userText === 'string' ? streamState.userText : '',
+    userFiles: userPending && Array.isArray(streamState.userFiles) ? streamState.userFiles : [],
+  };
+}
+
+/**
+ * The generation a language-switch reload should paint. A committed turn is
+ * already in context, so it is not reported here.
+ * @returns {object | null}
+ */
+function activeStreamSnapshot() {
+  /** @type {object | null} */
+  let preparing = null;
+  for (const [requestId, streamState] of state.activeStreamRequests) {
+    if (!streamState || streamState.canceled || streamState.committed) {
+      continue;
+    }
+    const pending = engineManager.streamRunUserPending(requestId);
+    if (pending == null) {
+      preparing = describeStreamState(requestId, streamState, true);
+      continue;
+    }
+    return describeStreamState(requestId, streamState, pending);
+  }
+  return preparing;
+}
+
+/**
+ * Transcript plus any in-flight generation. Context is the live transcript;
+ * the session file fills in only when context is still empty.
+ * @returns {Promise<{ sessionName: string | null, messages: Array<object>, stream: object | null }>}
+ */
+async function readChatRestoreState() {
+  let messages = await engineManager.contextSnapshot();
+  let stream = activeStreamSnapshot();
+  if (!stream) {
+    messages = await engineManager.contextSnapshot();
+    stream = activeStreamSnapshot();
+  }
+  if (
+    (!Array.isArray(messages) || messages.length === 0) &&
+    state.activeSessionFilename &&
+    !stream
+  ) {
+    try {
+      const stored = await readActiveSessionFile();
+      if (Array.isArray(stored) && stored.length > 0) {
+        messages = stored;
+      }
+    } catch {
+      /* unsaved, or the workspace path is not ready */
+    }
+  }
+  return {
+    sessionName: state.activeSessionFilename,
+    messages: Array.isArray(messages) ? messages : [],
+    stream,
+  };
+}
+
 function handleEngineStreamStart(event, payload) {
   if (!payload || typeof payload !== 'object') {
     return Promise.resolve();
@@ -323,7 +409,18 @@ function handleEngineStreamStart(event, payload) {
     return Promise.resolve();
   }
 
-  const streamState = { canceled: false, sender, timeoutHandle: null, keepaliveHandle: null };
+  const streamState = {
+    canceled: false,
+    committed: false,
+    sender,
+    timeoutHandle: null,
+    keepaliveHandle: null,
+    text: '',
+    seq: 0,
+    startsInThinking: false,
+    userText: message,
+    userFiles: files,
+  };
   state.activeStreamRequests.set(requestId, streamState);
 
   function onSenderDestroyed() {
@@ -371,7 +468,8 @@ function handleEngineStreamStart(event, payload) {
       cleanupStream();
       return;
     }
-    emitStreamEvent(sender, { requestId, type: 'started', startsInThinking });
+    streamState.startsInThinking = startsInThinking;
+    emitStreamEvent(sender, stampStreamEvent(streamState, { requestId, type: 'started', startsInThinking }));
 
     let streamedAnyChunk = false;
     let rejectTimeout;
@@ -407,7 +505,16 @@ function handleEngineStreamStart(event, payload) {
           }
           if (typeof chunk === 'string' && chunk.length > 0) {
             streamedAnyChunk = true;
-            emitStreamEvent(sender, { requestId, type: 'chunk', chunk });
+            streamState.text = `${streamState.text || ''}${chunk}`;
+            emitStreamEvent(
+              sender,
+              stampStreamEvent(streamState, {
+                requestId,
+                type: 'chunk',
+                chunk,
+                text: streamState.text,
+              })
+            );
             resetTimeout();
           }
         },
@@ -417,9 +524,16 @@ function handleEngineStreamStart(event, payload) {
           }
           if (typeof text === 'string') {
             streamedAnyChunk = true;
-            emitStreamEvent(sender, { requestId, type: 'snapshot', text });
+            streamState.text = text;
+            emitStreamEvent(
+              sender,
+              stampStreamEvent(streamState, { requestId, type: 'snapshot', text })
+            );
             resetTimeout();
           }
+        },
+        onSettle: () => {
+          streamState.committed = true;
         },
       });
       streamState.keepaliveHandle = setInterval(() => {
@@ -436,28 +550,41 @@ function handleEngineStreamStart(event, payload) {
       ]);
 
       if (streamState.canceled) {
-        emitStreamEvent(sender, { requestId, type: 'canceled' });
+        emitStreamEvent(sender, stampStreamEvent(streamState, { requestId, type: 'canceled' }));
         await persistTurnSession('Failed to persist session after canceled chat turn:');
         return;
       }
 
       const split = splitPromptResult(response);
       if (!streamedAnyChunk && split.text.length > 0) {
-        emitStreamEvent(sender, { requestId, type: 'chunk', chunk: split.text });
+        streamState.text = `${streamState.text || ''}${split.text}`;
+        emitStreamEvent(
+          sender,
+          stampStreamEvent(streamState, {
+            requestId,
+            type: 'chunk',
+            chunk: split.text,
+            text: streamState.text,
+          })
+        );
       }
-      emitStreamEvent(sender, {
-        requestId,
-        type: 'done',
-        response: split.text,
-        images: split.images,
-      });
+      emitStreamEvent(
+        sender,
+        stampStreamEvent(streamState, {
+          requestId,
+          type: 'done',
+          response: split.text,
+          images: split.images,
+        })
+      );
       await persistTurnSession('Failed to persist session after chat turn:');
     } catch (err) {
+      streamState.committed = true;
       if (sendPromptPromise) {
         sendPromptPromise.catch(() => {});
       }
       if (streamState.canceled) {
-        emitStreamEvent(sender, { requestId, type: 'canceled' });
+        emitStreamEvent(sender, stampStreamEvent(streamState, { requestId, type: 'canceled' }));
         await persistTurnSession('Failed to persist session after canceled chat turn:');
         return;
       }
@@ -475,7 +602,7 @@ function handleEngineStreamStart(event, payload) {
         clearPendingSessionFilename();
       }
       const errorInfo = toStructuredError(err, 'E_INFERENCE');
-      emitStreamEvent(sender, { requestId, type: 'error', errorInfo });
+      emitStreamEvent(sender, stampStreamEvent(streamState, { requestId, type: 'error', errorInfo }));
     } finally {
       releaseSessionImagePath(outputPath, reservationId);
       cleanupStream();
@@ -617,6 +744,14 @@ function registerEngineBridgeIpc() {
   });
 
   ipcMain.handle('engine:cancel', async () => handleEngineCancel());
+
+  ipcMain.handle('engine:getChatRestoreState', async () => {
+    try {
+      return ok(await readChatRestoreState());
+    } catch (err) {
+      return fail(err, 'E_RESTORE');
+    }
+  });
 }
 
 engineManager.setDiffusersKillRecovery(() =>
@@ -629,6 +764,7 @@ module.exports = {
   handleEngineSendMessage,
   handleEngineStreamStart,
   handleEngineCancel,
+  readChatRestoreState,
   cancelStreamRequest,
   requestWorkerReload,
 };

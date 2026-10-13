@@ -176,11 +176,21 @@ function renderSessionsList() {
 }
 
 async function loadSession(sessionName) {
+  if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
+    return;
+  }
   if (activeStream || engineBusy || engineLoading) {
     return;
   }
-  if (sessionName === activeSessionName) {
+  if (
+    sessionName === activeSessionName &&
+    typeof chatTranscriptVisible === 'function' &&
+    chatTranscriptVisible()
+  ) {
     return;
+  }
+  if (typeof noteChatViewChange === 'function') {
+    noteChatViewChange();
   }
   if (!(window.api && window.api.sessions && typeof window.api.sessions.load === 'function')) {
     return;
@@ -203,8 +213,14 @@ async function loadSession(sessionName) {
 }
 
 async function startNewSession() {
+  if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
+    return;
+  }
   if (activeStream || engineBusy || engineLoading) {
     return;
+  }
+  if (typeof noteChatViewChange === 'function') {
+    noteChatViewChange();
   }
   if (!(window.api && window.api.sessions && typeof window.api.sessions.new === 'function')) {
     return;
@@ -229,6 +245,9 @@ async function startNewSession() {
 }
 
 async function trashSession(sessionName) {
+  if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
+    return;
+  }
   if (engineBusy || engineLoading || activeStream) {
     return;
   }
