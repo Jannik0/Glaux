@@ -303,15 +303,17 @@ function stampStreamEvent(streamState, payload) {
  * @param {{ text?: string, seq?: number, startsInThinking?: boolean, userText?: string, userFiles?: Array<object> }} streamState
  * @param {boolean} userPending
  */
-function describeStreamState(requestId, streamState, userPending) {
+function describeStreamState(requestId, streamState, userPending, settling = false) {
+  const pending = Boolean(userPending) && !settling;
   return {
     requestId,
     text: typeof streamState.text === 'string' ? streamState.text : '',
     startsInThinking: Boolean(streamState.startsInThinking),
     seq: streamState.seq || 0,
-    userPending: Boolean(userPending),
-    userText: userPending && typeof streamState.userText === 'string' ? streamState.userText : '',
-    userFiles: userPending && Array.isArray(streamState.userFiles) ? streamState.userFiles : [],
+    userPending: pending,
+    userText: pending && typeof streamState.userText === 'string' ? streamState.userText : '',
+    userFiles: pending && Array.isArray(streamState.userFiles) ? streamState.userFiles : [],
+    settling: Boolean(settling),
   };
 }
 
@@ -323,18 +325,30 @@ function describeStreamState(requestId, streamState, userPending) {
 function activeStreamSnapshot() {
   /** @type {object | null} */
   let preparing = null;
+  /** @type {object | null} */
+  let settling = null;
   for (const [requestId, streamState] of state.activeStreamRequests) {
-    if (!streamState || streamState.canceled || streamState.committed) {
+    if (!streamState) {
+      continue;
+    }
+    // Stop seals the marker and clears generationInFlight immediately, then
+    // persistTurnSession still has to write that turn. Hold a settling entry
+    // (user already in context, no second assistant bubble) until committed.
+    if (streamState.canceled && !streamState.committed) {
+      settling = describeStreamState(requestId, streamState, false, true);
+      continue;
+    }
+    if (streamState.canceled || streamState.committed) {
       continue;
     }
     const pending = engineManager.streamRunUserPending(requestId);
     if (pending == null) {
-      preparing = describeStreamState(requestId, streamState, true);
+      preparing = describeStreamState(requestId, streamState, true, false);
       continue;
     }
-    return describeStreamState(requestId, streamState, pending);
+    return describeStreamState(requestId, streamState, pending, false);
   }
-  return preparing;
+  return preparing || settling;
 }
 
 /**
@@ -357,7 +371,8 @@ async function readChatRestoreState() {
     try {
       const stored = await readActiveSessionFile();
       if (Array.isArray(stored) && stored.length > 0) {
-        messages = stored;
+        await engineManager.contextReplace(stored);
+        messages = await engineManager.contextSnapshot();
       }
     } catch {
       /* unsaved, or the workspace path is not ready */
@@ -533,7 +548,9 @@ function handleEngineStreamStart(event, payload) {
           }
         },
         onSettle: () => {
-          streamState.committed = true;
+          if (!streamState.canceled) {
+            streamState.committed = true;
+          }
         },
       });
       streamState.keepaliveHandle = setInterval(() => {
@@ -552,6 +569,7 @@ function handleEngineStreamStart(event, payload) {
       if (streamState.canceled) {
         emitStreamEvent(sender, stampStreamEvent(streamState, { requestId, type: 'canceled' }));
         await persistTurnSession('Failed to persist session after canceled chat turn:');
+        streamState.committed = true;
         return;
       }
 
@@ -579,15 +597,16 @@ function handleEngineStreamStart(event, payload) {
       );
       await persistTurnSession('Failed to persist session after chat turn:');
     } catch (err) {
-      streamState.committed = true;
       if (sendPromptPromise) {
         sendPromptPromise.catch(() => {});
       }
       if (streamState.canceled) {
         emitStreamEvent(sender, stampStreamEvent(streamState, { requestId, type: 'canceled' }));
         await persistTurnSession('Failed to persist session after canceled chat turn:');
+        streamState.committed = true;
         return;
       }
+      streamState.committed = true;
       const isStreamIdleTimeout =
         (err && err.code === 'E_TIMEOUT') ||
         /stream timed out/i.test(String(err && err.message ? err.message : err));

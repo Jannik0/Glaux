@@ -35,7 +35,12 @@ let chatContextTargetIndex = -1;
 let chatRestorePending = Boolean(
   window.api && typeof window.api.getChatRestoreState === 'function'
 );
+/** Set when the reload snapshot could not be read, so a blank transcript can be recovered without treating every empty session click as a reload. */
+let chatRestoreFailed = false;
 let chatViewEpoch = 0;
+
+/** Survives win.reload() on this origin. Draft, unsent chips, and scroll live only in the page. */
+const CHAT_COMPOSER_STORAGE_KEY = 'glaux.chatComposer';
 
 function noteChatViewChange() {
   chatViewEpoch += 1;
@@ -735,7 +740,7 @@ function appendMessage(role, text, files = []) {
 function updateSendButton() {
   const iconEl = sendButtonEl.querySelector('.icon');
   const labelEl = sendButtonEl.querySelector('.icon + span');
-  if (engineBusy && activeStream) {
+  if ((engineBusy && activeStream) || chatRestorePending) {
     sendButtonEl.disabled = false;
     if (iconEl) iconEl.textContent = '\u25A0';
     if (labelEl) labelEl.textContent = t('chat.stop');
@@ -1067,6 +1072,12 @@ function watchAssistantStream(opts) {
     },
     onFullText: (full) => {
       const next = typeof full === 'string' ? full : '';
+      // A status poll can deliver a snapshot taken before the latest token.
+      // Replacing with that shorter text rewinds the bubble, and the newer
+      // seq will not be applied again.
+      if (next.length < streamed.length) {
+        return false;
+      }
       if (streamParser && next.startsWith(streamed)) {
         const delta = next.slice(streamed.length);
         streamed = next;
@@ -1233,6 +1244,144 @@ function streamErrorFromPayload(payload) {
   return error;
 }
 
+function saveChatComposerForReload() {
+  if (typeof sessionStorage === 'undefined') {
+    return;
+  }
+  const draft = inputEl ? String(inputEl.value || '') : '';
+  const attachments = pendingChatAttachments.map((file) => ({
+    source: file.source === 'outputs' ? 'outputs' : 'resources',
+    relativePath: file.relativePath,
+    name: file.name,
+  }));
+  const scrollTop = messagesEl ? Number(messagesEl.scrollTop) || 0 : 0;
+  try {
+    sessionStorage.setItem(
+      CHAT_COMPOSER_STORAGE_KEY,
+      JSON.stringify({ draft, attachments, scrollTop })
+    );
+  } catch {
+    /* private mode or quota */
+  }
+}
+
+/**
+ * @param {boolean} restoreScroll Saved scroll applies when nothing is still streaming.
+ * @returns {boolean} True when a saved scroll offset was applied.
+ */
+function restoreChatComposerAfterReload(restoreScroll) {
+  if (typeof sessionStorage === 'undefined') {
+    return false;
+  }
+  let saved = null;
+  try {
+    const raw = sessionStorage.getItem(CHAT_COMPOSER_STORAGE_KEY);
+    sessionStorage.removeItem(CHAT_COMPOSER_STORAGE_KEY);
+    if (raw) {
+      saved = JSON.parse(raw);
+    }
+  } catch {
+    saved = null;
+  }
+  if (!saved || typeof saved !== 'object') {
+    return false;
+  }
+  if (inputEl && typeof saved.draft === 'string') {
+    inputEl.value = saved.draft;
+    updateMessageInputHighlight();
+  }
+  if (Array.isArray(saved.attachments)) {
+    pendingChatAttachments = [];
+    for (const file of saved.attachments) {
+      if (!file || typeof file.relativePath !== 'string' || !file.relativePath) {
+        continue;
+      }
+      pendingChatAttachments.push({
+        source: file.source === 'outputs' ? 'outputs' : 'resources',
+        relativePath: file.relativePath,
+        name:
+          typeof file.name === 'string' && file.name
+            ? file.name
+            : fileNameFromPath(file.relativePath),
+      });
+    }
+    renderChatAttachments();
+  }
+  if (restoreScroll && messagesEl && Number.isFinite(Number(saved.scrollTop))) {
+    messagesEl.scrollTop = Number(saved.scrollTop);
+    return true;
+  }
+  return false;
+}
+
+function sessionsListReady() {
+  return typeof sessionsListLoaded !== 'undefined' && sessionsListLoaded;
+}
+
+/**
+ * Stop has already sealed the turn into context. Keep the busy lock until
+ * persist finishes, without painting a second assistant bubble.
+ * @param {object} streamInfo
+ * @param {{ unsubscribe: () => void, buffered: Array<object>, setLive: (fn: (payload: object) => void) => void }} hooks
+ */
+function holdSettlingStream(streamInfo, hooks) {
+  const requestId = String(streamInfo.requestId);
+  let settled = false;
+  let resolveCompletion;
+  const completion = new Promise((resolve) => {
+    resolveCompletion = resolve;
+  });
+  const finish = (response) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    resolveCompletion(response || '');
+  };
+  activeStream = {
+    requestId,
+    restored: true,
+    settling: true,
+    completion,
+    applyText() {},
+    complete: (response) => finish(response),
+    cancel: () => {
+      if (settled) {
+        return;
+      }
+      if (window.api && typeof window.api.cancelStream === 'function') {
+        window.api.cancelStream(requestId);
+      }
+    },
+  };
+  setBusy(true);
+  const live = (payload) => {
+    if (!payload || payload.requestId !== requestId || settled) {
+      return;
+    }
+    if (payload.type === 'canceled' || payload.type === 'done' || payload.type === 'error') {
+      void reconcileRestoredGeneration();
+    }
+  };
+  hooks.setLive(live);
+  for (const payload of hooks.buffered.splice(0, hooks.buffered.length)) {
+    live(payload);
+  }
+  void (async () => {
+    try {
+      await completion;
+    } finally {
+      if (activeStream && activeStream.requestId === requestId) {
+        activeStream = null;
+        setBusy(false);
+      }
+      hooks.unsubscribe();
+      void refreshSessionsList();
+      void updateContextUsageIndicator();
+    }
+  })();
+}
+
 /**
  * Language switches reload this page. The main process keeps the session and
  * any in-flight generation; paint both again, the same way model downloads are
@@ -1258,6 +1407,7 @@ async function restoreChatAfterReload() {
   }
 
   const epoch = chatViewEpoch;
+  let restoreScroll = true;
   try {
     if (!(window.api && typeof window.api.getChatRestoreState === 'function')) {
       return;
@@ -1266,17 +1416,20 @@ async function restoreChatAfterReload() {
     try {
       snap = await window.api.getChatRestoreState();
     } catch {
+      chatRestoreFailed = true;
       return;
     }
     if (epoch !== chatViewEpoch) {
       return;
     }
     if (!snap) {
+      chatRestoreFailed = true;
       return;
     }
+    chatRestoreFailed = false;
 
     activeSessionName = snap.sessionName || null;
-    if (typeof renderSessionsList === 'function') {
+    if (sessionsListReady() && typeof renderSessionsList === 'function') {
       renderSessionsList();
     }
 
@@ -1290,10 +1443,24 @@ async function restoreChatAfterReload() {
     rebuildChatFromContext(messages);
 
     if (!streamInfo || !streamInfo.requestId) {
-      scrollMessagesToBottomAfterRender();
       void updateContextUsageIndicator({ refresh: true });
       return;
     }
+
+    if (streamInfo.settling) {
+      modelReady = true;
+      handedOff = true;
+      holdSettlingStream(streamInfo, {
+        unsubscribe,
+        buffered,
+        setLive: (fn) => {
+          live = fn;
+        },
+      });
+      return;
+    }
+
+    restoreScroll = false;
 
     if (streamInfo.userPending) {
       appendMessage(
@@ -1386,9 +1553,19 @@ async function restoreChatAfterReload() {
           requestId,
           restored: true,
           completion,
-          applyText: (text) => {
-            if (!settled) {
-              handlers.onFullText(text);
+          applyText: (text, seq) => {
+            if (settled) {
+              return;
+            }
+            const next = typeof text === 'string' ? text : '';
+            if (typeof seq === 'number' && seq < applied.seq) {
+              return;
+            }
+            if (handlers.onFullText(next) === false) {
+              return;
+            }
+            if (typeof seq === 'number' && seq > applied.seq) {
+              applied.seq = seq;
             }
           },
           complete: (response) => finish(response),
@@ -1402,10 +1579,24 @@ async function restoreChatAfterReload() {
       },
     });
   } finally {
+    const aborted = epoch !== chatViewEpoch;
     chatRestorePending = false;
+    if (!aborted) {
+      const appliedScroll = restoreChatComposerAfterReload(restoreScroll);
+      if (restoreScroll && !appliedScroll) {
+        scrollMessagesToBottomAfterRender();
+      }
+    } else {
+      try {
+        sessionStorage.removeItem(CHAT_COMPOSER_STORAGE_KEY);
+      } catch {
+        /* ignore */
+      }
+    }
     if (!handedOff) {
       unsubscribe();
     }
+    updateSendButton();
   }
 }
 
@@ -1467,6 +1658,11 @@ formEl.addEventListener('submit', async (event) => {
 
 sendButtonEl.addEventListener('click', () => {
   if (chatRestorePending) {
+    if (activeStream) {
+      stopActiveGeneration();
+    } else if (window.api && typeof window.api.cancelGeneration === 'function') {
+      void window.api.cancelGeneration();
+    }
     return;
   }
   if (activeStream) {
@@ -1583,7 +1779,7 @@ async function reconcileRestoredGeneration() {
     }
     if (snap && snap.stream && String(snap.stream.requestId) === String(stream.requestId)) {
       if (typeof snap.stream.text === 'string' && typeof stream.applyText === 'function') {
-        stream.applyText(snap.stream.text);
+        stream.applyText(snap.stream.text, snap.stream.seq);
       }
       return;
     }
@@ -1592,7 +1788,7 @@ async function reconcileRestoredGeneration() {
     clearChatMessages();
     rebuildChatFromContext(messages);
     activeSessionName = snap && snap.sessionName ? snap.sessionName : null;
-    if (typeof renderSessionsList === 'function') {
+    if (sessionsListReady() && typeof renderSessionsList === 'function') {
       renderSessionsList();
     }
     scrollMessagesToBottomAfterRender();

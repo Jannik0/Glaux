@@ -210,6 +210,7 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.send('engine:streamCancel', { requestId: id });
     void ipcRenderer.invoke('engine:cancel');
   },
+  cancelGeneration: () => ipcRenderer.invoke('engine:cancel'),
   onEngineStreamEvent: (callback) => {
     if (typeof callback !== 'function') {
       return () => {};

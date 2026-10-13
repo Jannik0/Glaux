@@ -213,6 +213,9 @@ function initializeLanguageSelect() {
     if (!next || next === i18n.language) {
       return;
     }
+    if (typeof saveChatComposerForReload === 'function') {
+      saveChatComposerForReload();
+    }
     if (window.api && typeof window.api.updatePreferences === 'function') {
       void window.api.updatePreferences({ language: next });
     }
