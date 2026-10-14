@@ -14,6 +14,8 @@ const sessionsStatusEl = document.getElementById('sessions-status');
 let activeSessionName = null;
 /** @type {Array<{ name: string, displayName: string }>} */
 let sessionsList = [];
+/** True after the first successful list fetch, so a restore does not paint the empty placeholder first. */
+let sessionsListLoaded = false;
 /** @type {string | null} */
 let sessionsEditingName = null;
 /** Prevents duplicate rename commits (e.g. Enter then blur). */
@@ -23,8 +25,17 @@ function setSessionsStatus(message, isError = false) {
   window.Glaux.Status.setTimedPanelStatus(sessionsStatusEl, 'sessions', message, isError, 'error');
 }
 
+function sessionsActionsBlocked() {
+  return (
+    engineBusy ||
+    engineLoading ||
+    Boolean(activeStream) ||
+    (typeof chatRestorePending !== 'undefined' && chatRestorePending)
+  );
+}
+
 function syncSessionsPanelDisabled() {
-  const dis = engineBusy || engineLoading || Boolean(activeStream);
+  const dis = sessionsActionsBlocked();
   if (sessionsNewEl) {
     sessionsNewEl.disabled = dis;
   }
@@ -59,6 +70,7 @@ async function refreshSessionsList() {
       activeSessionName = await window.api.sessions.getActive();
     }
     sessionsList = await window.api.sessions.list();
+    sessionsListLoaded = true;
     renderSessionsList();
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
@@ -176,11 +188,17 @@ function renderSessionsList() {
 }
 
 async function loadSession(sessionName) {
+  if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
+    return;
+  }
   if (activeStream || engineBusy || engineLoading) {
     return;
   }
   if (sessionName === activeSessionName) {
     return;
+  }
+  if (typeof noteChatViewChange === 'function') {
+    noteChatViewChange();
   }
   if (!(window.api && window.api.sessions && typeof window.api.sessions.load === 'function')) {
     return;
@@ -189,7 +207,6 @@ async function loadSession(sessionName) {
     const { messages, sessionName: loadedName } = await window.api.sessions.load(sessionName);
     activeSessionName = loadedName;
     clearChatMessages();
-    clearChatAttachments();
     rebuildChatFromContext(messages);
     scrollMessagesToBottomAfterRender();
     void updateContextUsageIndicator({ refresh: true });
@@ -202,9 +219,55 @@ async function loadSession(sessionName) {
   }
 }
 
-async function startNewSession() {
+/**
+ * A failed reload can leave the active session highlighted and the transcript
+ * blank. Load that file in place. The composer draft and pending attachments
+ * stay, the same as switching sessions.
+ */
+async function recoverBlankTranscript() {
+  if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
+    return;
+  }
   if (activeStream || engineBusy || engineLoading) {
     return;
+  }
+  if (typeof chatTranscriptVisible === 'function' && chatTranscriptVisible()) {
+    return;
+  }
+  if (!activeSessionName) {
+    return;
+  }
+  if (!(window.api && window.api.sessions && typeof window.api.sessions.load === 'function')) {
+    return;
+  }
+  try {
+    const { messages, sessionName: loadedName } = await window.api.sessions.load(activeSessionName);
+    activeSessionName = loadedName;
+    clearChatMessages();
+    rebuildChatFromContext(messages);
+    scrollMessagesToBottomAfterRender();
+    void updateContextUsageIndicator({ refresh: true });
+    sessionsEditingName = null;
+    renderSessionsList();
+    setSessionsStatus('', false);
+    if (typeof chatRestoreFailed !== 'undefined') {
+      chatRestoreFailed = false;
+    }
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    setSessionsStatus(msg, true);
+  }
+}
+
+async function startNewSession() {
+  if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
+    return;
+  }
+  if (activeStream || engineBusy || engineLoading) {
+    return;
+  }
+  if (typeof noteChatViewChange === 'function') {
+    noteChatViewChange();
   }
   if (!(window.api && window.api.sessions && typeof window.api.sessions.new === 'function')) {
     return;
@@ -229,6 +292,9 @@ async function startNewSession() {
 }
 
 async function trashSession(sessionName) {
+  if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
+    return;
+  }
   if (engineBusy || engineLoading || activeStream) {
     return;
   }
@@ -248,7 +314,6 @@ async function trashSession(sessionName) {
     if (wasActive) {
       activeSessionName = null;
       clearChatMessages();
-      clearChatAttachments();
       void updateContextUsageIndicator({ refresh: true });
     }
     sessionsEditingName = null;
@@ -324,14 +389,25 @@ function initializeSessionsPanel() {
       return;
     }
     const main = e.target && /** @type {HTMLElement} */ (e.target).closest('.sessions-row-main');
-    if (!main || engineBusy || engineLoading || activeStream) {
+    if (!main || sessionsActionsBlocked()) {
       return;
     }
     const row = main.closest('.sessions-row');
     const name = row && row.getAttribute('data-session-name');
-    if (name) {
-      void loadSession(name);
+    if (!name) {
+      return;
     }
+    if (
+      name === activeSessionName &&
+      typeof chatRestoreFailed !== 'undefined' &&
+      chatRestoreFailed &&
+      typeof chatTranscriptVisible === 'function' &&
+      !chatTranscriptVisible()
+    ) {
+      void recoverBlankTranscript();
+      return;
+    }
+    void loadSession(name);
   });
 
   void refreshSessionsList();

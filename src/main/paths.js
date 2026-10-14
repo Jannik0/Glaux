@@ -31,7 +31,18 @@ let outputsRoot;
 let modelsRoot;
 let sessionsRoot;
 
-function initAppPaths() {
+/**
+ * @param {{ userDataRoot?: string }} [options] Skip Electron and use this directory as userData.
+ */
+function initAppPaths(options = {}) {
+  if (options && typeof options.userDataRoot === 'string' && options.userDataRoot) {
+    workspacesRoot = path.join(options.userDataRoot, 'Workspaces');
+    modelsRoot = path.join(options.userDataRoot, 'Models');
+    resourcesRoot = null;
+    outputsRoot = null;
+    sessionsRoot = null;
+    return;
+  }
   app.setName(APP_NAME);
   process.title = APP_NAME;
   app.setPath('userData', path.join(app.getPath('appData'), APP_NAME));

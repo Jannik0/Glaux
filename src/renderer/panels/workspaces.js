@@ -37,8 +37,18 @@ function validateWorkspaceNameInput(value, existingNames, allowName = null) {
   return null;
 }
 
+function workspaceActionsBlocked() {
+  return (
+    engineBusy ||
+    engineLoading ||
+    Boolean(activeStream) ||
+    workspaceSwitchInFlight ||
+    (typeof chatRestorePending !== 'undefined' && chatRestorePending)
+  );
+}
+
 function syncWorkspaceControlsDisabled() {
-  const dis = engineBusy || engineLoading || Boolean(activeStream) || workspaceSwitchInFlight;
+  const dis = workspaceActionsBlocked();
   if (workspaceSelectEl instanceof HTMLSelectElement) {
     workspaceSelectEl.disabled = dis;
   }
@@ -92,12 +102,32 @@ function renderWorkspaceSelect() {
  * active session when switching workspaces.
  */
 async function refreshPanelsForWorkspaceChange() {
-  if (window.api && window.api.sessions && typeof window.api.sessions.new === 'function') {
+  const canReset =
+    window.api && window.api.sessions && typeof window.api.sessions.new === 'function';
+  let resetSession = !canReset;
+  if (canReset) {
     try {
       await window.api.sessions.new();
+      resetSession = true;
     } catch (err) {
       console.error('Failed to reset session after workspace change:', err);
+      resetSession = false;
     }
+  }
+  if (!resetSession) {
+    if (typeof refreshSessionsList === 'function') {
+      await refreshSessionsList();
+    }
+    if (window.Glaux && window.Glaux.Resources && window.Glaux.Resources.panel) {
+      await window.Glaux.Resources.panel.refreshTree();
+    }
+    if (window.Glaux && window.Glaux.Outputs && window.Glaux.Outputs.panel) {
+      await window.Glaux.Outputs.panel.refreshTree();
+    }
+    return;
+  }
+  if (typeof noteChatViewChange === 'function') {
+    noteChatViewChange();
   }
   activeSessionName = null;
   if (typeof clearChatMessages === 'function') {
@@ -156,10 +186,7 @@ async function handleWorkspaceSelectChange() {
   if (
     !next ||
     next === activeWorkspaceName ||
-    workspaceSwitchInFlight ||
-    engineBusy ||
-    engineLoading ||
-    activeStream
+    workspaceActionsBlocked()
   ) {
     renderWorkspaceSelect();
     return;
@@ -198,13 +225,7 @@ async function promptRenameWorkspace(currentName) {
 }
 
 async function handleWorkspaceCreate() {
-  if (
-    workspaceSwitchInFlight ||
-    engineBusy ||
-    engineLoading ||
-    activeStream ||
-    !(window.api && window.api.workspaces)
-  ) {
+  if (workspaceActionsBlocked() || !(window.api && window.api.workspaces)) {
     return;
   }
   workspaceSwitchInFlight = true;
@@ -235,14 +256,7 @@ async function handleWorkspaceCreate() {
 }
 
 async function handleWorkspaceRename() {
-  if (
-    workspaceSwitchInFlight ||
-    engineBusy ||
-    engineLoading ||
-    activeStream ||
-    !activeWorkspaceName ||
-    !(window.api && window.api.workspaces)
-  ) {
+  if (workspaceActionsBlocked() || !activeWorkspaceName || !(window.api && window.api.workspaces)) {
     return;
   }
   const current = activeWorkspaceName;
@@ -270,10 +284,7 @@ async function handleWorkspaceRename() {
 
 async function handleWorkspaceTrash() {
   if (
-    workspaceSwitchInFlight ||
-    engineBusy ||
-    engineLoading ||
-    activeStream ||
+    workspaceActionsBlocked() ||
     !activeWorkspaceName ||
     workspaceNames.length <= 1 ||
     !(window.api && window.api.workspaces)
