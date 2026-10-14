@@ -1043,6 +1043,79 @@ describe('chat restore renderer', { concurrency: 1 }, () => {
     assert.equal(env.run('activeSessionName'), null);
   });
 
+  function sessionRowsDisabled() {
+    const list = env.ids.get('sessions-list');
+    const rows = list.querySelectorAll('.sessions-row');
+    const mains = list.querySelectorAll('.sessions-row-main');
+    const trashes = list.querySelectorAll('.sessions-trash');
+    return (
+      rows.length > 0 &&
+      rows.every((row) => row.classList.contains('is-disabled')) &&
+      mains.every((el) => el.getAttribute('aria-disabled') === 'true') &&
+      trashes.every((btn) => btn.disabled === true)
+    );
+  }
+
+  it('disables session rows during restore and keeps the composer when load or trash is blocked', async () => {
+    reset();
+    env.api._sessions = [
+      { name: 'chat.json', displayName: 'chat' },
+      { name: 'other.json', displayName: 'other' },
+    ];
+    env.api._active = 'chat.json';
+    await env.run('refreshSessionsList()');
+    assert.equal(sessionRowsDisabled(), false);
+    seedComposer();
+
+    let release;
+    env.api.getChatRestoreState = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    const pending = env.run('restoreChatAfterReload()');
+    assert.equal(env.run('chatRestorePending'), true);
+    assert.equal(sessionRowsDisabled(), true);
+    assert.equal(env.ids.get('sessions-new').disabled, true);
+
+    const loadsBefore = env.api._loads;
+    env.ids.get('sessions-list').querySelectorAll('.sessions-row-main')[1].click();
+    await env.run('loadSession("other.json")');
+    await env.run('trashSession("chat.json")');
+    assert.equal(env.api._loads, loadsBefore);
+    assert.equal(env.run('inputEl.value'), 'keep this');
+    assert.equal(env.run('pendingChatAttachments.length'), 1);
+    assert.equal(env.run('activeSessionName'), 'chat.json');
+
+    release({ sessionName: 'chat.json', messages: [], stream: null });
+    await pending;
+    assert.equal(env.run('chatRestorePending'), false);
+    assert.equal(sessionRowsDisabled(), false);
+    assert.equal(env.ids.get('sessions-new').disabled, false);
+    assert.equal(env.run('inputEl.value'), 'keep this');
+    assert.equal(env.run('pendingChatAttachments.length'), 1);
+
+    env.run('chatRestorePending = true; syncSessionsPanelDisabled();');
+    assert.equal(sessionRowsDisabled(), true);
+    env.api.getChatRestoreState = async () => {
+      throw new Error('restore failed');
+    };
+    await env.run('restoreChatAfterReload()');
+    assert.equal(env.run('chatRestorePending'), false);
+    assert.equal(sessionRowsDisabled(), false);
+
+    seedComposer();
+    env.run('activeStream = { requestId: "live" }; syncSessionsPanelDisabled();');
+    assert.equal(sessionRowsDisabled(), true);
+    await env.run('loadSession("other.json")');
+    await env.run('trashSession("chat.json")');
+    assert.equal(env.api._loads, loadsBefore);
+    assert.equal(env.run('inputEl.value'), 'keep this');
+    assert.equal(env.run('pendingChatAttachments.length'), 1);
+    assert.equal(env.run('activeSessionName'), 'chat.json');
+    env.run('activeStream = null; syncSessionsPanelDisabled();');
+    assert.equal(sessionRowsDisabled(), false);
+  });
+
   it('clears pending attachments with the draft after a successful send', () => {
     reset();
     env.api.sendMessageStream = () => ({

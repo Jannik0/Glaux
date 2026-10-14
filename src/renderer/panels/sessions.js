@@ -25,8 +25,17 @@ function setSessionsStatus(message, isError = false) {
   window.Glaux.Status.setTimedPanelStatus(sessionsStatusEl, 'sessions', message, isError, 'error');
 }
 
+function sessionsActionsBlocked() {
+  return (
+    engineBusy ||
+    engineLoading ||
+    Boolean(activeStream) ||
+    (typeof chatRestorePending !== 'undefined' && chatRestorePending)
+  );
+}
+
 function syncSessionsPanelDisabled() {
-  const dis = engineBusy || engineLoading || Boolean(activeStream);
+  const dis = sessionsActionsBlocked();
   if (sessionsNewEl) {
     sessionsNewEl.disabled = dis;
   }
@@ -380,7 +389,7 @@ function initializeSessionsPanel() {
       return;
     }
     const main = e.target && /** @type {HTMLElement} */ (e.target).closest('.sessions-row-main');
-    if (!main || engineBusy || engineLoading || activeStream) {
+    if (!main || sessionsActionsBlocked()) {
       return;
     }
     const row = main.closest('.sessions-row');

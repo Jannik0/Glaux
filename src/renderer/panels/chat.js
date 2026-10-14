@@ -1427,6 +1427,7 @@ async function restoreChatAfterReload() {
   chatRestorePending = true;
   syncComposerInteraction();
   updateSendButton();
+  syncSessionsPanelDisabled();
   let unsubscribe = () => {};
   let handedOff = false;
   const buffered = [];
@@ -1634,6 +1635,7 @@ async function restoreChatAfterReload() {
     const aborted = epoch !== chatViewEpoch;
     chatRestorePending = false;
     syncComposerInteraction();
+    syncSessionsPanelDisabled();
     if (!aborted) {
       const appliedScroll = restoreChatComposerAfterReload(restoreScroll);
       if (restoreScroll && !appliedScroll) {
