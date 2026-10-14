@@ -7,7 +7,7 @@
   const navToggle = document.querySelector(".nav-toggle");
   const languageSelect = document.getElementById("language-select");
   const lightbox = document.getElementById("lightbox");
-  const RELEASE_VERSION = "1.2.0";
+  const RELEASE_VERSION = "1.3.0";
   const RELEASE_BASE = `https://github.com/Jannik0/Glaux/releases/download/v${RELEASE_VERSION}`;
   const BUILDS = {
     windows: `${RELEASE_BASE}/Glaux-Setup-${RELEASE_VERSION}.exe`,

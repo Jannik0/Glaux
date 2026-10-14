@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Glaux — Local AI Workspace",
-    "description": "Glaux is a local AI workspace for Windows, macOS, and Linux. Chat, read files, and transcribe audio on your computer with any open-weights Safetensors or GGUF model — nothing is sent to a cloud AI."
+    "description": "Glaux is a local AI workspace for Windows, macOS, and Linux. Chat, read files, transcribe audio, and generate images on your computer with any open-weights Safetensors or GGUF model — nothing is sent to a cloud AI."
   },
   "nav": {
     "skip": "Skip to content",
@@ -23,7 +23,7 @@
   "hero": {
     "eyebrow": "Free open-source AI assistant",
     "title": "Your AI workspace, on your computer",
-    "lede": "Chat, read files, and transcribe audio on your machine — nothing is sent to a cloud AI.",
+    "lede": "Chat, read files, transcribe audio, and generate images on your machine — nothing is sent to a cloud AI.",
     "claim": "Runs any open-weights model in Safetensors or GGUF format.",
     "getGlaux": "Get Glaux",
     "howTo": "How to use",
@@ -32,9 +32,9 @@
   "models": {
     "eyebrow": "Open models",
     "title": "Any open-weights model, ready to run",
-    "body": "Pick a model from Hugging Face, download it through Glaux, and start using it. If it is published as <strong>Safetensors</strong> or <strong>GGUF</strong>, Glaux can serve it locally — chat, vision, and speech included. No need to tinker around or set up extra software; Glaux manages everything for you.",
+    "body": "Pick a model from Hugging Face, download it through Glaux, and start using it. If it is published as <strong>Safetensors</strong> or <strong>GGUF</strong>, Glaux can serve it locally — chat, vision, speech, and image generation included. No need to tinker around or set up extra software; Glaux manages everything for you.",
     "safetensorsTitle": "Full open models",
-    "safetensorsBody": "The standard weights format on Hugging Face. Use it when you want the complete open-weights model for chatting, looking at images, or transcribing speech.",
+    "safetensorsBody": "The standard weights format on Hugging Face. Use it when you want the complete open-weights model for chatting, looking at images, transcribing speech, or generating pictures.",
     "ggufTitle": "Compact open models",
     "ggufBody": "Smaller packaged versions of the same open models. Choose a GGUF build when you want capable AI that fits more comfortably on your machine.",
     "note": "Some Hub models are gated. Accept the license on the model page, then set a Hugging Face access token in your environment before you open Glaux."
@@ -42,10 +42,11 @@
   "uses": {
     "eyebrow": "Use cases",
     "title": "Everyday work, kept private",
-    "lead": "Glaux is a workspace for people who want local AI for writing, files, and recordings — not a developer toolkit.",
+    "lead": "Glaux is a workspace for people who want local AI for writing, files, recordings, and pictures — not a developer toolkit.",
     "tabsAria": "Ways to use Glaux",
     "chatTab": "Private chat and writing",
     "photosTab": "Photos and screenshots",
+    "imagesTab": "Pictures from a prompt",
     "audioTab": "Meetings and voice memos",
     "pdfsTab": "Answers from PDFs",
     "projectsTab": "Separate projects",
@@ -53,6 +54,8 @@
     "chatBody": "Draft emails, outline ideas, and talk through a problem the way you would with a cloud assistant — except the conversation stays on your computer. Sessions are saved in your workspace so you can pick up later.",
     "photosTitle": "Ask about what is in an image",
     "photosBody": "Drop a photo or screenshot into the chat when the model supports images. Describe a scene, extract text from a picture, or ask what is happening — useful for receipts, whiteboards, and everyday snapshots.",
+    "imagesTitle": "Create images on your computer",
+    "imagesBody": "Download an image model, describe the picture you want, and Glaux draws it locally. Some models also take one reference image so you can restyle or edit a photo you already have. The result stays in the chat and in Outputs.",
     "audioTitle": "Turn speech into text",
     "audioBody": "Attach a voice memo, meeting recording, or video. Glaux can transcribe the audio on your machine so you get a written record without sending the file to a transcription service.",
     "pdfsTitle": "Read documents, then ask questions",
@@ -73,7 +76,7 @@
   "features": {
     "eyebrow": "Features",
     "title": "A full workspace, not just a chat box",
-    "lead": "Everything you need to download a model, talk to it, and keep the files that come out of that work.",
+    "lead": "Everything you need to download a model, talk to it, generate pictures, and keep the files that come out of that work.",
     "localChatTitle": "Local chat",
     "localChatBody": "Conversations run on your computer. Nothing is sent to a cloud AI for inference.",
     "openModelsTitle": "Any open-weights model",
@@ -84,6 +87,8 @@
     "pdfBody": "Documents are parsed automatically so you can search, quote, and ask questions about them.",
     "transcriptionTitle": "Transcription",
     "transcriptionBody": "Turn recordings and video soundtracks into text with a speech model from the Hub.",
+    "imageTitle": "Image generation",
+    "imageBody": "Turn a prompt into a picture with an open image model. When the model supports it, attach a reference image to edit or restyle a photo. Nothing is sent to a cloud service.",
     "switchTitle": "Switch models mid-chat",
     "switchBody": "Change models during a session in order to mix and match capabilities as you need them and keep the conversation.",
     "workspacesTitle": "Workspaces",
@@ -94,8 +99,6 @@
     "resourcesBody": "Keep the files a project needs in one place, with drag-and-drop and a built-in markdown editor.",
     "outputsTitle": "Outputs browser",
     "outputsBody": "Find generated and exported files next to the chat, ready to open or copy back into your resource library.",
-    "themeTitle": "Light and dark",
-    "themeBody": "Follows your system by default. Switch to light or dark any time from the theme selector in the header.",
     "platformsTitle": "Windows, macOS, and Linux",
     "platformsBody": "One desktop app per platform. GPU is used automatically when your machine has one."
   },
@@ -110,9 +113,9 @@
     "s3Title": "Download an open-weights model",
     "s3Body": "In the Models panel, paste a Hugging Face model id such as <code>org/model-name</code> and choose Add. Glaux fetches any open-weights Safetensors or GGUF model you pick. For GGUF you can choose a smaller or larger variant before the download starts.",
     "s4Title": "Select it and start chatting",
-    "s4Body": "Click the downloaded model to load it. Type in the input field at the bottom of the chat window and send. A context meter shows how much of the model’s memory the conversation is using.",
+    "s4Body": "Click the downloaded model to load it. Type in the input field at the bottom of the chat window and send. With a chat model you get a reply. With an image model the same prompt becomes a picture. A context meter shows how much of the model’s memory the conversation is using.",
     "s5Title": "Drop in files when you need them",
-    "s5Body": "Drag images, audio, video, or PDFs into your message in order to pass them to the model. Use a vision model for pictures, a speech model for recordings, or attach a PDF to ask about the document.",
+    "s5Body": "Drag images, audio, video, or PDFs into your message in order to pass them to the model. Use a vision model for pictures, a speech model for recordings, or attach a PDF to ask about the document. With an image model that accepts a reference, one photo can guide the picture Glaux creates.",
     "s6Title": "Find chats, files, and outputs",
     "s6Body": "Sessions holds past conversations. Resources is your project library. Outputs collects files you export or generate. Everything is saved under your user profile on your computer."
   },
@@ -124,14 +127,14 @@
   "download": {
     "eyebrow": "Get Glaux",
     "title": "Install the desktop app",
-    "lead": "Glaux 1.2.0 is available for Windows and Linux. Models are downloaded after you install — they are not inside the installer. A GPU driver helps when you want faster responses, but it is not required.",
+    "lead": "Glaux 1.3.0 is available for Windows and Linux. Models are downloaded after you install — they are not inside the installer. A GPU driver helps when you want faster responses, but it is not required.",
     "ctaWindows": "Download for Windows",
     "ctaDeb": "Download for Debian and Ubuntu",
     "ctaRpm": "Download for Fedora, RHEL, and openSUSE",
     "allReleases": "All releases",
     "noteWindows": "Windows 10 or 11, x64. Run the setup, choose a folder if you like, then open Glaux from the Start menu.",
-    "noteDeb": "Debian and Ubuntu, x64. Debian is the tested Linux platform. Install with <code>sudo apt install ./Glaux_1.2.0_amd64.deb</code>",
-    "noteRpm": "Fedora, RHEL, openSUSE, and other RPM distributions, x64. Install with <code>sudo dnf install ./Glaux-1.2.0.x86_64.rpm</code>",
+    "noteDeb": "Debian and Ubuntu, x64. Debian is the tested Linux platform. Install with <code>sudo apt install ./Glaux_1.3.0_amd64.deb</code>",
+    "noteRpm": "Fedora, RHEL, openSUSE, and other RPM distributions, x64. Install with <code>sudo dnf install ./Glaux-1.3.0.x86_64.rpm</code>",
     "noteMac": "macOS packaging is supported, but those builds still need validation and are not published yet."
   }
 }

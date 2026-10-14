@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Glaux is a local AI workspace for Windows, macOS, and Linux. Chat, read files, and transcribe audio on your computer with any open-weights Safetensors or GGUF model — nothing is sent to a cloud AI.">
+    <meta name="description" content="Glaux is a local AI workspace for Windows, macOS, and Linux. Chat, read files, transcribe audio, and generate images on your computer with any open-weights Safetensors or GGUF model — nothing is sent to a cloud AI.">
     <meta name="theme-color" content="#0f1011">
     <meta property="og:title" content="Glaux — Local AI Workspace">
-    <meta property="og:description" content="Chat, read files, and transcribe audio on your computer. Runs any open-weights model in Safetensors or GGUF.">
+    <meta property="og:description" content="Chat, read files, transcribe audio, and generate images on your computer. Runs any open-weights model in Safetensors or GGUF.">
     <meta property="og:image" content="assets/GlauxAI_Logo.png">
     <title>Glaux — Local AI Workspace</title>
     <link rel="icon" href="assets/favicon.ico">
@@ -110,7 +110,7 @@
             <p class="eyebrow" data-i18n="hero.eyebrow">Free open-source AI assistant</p>
             <h1 data-i18n="hero.title">Your AI workspace, on your computer</h1>
             <p class="lede" data-i18n="hero.lede">
-              Chat, read files, and transcribe audio on your machine — nothing is sent to a cloud AI.
+              Chat, read files, transcribe audio, and generate images on your machine — nothing is sent to a cloud AI.
             </p>
             <p class="hero-claim" data-i18n="hero.claim">Runs any open-weights model in Safetensors or GGUF format.</p>
             <div class="hero-actions">
@@ -131,7 +131,7 @@
             <h2 data-i18n="models.title">Any open-weights model, ready to run</h2>
             <p data-i18n-html="models.body">
               Pick a model from Hugging Face, download it through Glaux, and start using it. If it is published as
-              <strong>Safetensors</strong> or <strong>GGUF</strong>, Glaux can serve it locally — chat, vision, and speech included.
+              <strong>Safetensors</strong> or <strong>GGUF</strong>, Glaux can serve it locally — chat, vision, speech, and image generation included.
               No need to tinker around or set up extra software; Glaux manages everything for you.
             </p>
           </header>
@@ -141,7 +141,7 @@
               <h3 data-i18n="models.safetensorsTitle">Full open models</h3>
               <p data-i18n="models.safetensorsBody">
                 The standard weights format on Hugging Face. Use it when you want the complete open-weights model
-                for chatting, looking at images, or transcribing speech.
+                for chatting, looking at images, transcribing speech, or generating pictures.
               </p>
             </article>
             <article class="format-card" data-reveal>
@@ -165,12 +165,13 @@
           <header class="section-heading" data-reveal>
             <p class="eyebrow" data-i18n="uses.eyebrow">Use cases</p>
             <h2 data-i18n="uses.title">Everyday work, kept private</h2>
-            <p data-i18n="uses.lead">Glaux is a workspace for people who want local AI for writing, files, and recordings — not a developer toolkit.</p>
+            <p data-i18n="uses.lead">Glaux is a workspace for people who want local AI for writing, files, recordings, and pictures — not a developer toolkit.</p>
           </header>
           <div class="use-layout" data-reveal>
             <div class="use-tabs" role="tablist" data-i18n-aria="uses.tabsAria" aria-label="Ways to use Glaux">
               <button type="button" role="tab" id="tab-chat" aria-selected="true" aria-controls="panel-chat" data-use="chat" data-i18n="uses.chatTab">Private chat and writing</button>
               <button type="button" role="tab" id="tab-photos" aria-selected="false" aria-controls="panel-photos" data-use="photos" data-i18n="uses.photosTab">Photos and screenshots</button>
+              <button type="button" role="tab" id="tab-images" aria-selected="false" aria-controls="panel-images" data-use="images" data-i18n="uses.imagesTab">Pictures from a prompt</button>
               <button type="button" role="tab" id="tab-audio" aria-selected="false" aria-controls="panel-audio" data-use="audio" data-i18n="uses.audioTab">Meetings and voice memos</button>
               <button type="button" role="tab" id="tab-pdfs" aria-selected="false" aria-controls="panel-pdfs" data-use="pdfs" data-i18n="uses.pdfsTab">Answers from PDFs</button>
               <button type="button" role="tab" id="tab-projects" aria-selected="false" aria-controls="panel-projects" data-use="projects" data-i18n="uses.projectsTab">Separate projects</button>
@@ -188,6 +189,14 @@
                 <p data-i18n="uses.photosBody">
                   Drop a photo or screenshot into the chat when the model supports images. Describe a scene, extract
                   text from a picture, or ask what is happening — useful for receipts, whiteboards, and everyday snapshots.
+                </p>
+              </article>
+              <article class="use-panel" role="tabpanel" id="panel-images" aria-labelledby="tab-images" hidden>
+                <h3 data-i18n="uses.imagesTitle">Create images on your computer</h3>
+                <p data-i18n="uses.imagesBody">
+                  Download an image model, describe the picture you want, and Glaux draws it locally. Some models also
+                  take one reference image so you can restyle or edit a photo you already have. The result stays in the
+                  chat and in Outputs.
                 </p>
               </article>
               <article class="use-panel" role="tabpanel" id="panel-audio" aria-labelledby="tab-audio" hidden>
@@ -233,7 +242,7 @@
           <header class="section-heading" data-reveal>
             <p class="eyebrow" data-i18n="features.eyebrow">Features</p>
             <h2 data-i18n="features.title">A full workspace, not just a chat box</h2>
-            <p data-i18n="features.lead">Everything you need to download a model, talk to it, and keep the files that come out of that work.</p>
+            <p data-i18n="features.lead">Everything you need to download a model, talk to it, generate pictures, and keep the files that come out of that work.</p>
           </header>
           <div class="feature-grid">
             <article class="feature-card" data-reveal>
@@ -257,6 +266,10 @@
               <p data-i18n="features.transcriptionBody">Turn recordings and video soundtracks into text with a speech model from the Hub.</p>
             </article>
             <article class="feature-card" data-reveal>
+              <h3 data-i18n="features.imageTitle">Image generation</h3>
+              <p data-i18n="features.imageBody">Turn a prompt into a picture with an open image model. When the model supports it, attach a reference image to edit or restyle a photo. Nothing is sent to a cloud service.</p>
+            </article>
+            <article class="feature-card" data-reveal>
               <h3 data-i18n="features.switchTitle">Switch models mid-chat</h3>
               <p data-i18n="features.switchBody">Change models during a session in order to mix and match capabilities as you need them and keep the conversation.</p>
             </article>
@@ -275,10 +288,6 @@
             <article class="feature-card" data-reveal>
               <h3 data-i18n="features.outputsTitle">Outputs browser</h3>
               <p data-i18n="features.outputsBody">Find generated and exported files next to the chat, ready to open or copy back into your resource library.</p>
-            </article>
-            <article class="feature-card" data-reveal>
-              <h3 data-i18n="features.themeTitle">Light and dark</h3>
-              <p data-i18n="features.themeBody">Follows your system by default. Switch to light or dark any time from the theme selector in the header.</p>
             </article>
             <article class="feature-card" data-reveal>
               <h3 data-i18n="features.platformsTitle">Windows, macOS, and Linux</h3>
@@ -341,7 +350,8 @@
               <div class="step-body">
                 <p data-i18n="how.s4Body">
                   Click the downloaded model to load it. Type in the input field at the bottom of the chat window and send.
-                  A context meter shows how much of the model’s memory the conversation is using.
+                  With a chat model you get a reply. With an image model the same prompt becomes a picture. A context
+                  meter shows how much of the model’s memory the conversation is using.
                 </p>
               </div>
             </li>
@@ -352,8 +362,9 @@
               </button>
               <div class="step-body">
                 <p data-i18n="how.s5Body">
-                  Drag images, audio, video, or PDFs into the your message in order to pass them to the model.
+                  Drag images, audio, video, or PDFs into your message in order to pass them to the model.
                   Use a vision model for pictures, a speech model for recordings, or attach a PDF to ask about the document.
+                  With an image model that accepts a reference, one photo can guide the picture Glaux creates.
                 </p>
               </div>
             </li>
@@ -390,7 +401,7 @@
           <p class="eyebrow" data-i18n="download.eyebrow">Get Glaux</p>
           <h2 data-i18n="download.title">Install the desktop app</h2>
           <p class="download-lead" data-i18n="download.lead">
-            Glaux 1.2.0 is available for Windows and Linux. Models are downloaded after you install — they are not inside the installer.
+            Glaux 1.3.0 is available for Windows and Linux. Models are downloaded after you install — they are not inside the installer.
             A GPU driver helps when you want faster responses, but it is not required.
           </p>
           <ul class="download-builds">
@@ -398,7 +409,7 @@
               <a
                 class="btn btn-primary btn-lg"
                 id="download-windows"
-                href="https://github.com/Jannik0/Glaux/releases/download/v1.2.0/Glaux-Setup-1.2.0.exe"
+                href="https://github.com/Jannik0/Glaux/releases/download/v1.3.0/Glaux-Setup-1.3.0.exe"
                 data-i18n="download.ctaWindows"
               >
                 Download for Windows
@@ -411,28 +422,28 @@
               <a
                 class="btn btn-ghost btn-lg"
                 id="download-deb"
-                href="https://github.com/Jannik0/Glaux/releases/download/v1.2.0/Glaux_1.2.0_amd64.deb"
+                href="https://github.com/Jannik0/Glaux/releases/download/v1.3.0/Glaux_1.3.0_amd64.deb"
                 data-i18n="download.ctaDeb"
               >
                 Download for Debian and Ubuntu
               </a>
               <p data-i18n-html="download.noteDeb">
                 Debian and Ubuntu, x64. Debian is the tested Linux platform. Install with
-                <code>sudo apt install ./Glaux_1.2.0_amd64.deb</code>
+                <code>sudo apt install ./Glaux_1.3.0_amd64.deb</code>
               </p>
             </li>
             <li data-platform="linux">
               <a
                 class="btn btn-ghost btn-lg"
                 id="download-rpm"
-                href="https://github.com/Jannik0/Glaux/releases/download/v1.2.0/Glaux-1.2.0.x86_64.rpm"
+                href="https://github.com/Jannik0/Glaux/releases/download/v1.3.0/Glaux-1.3.0.x86_64.rpm"
                 data-i18n="download.ctaRpm"
               >
                 Download for Fedora, RHEL, and openSUSE
               </a>
               <p data-i18n-html="download.noteRpm">
                 Fedora, RHEL, openSUSE, and other RPM distributions, x64. Install with
-                <code>sudo dnf install ./Glaux-1.2.0.x86_64.rpm</code>
+                <code>sudo dnf install ./Glaux-1.3.0.x86_64.rpm</code>
               </p>
             </li>
           </ul>
