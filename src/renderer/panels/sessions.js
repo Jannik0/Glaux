@@ -198,7 +198,6 @@ async function loadSession(sessionName) {
     const { messages, sessionName: loadedName } = await window.api.sessions.load(sessionName);
     activeSessionName = loadedName;
     clearChatMessages();
-    clearChatAttachments();
     rebuildChatFromContext(messages);
     scrollMessagesToBottomAfterRender();
     void updateContextUsageIndicator({ refresh: true });
@@ -213,8 +212,8 @@ async function loadSession(sessionName) {
 
 /**
  * A failed reload can leave the active session highlighted and the transcript
- * blank. Load that file without clearing composer chips the way a session
- * switch does.
+ * blank. Load that file in place. The composer draft and pending attachments
+ * stay, the same as switching sessions.
  */
 async function recoverBlankTranscript() {
   if (typeof chatRestorePending !== 'undefined' && chatRestorePending) {
@@ -306,7 +305,6 @@ async function trashSession(sessionName) {
     if (wasActive) {
       activeSessionName = null;
       clearChatMessages();
-      clearChatAttachments();
       void updateContextUsageIndicator({ refresh: true });
     }
     sessionsEditingName = null;

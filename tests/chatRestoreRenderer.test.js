@@ -407,6 +407,9 @@ function bootRenderer() {
         return false;
       },
       closeNameDialog() {},
+      showConfirmDialog() {
+        return Promise.resolve(true);
+      },
     },
     Resources: {
       panel: {
@@ -467,6 +470,14 @@ function bootRenderer() {
         if (api._newError) {
           throw api._newError;
         }
+      },
+      trash: async (name) => {
+        const wasActive = name === api._active;
+        api._sessions = api._sessions.filter((session) => session.name !== name);
+        if (wasActive) {
+          api._active = null;
+        }
+        return { wasActive, sessions: api._sessions };
       },
     },
   };
@@ -962,5 +973,88 @@ describe('chat restore renderer', { concurrency: 1 }, () => {
     assert.deepEqual(env.api.cancels, ['engine:cancel']);
     assert.equal(env.run(`sendButtonEl.querySelector('.icon + span').textContent`), 'chat.stop');
     env.run('chatRestorePending = false; activeStream = null; setBusy(false);');
+  });
+
+  function seedComposer() {
+    env.run(`
+      inputEl.value = 'keep this';
+      pendingChatAttachments = [{ source: 'resources', relativePath: 'pics/a.png', name: 'a.png' }];
+      renderChatAttachments();
+      updateMessageInputHighlight();
+    `);
+  }
+
+  it('keeps pending attachments when switching sessions, like the draft', async () => {
+    reset();
+    env.api._sessions = [
+      { name: 'chat.json', displayName: 'chat' },
+      { name: 'other.json', displayName: 'other' },
+    ];
+    env.api._active = 'chat.json';
+    await env.run('refreshSessionsList()');
+    seedComposer();
+    await env.run('loadSession("other.json")');
+    assert.equal(env.run('inputEl.value'), 'keep this');
+    assert.equal(env.run('pendingChatAttachments.length'), 1);
+    assert.equal(env.run(`chatAttachmentsListEl.querySelector('.chat-attachment-name').textContent`), 'a.png');
+    assert.equal(env.run(`messagesEl.querySelector('.message.user .message-body').textContent`), 'from file');
+    assert.equal(env.run('activeSessionName'), 'other.json');
+  });
+
+  it('clears pending attachments with the draft on New Chat and a workspace switch', async () => {
+    reset();
+    seedComposer();
+    env.run(`appendMessage('user', 'old turn');`);
+    await env.run('startNewSession()');
+    assert.equal(env.run('inputEl.value'), '');
+    assert.equal(env.run('pendingChatAttachments.length'), 0);
+    assert.equal(env.run('chatAttachmentsListEl.querySelector(".chat-attachment-chip")'), null);
+    assert.equal(env.run('messagesEl.querySelector(".message.user")'), null);
+
+    seedComposer();
+    env.run(`appendMessage('user', 'old turn');`);
+    await env.run('refreshPanelsForWorkspaceChange()');
+    assert.equal(env.run('inputEl.value'), '');
+    assert.equal(env.run('pendingChatAttachments.length'), 0);
+    assert.equal(env.run('chatAttachmentsListEl.querySelector(".chat-attachment-chip")'), null);
+    assert.equal(env.run('messagesEl.querySelector(".message.user")'), null);
+  });
+
+  it('keeps pending attachments when the active session is deleted, like the draft', async () => {
+    reset();
+    env.api._sessions = [
+      { name: 'chat.json', displayName: 'chat' },
+      { name: 'other.json', displayName: 'other' },
+    ];
+    env.api._active = 'chat.json';
+    await env.run('refreshSessionsList()');
+    seedComposer();
+    env.run(`appendMessage('user', 'in this chat');`);
+    await env.run('trashSession("other.json")');
+    assert.equal(env.run('inputEl.value'), 'keep this');
+    assert.equal(env.run('pendingChatAttachments.length'), 1);
+    assert.equal(env.run(`messagesEl.querySelector('.message.user .message-body').textContent`), 'in this chat');
+
+    await env.run('trashSession("chat.json")');
+    assert.equal(env.run('inputEl.value'), 'keep this');
+    assert.equal(env.run('pendingChatAttachments.length'), 1);
+    assert.equal(env.run(`chatAttachmentsListEl.querySelector('.chat-attachment-name').textContent`), 'a.png');
+    assert.equal(env.run('messagesEl.querySelector(".message.user")'), null);
+    assert.equal(env.run('activeSessionName'), null);
+  });
+
+  it('clears pending attachments with the draft after a successful send', () => {
+    reset();
+    env.api.sendMessageStream = () => ({
+      completion: new Promise(() => {}),
+      cancel() {},
+    });
+    env.run('setReady(true);');
+    seedComposer();
+    env.ids.get('chat-form').dispatchEvent({ type: 'submit' });
+    assert.equal(env.run('inputEl.value'), '');
+    assert.equal(env.run('pendingChatAttachments.length'), 0);
+    assert.equal(env.run('chatAttachmentsListEl.querySelector(".chat-attachment-chip")'), null);
+    env.run('activeStream = null; setBusy(false);');
   });
 });
